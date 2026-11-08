@@ -1,0 +1,5 @@
+# build artifacts
+/mini
+/cmd/mini/mini
+last_mini_run.traj.json
+*.log

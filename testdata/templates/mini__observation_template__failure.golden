@@ -1,0 +1,4 @@
+{
+  "returncode": -1,
+  "output": "", "exception_info": "An error occurred while executing the command: Command \u0027x\u0027 returned non-zero exit status 1 \"quoted\"."
+}

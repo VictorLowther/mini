@@ -1,0 +1,530 @@
+package ui
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/styles"
+	"charm.land/lipgloss/v2"
+
+	"github.com/VictorLowther/mini/agent"
+	"github.com/VictorLowther/mini/model"
+)
+
+// TUIOptions wires the terminal UI to a configured loop.
+type TUIOptions struct {
+	Cfg        *agent.Config
+	Loop       *agent.Loop
+	Model      *model.Sushi
+	ConfigName string
+	// Width/Height override the terminal size (tests).
+	Width, Height int
+}
+
+// TUI is the bubbletea front end. It is both the UI the agent talks to and the
+// owner of the program: the agent loop runs in one goroutine and every callback
+// reaches the screen through program.Send, so there is exactly one producer and
+// no per-chunk command plumbing.
+type TUI struct {
+	cfg        *agent.Config
+	loop       *agent.Loop
+	modelName  string
+	baseURL    string
+	configName string
+
+	program *tea.Program
+	runCtx  context.Context
+
+	mu       sync.Mutex
+	pending  chan Answer
+	lastQ    Question
+	stream   streamState
+	blocks   []block
+	width    int
+	height   int
+	runInfo  map[string]any
+	runError error
+	runDone  chan struct{}
+	finished chan struct{}
+	// fallback delivers messages when no program is running (tests drive the
+	// model directly).
+	fallback   func(tea.Msg)
+	programErr error
+	// reasoningVisible is toggled with `t`; hidden by default so the useful
+	// text stays on screen.
+	reasoningVisible bool
+	// task is the run's task text, shown on one line in place of the rendered
+	// instance template.
+	task string
+	// loopGID is the goroutine bubbletea runs Update on, captured in Init. The
+	// one hard rule of this UI is that Send must never be called from it:
+	// program.Send is an unbuffered hand-off, so doing so deadlocks the pane
+	// permanently (the symptom users report as "input focus is gone forever").
+	// In-loop code appends to the scrollback directly instead.
+	loopGID atomic.Uint64
+	onLoop  atomic.Bool
+	// loopMu serialises delivery in tests that drive the model without a
+	// program, reproducing bubbletea's single-update-goroutine guarantee.
+	loopMu sync.Mutex
+}
+
+// goid identifies the current goroutine. It is only consulted while the update
+// loop is executing, so the cost is irrelevant.
+func goid() uint64 {
+	var b [32]byte
+	n := runtime.Stack(b[:], false)
+	if n < len("goroutine ") {
+		return 0
+	}
+	var id uint64
+	for _, c := range b[len("goroutine "):n] {
+		if c == ' ' {
+			break
+		}
+		id = id*10 + uint64(c-'0')
+	}
+	return id
+}
+
+// kick delivers a message to the model the way the event loop would (tests only).
+func (t *TUI) kick(m *tuiModel, msg tea.Msg) {
+	t.loopMu.Lock()
+	defer t.loopMu.Unlock()
+	m.Update(msg)
+}
+
+// doOn runs fn with the update loop quiescent, so tests can poke at the model
+// without racing the fallback delivery.
+func (t *TUI) doOn(fn func()) {
+	t.loopMu.Lock()
+	defer t.loopMu.Unlock()
+	fn()
+}
+
+func (t *TUI) setInLoop(v bool) {
+	if v {
+		t.loopGID.CompareAndSwap(0, goid())
+		t.onLoop.Store(true)
+		return
+	}
+	t.onLoop.Store(false)
+}
+
+type streamState struct {
+	reasoning strings.Builder
+	content   strings.Builder
+}
+
+// block is one entry in the scrollback. kind is a message role, or one of
+// "note" / "error" for UI-generated lines.
+type block struct {
+	kind  string
+	title string
+	text  string
+	// collapsible blocks (reasoning) hide when the user presses t.
+	reasoning bool
+}
+
+// NewTUI builds the UI and installs itself as the loop's streaming handler.
+func NewTUI(o TUIOptions) (*TUI, error) {
+	t := &TUI{
+		cfg: o.Cfg, loop: o.Loop,
+		modelName: o.Model.Model, baseURL: o.Model.BaseURL, configName: o.ConfigName,
+		width:    orDefault(o.Width, 80),
+		height:   orDefault(o.Height, 24),
+		runDone:  make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	if o.Loop != nil {
+		o.Loop.Handler = &model.Handler{Content: t.Content, Reasoning: t.Reasoning}
+	}
+	return t, nil
+}
+
+func orDefault(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
+// send hands a message to the running program. Before Run (and in tests that
+// drive the model directly) there is no program, and the update loop is fed by
+// the test instead.
+func (t *TUI) send(msg tea.Msg) {
+	if t.program != nil {
+		if t.onLoop.Load() && goid() == t.loopGID.Load() {
+			panic("TUI.send called from the update loop: program.Send would deadlock the pane; use tuiModel.noteLocal")
+		}
+		t.program.Send(msg)
+		return
+	}
+	if t.fallback != nil {
+		t.loopMu.Lock()
+		defer t.loopMu.Unlock()
+		t.fallback(msg)
+	}
+}
+
+// Interactive: the TUI always has a human on the other end.
+func (t *TUI) Interactive() bool { return true }
+
+// Run starts the program and the agent, returning when the user quits or the
+// run ends. A non-empty task starts the loop immediately; an empty one asks the
+// user first.
+func (t *TUI) Run(ctx context.Context, task string) (map[string]any, error) {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	t.runCtx = runCtx
+	m := newTUIModel(t, task, cancelRun)
+	t.program = tea.NewProgram(m)
+
+	go func() {
+		_, err := t.program.Run()
+		t.mu.Lock()
+		t.programErr = err
+		t.mu.Unlock()
+		cancelRun()
+		close(t.finished)
+	}()
+	go t.drive(runCtx, task)
+
+	select {
+	case <-t.finished:
+	case <-ctx.Done():
+	}
+	// Give the loop a moment to finish saving its trajectory.
+	select {
+	case <-t.runDone:
+	case <-time.After(2 * time.Second):
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	info := t.runInfo
+	err := t.runError
+	if err != nil && ctx.Err() == nil && t.programErr != nil {
+		err = t.programErr
+	}
+	return info, err
+}
+
+// drive asks for a task when needed, then runs the loop.
+func (t *TUI) drive(ctx context.Context, task string) {
+	defer close(t.runDone)
+	if task == "" {
+		ans, err := t.Ask(ctx, Question{Kind: AskTask, Title: TaskPrompt, Cfg: t.cfg})
+		if err != nil {
+			t.finish(nil, err)
+			return
+		}
+		task = ans.Text
+	}
+	t.mu.Lock()
+	t.task = task
+	t.mu.Unlock()
+	info, err := t.loop.Run(ctx, task)
+	t.finish(info, err)
+}
+
+func (t *TUI) finish(info map[string]any, err error) {
+	t.mu.Lock()
+	t.runInfo, t.runError = info, err
+	t.mu.Unlock()
+	if t.program != nil {
+		t.send(runDoneMsg{})
+	}
+}
+
+var _ UI = (*TUI)(nil)
+
+// ---------------------------------------------------------------- streaming --
+
+func (t *TUI) Reasoning(text string) {
+	t.mu.Lock()
+	t.stream.reasoning.WriteString(text)
+	t.mu.Unlock()
+	t.send(streamMsg{kind: "reasoning", text: text})
+}
+
+func (t *TUI) Content(text string) {
+	t.mu.Lock()
+	t.stream.content.WriteString(text)
+	t.mu.Unlock()
+	t.send(streamMsg{kind: "content", text: text})
+}
+
+// StreamText returns the text streamed so far for the turn in flight.
+func (t *TUI) StreamText() (reasoning, content string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stream.reasoning.String(), t.stream.content.String()
+}
+
+// Message records a finished message in the scrollback.
+//
+// The system message and the rendered instance template are skipped: they are
+// prompt plumbing, they are enormous, and at the start of a run they bury
+// everything the user cares about. The task itself is shown on one line
+// instead. Only messages the agent produced (every one of them carries an
+// "extra" map) reach the pane.
+func (t *TUI) Message(m model.Message) {
+	role, _ := m["role"].(string)
+	content, _ := m["content"].(string)
+	if _, built := m["extra"]; !built {
+		if role == "user" {
+			t.mu.Lock()
+			task := t.task
+			t.mu.Unlock()
+			t.note("task: " + firstLine(task))
+		}
+		return
+	}
+	reasoning := false
+	if r, ok := m["reasoning_content"].(string); ok && r != "" {
+		reasoning = t.showReasoning()
+	}
+	b := block{kind: role, text: content, reasoning: reasoning}
+	switch role {
+	case "assistant":
+		snap := t.snapshot()
+		b.title = fmt.Sprintf("mini-swe-agent (step %d, $%.2f)", snap.Calls, snap.Cost)
+	case "tool":
+		extra, _ := m["extra"].(map[string]any)
+		code, _ := extra["returncode"].(int)
+		b.title = fmt.Sprintf("exit %d", code)
+	case "exit":
+		extra, _ := m["extra"].(map[string]any)
+		status, _ := extra["exit_status"].(string)
+		b.title = status
+	}
+	t.send(blockMsg{b})
+}
+
+func (t *TUI) showReasoning() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reasoningVisible
+}
+
+// note appends a UI-generated line (help text, mode changes, errors).
+func (t *TUI) note(text string) {
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		if line != "" {
+			t.send(blockMsg{block{kind: "note", text: line}})
+		}
+	}
+}
+
+// queueSteering appends a user message to the loop's steering queue; the loop
+// commits it to the history before its next model call.
+func (t *TUI) queueSteering(text string) {
+	if t.loop == nil {
+		return
+	}
+	t.loop.QueueMessage(model.Message{
+		"role":    "user",
+		"content": text,
+		"extra":   map[string]any{"interrupt_type": "UserSteering"},
+	})
+}
+
+// RetryNotice tells the pane that a model call is being retried.
+func (t *TUI) RetryNotice(attempt, max int, err error, wait time.Duration) {
+	t.note(fmt.Sprintf("model call failed (attempt %d/%d), retrying in %s: %v", attempt, max, wait.Round(time.Second), err))
+}
+
+// Write lets ui.slash() print into the scrollback.
+func (t *TUI) Write(p []byte) (int, error) {
+	t.note(string(p))
+	return len(p), nil
+}
+
+// ------------------------------------------------------------ the ask loop ---
+
+// Ask shows a question and blocks until the keyboard answers it.
+func (t *TUI) Ask(ctx context.Context, q Question) (Answer, error) {
+	reply := make(chan Answer, 1)
+	t.mu.Lock()
+	t.pending = reply
+	t.lastQ = q
+	t.mu.Unlock()
+	t.send(questionMsg{q})
+	select {
+	case ans := <-reply:
+		return ans, nil
+	case <-ctx.Done():
+		t.mu.Lock()
+		t.pending = nil
+		t.mu.Unlock()
+		return Answer{}, ctx.Err()
+	}
+}
+
+// resolve answers the pending question from the update loop.
+func (t *TUI) resolve(a Answer) {
+	t.mu.Lock()
+	ch := t.pending
+	t.pending = nil
+	t.mu.Unlock()
+	if ch != nil {
+		ch <- a
+	}
+}
+
+// HasQuestion reports whether a prompt is waiting for an answer.
+func (t *TUI) HasQuestion() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.pending != nil
+}
+
+// PendingQuestion returns the question being answered.
+func (t *TUI) PendingQuestion() Question {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastQ
+}
+
+// ToggleReasoning flips the collapsed state of thinking blocks (t).
+func (t *TUI) ToggleReasoning() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.reasoningVisible = !t.reasoningVisible
+	return t.reasoningVisible
+}
+
+// loopRunning reports whether the agent is inside Loop.Run.
+func (t *TUI) loopRunning() bool { return t.loop != nil && t.loop.Running() }
+
+// result returns how the run ended.
+func (t *TUI) result() (map[string]any, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.runInfo, t.runError
+}
+
+// CancelCurrentTurn interrupts the command in flight (esc).
+func (t *TUI) CancelCurrentTurn() { t.loop.CancelTurn() }
+
+// RunStats renders the footer: step, cost, tokens, throughput, mode.
+func (t *TUI) RunStats() string {
+	snap := t.snapshot()
+	step, cost := snap.Calls, snap.Cost
+	parts := []string{fmt.Sprintf("step %d", step), fmt.Sprintf("$%.2f", cost), t.cfg.Mode}
+	if snap.ModelTokens > 0 {
+		parts = append(parts, fmt.Sprintf("%d tok", snap.ModelTokens))
+	}
+	if snap.ModelTokPerSec > 0 {
+		parts = append(parts, fmt.Sprintf("%.1f tok/s", snap.ModelTokPerSec))
+	}
+	return strings.Join(parts, "  ·  ")
+}
+
+func (t *TUI) snapshot() agent.Snapshot {
+	if t.loop == nil {
+		return agent.Snapshot{}
+	}
+	return t.loop.Snapshot()
+}
+
+// ---------------------------------------------------------------- rendering --
+
+// renderCache memoises one glamour renderer per wrap width.
+type renderCache struct {
+	mu  sync.Mutex
+	at  map[int]*glamour.TermRenderer
+	err error
+}
+
+func (r *renderCache) markdown(s string, width int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.at == nil {
+		r.at = map[int]*glamour.TermRenderer{}
+	}
+	t, ok := r.at[width]
+	if !ok {
+		t, r.err = glamour.NewTermRenderer(
+			glamour.WithStyles(styles.DarkStyleConfig),
+			glamour.WithWordWrap(width),
+			glamour.WithPreservedNewLines(),
+		)
+		if r.err != nil {
+			r.at[width] = nil
+			return s
+		}
+		r.at[width] = t
+	}
+	if t == nil {
+		return s
+	}
+	out, err := t.Render(s)
+	if err != nil {
+		return s
+	}
+	return strings.TrimRight(out, "\n")
+}
+
+var markdownCache renderCache
+
+// tuiStyles holds the fixed colours of the chrome.
+type tuiStyles struct {
+	title  lipgloss.Style
+	dim    lipgloss.Style
+	error  lipgloss.Style
+	prompt lipgloss.Style
+	panel  lipgloss.Style
+	ok     lipgloss.Style
+	status lipgloss.Style
+	badge  lipgloss.Style
+}
+
+var tuiStyler = tuiStyles{
+	title:  lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+	dim:    lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
+	error:  lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
+	prompt: lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
+	panel:  lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("11")).Padding(0, 1),
+	ok:     lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+	status: lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
+	badge:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")),
+}
+
+// renderBlock turns one scrollback entry into styled text.
+func renderBlock(b block, width int) string {
+	st := tuiStyler
+	switch b.kind {
+	case "assistant":
+		head := ""
+		if b.title != "" {
+			head = st.title.Render(b.title) + "\n"
+		}
+		return head + markdownCache.markdown(b.text, width)
+	case "user", "system":
+		return markdownCache.markdown(b.text, width)
+	case "tool":
+		return st.dim.Render("$ "+b.title) + "\n" + st.dim.Render(b.text)
+	case "exit":
+		return st.ok.Render("✓ "+b.title) + "\n" + b.text
+	case "error":
+		return st.error.Render(b.text)
+	default:
+		return st.dim.Render(b.text)
+	}
+}
+
+// truncateVisible keeps long command output from flooding the pane.
+func truncateVisible(s string, maxLines int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= maxLines {
+		return s
+	}
+	return strings.Join(lines[:maxLines], "\n") +
+		fmt.Sprintf("\n… %d more lines", len(lines)-maxLines)
+}

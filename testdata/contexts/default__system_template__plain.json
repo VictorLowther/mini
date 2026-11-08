@@ -1,0 +1,9 @@
+{
+  "task": "Fix the flaky test in tests/test_time.py\nit sometimes fails:\n\tassert 3 == 4",
+  "system": "Darwin",
+  "release": "25.0.0",
+  "version": "Darwin Kernel Version 25.0.0: Mon Aug 11 00:00:00 PDT 2025; root:xnu-12345.6.7~8/RELEASE_ARM64_T8132",
+  "machine": "arm64",
+  "node": "workstation.local",
+  "processor": "arm"
+}
