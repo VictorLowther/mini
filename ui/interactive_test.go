@@ -457,3 +457,64 @@ func TestUnanswerablePromptEndsTheRunInsteadOfLooping(t *testing.T) {
 		t.Errorf("n_calls = %d, want the run to stop at the first prompt", l.NCalls)
 	}
 }
+
+// TestTranscriptShowsCommandDirAndExit is the human-readable transcript the
+// JSON observation never gave: what ran, where, how it ended, what it printed.
+func TestTranscriptShowsCommandDirAndExit(t *testing.T) {
+	dir := t.TempDir()
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l, h := pair(t, c, []string{"printf 'hi\\nthere\\n'; echo err >&2", submitCmd},
+		&env.Local{CWD: dir, Timeout: 10 * time.Second}, "", true)
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	out := h.output()
+	for _, want := range []string{"$ printf 'hi\\nthere\\n'; echo err >&2", "  in " + dir, "exit 0", "hi\nthere", "err"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("transcript missing %q:\n%s", want, out)
+		}
+	}
+	// and no JSON wire format leaking into the transcript
+	for _, notWant := range []string{`"returncode"`, `"output"`, `"raw_output"`} {
+		if strings.Contains(out, notWant) {
+			t.Errorf("transcript shows the model's JSON view (%s):\n%s", notWant, out)
+		}
+	}
+}
+
+func TestTranscriptShowsFailingCommandAndCWD(t *testing.T) {
+	dir := t.TempDir()
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l, h := pair(t, c, []string{"cat definitely-missing", submitCmd},
+		&env.Local{CWD: dir, Timeout: 10 * time.Second}, "", true)
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	out := h.output()
+	for _, want := range []string{"$ cat definitely-missing", "  in " + dir, "exit 1", "No such file or directory"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("transcript missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestThinkingStateIsVisible: the status line always says whether thinking is
+// on, and a turn with hidden thinking says how much is hidden.
+func TestThinkingStateIsVisible(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l, h := pair(t, c, []string{submitCmd}, &env.Local{Timeout: 10 * time.Second}, "", true)
+	l.Handler = &model.Handler{
+		Reasoning: func(s string) { h.ui.Reasoning(s) },
+		Content:   func(s string) { h.ui.Content(s) },
+	}
+	l.Handler.Reasoning("pondering the meaning of ls")
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(h.output(), "[thinking] pondering the meaning of ls") {
+		t.Errorf("print mode never showed the thinking text:\n%s", h.output())
+	}
+}

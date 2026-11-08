@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
+	"charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/env"
@@ -20,7 +22,27 @@ import (
 // single update goroutine does in production.
 type pane struct {
 	*TUI
-	m *tuiModel
+	m   *tuiModel
+	log *printLog
+}
+
+// printLog records what the pane sent above itself, i.e. the lines that should
+// be in the terminal's own scrollback.
+type printLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *printLog) add(s string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, s)
+}
+
+func (l *printLog) all() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
 }
 
 func (p pane) press(msg tea.Msg) { p.kick(p.m, msg) }
@@ -29,12 +51,34 @@ func (p pane) typeText(s string) { p.doOn(func() { p.m.editor.Reset(); p.m.edito
 func (p pane) value() string     { var s string; p.doOn(func() { s = p.m.editor.Value() }); return s }
 func (p pane) view() string      { var s string; p.doOn(func() { s = p.m.View().Content }); return s }
 func (p pane) dialog() string    { var s string; p.doOn(func() { s = p.m.dialog }); return s }
+
+// scrollback returns the whole transcript - printed lines and pane lines are the
+// same slice of m.lines - with lipgloss padding removed, so assertions read
+// like the transcript instead of like a styled screen.
+// flat returns the scrollback with whitespace collapsed, and dense with it
+// removed: both let assertions ignore the pane's wrapping, which breaks long
+// tokens (paths) mid-string on purpose rather than soft-wrapping at the
+// terminal edge.
+func (p pane) flat() string  { return strings.Join(strings.Fields(p.scrollback()), " ") }
+func (p pane) dense() string { return strings.Join(strings.Fields(p.scrollback()), "") }
+
 func (p pane) scrollback() string {
 	var s string
-	p.doOn(func() { s = strings.Join(p.m.lines, "\n") })
+	p.doOn(func() {
+		stripped := ansi.Strip(strings.Join(p.m.lines, "\n"))
+		lines := make([]string, 0, 32)
+		for _, l := range strings.Split(stripped, "\n") {
+			lines = append(lines, strings.TrimRight(l, " \t"))
+		}
+		s = strings.Join(lines, "\n")
+	})
 	return s
 }
-func (p pane) panel() string      { var s string; p.doOn(func() { s = p.m.pendingPanel() }); return s }
+func (p pane) panel() string {
+	var s string
+	p.doOn(func() { s = ansi.Strip(p.m.pendingPanel()) })
+	return s
+}
 func (p pane) thinking() bool     { var b bool; p.doOn(func() { b = p.m.t.showReasoning() }); return b }
 func (p pane) helpExpanded() bool { var b bool; p.doOn(func() { b = p.m.showFullHelp }); return b }
 
@@ -55,12 +99,13 @@ func newTUIForTest(t *testing.T, c *agent.Config, l *agent.Loop) pane {
 	}
 	l.Hooks = h
 	m := newTUIModel(tui, "", func() {})
-	tui.fallback = func(msg tea.Msg) { m.Update(msg) }
+	tui.fallback = func(msg tea.Msg) { tui.kick(m, msg) }
 	m.width, m.height = 90, 30
-	m.viewport.SetWidth(90)
-	m.viewport.SetHeight(10)
 	m.ready = true
-	return pane{TUI: tui, m: m}
+	log := &printLog{}
+	// Delivery is synchronous here: there is no event loop to hand off to.
+	tui.printer = newSyncPrinter(log.add, func() {})
+	return pane{TUI: tui, m: m, log: log}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -146,7 +191,7 @@ func TestTUIConfirmPanelDrivesTheLoop(t *testing.T) {
 	if info["exit_status"] != "Submitted" || info["submission"] != "done\n" {
 		t.Errorf("info = %#v", info)
 	}
-	// The viewport only shows the tail; the whole scrollback is in m.lines.
+	// The pane shows only the unprinted tail; m.lines holds the whole transcript.
 	scrollback := p.scrollback()
 	for _, want := range []string{"mini-swe-agent (step 1", "exit 0", "hi"} {
 		if !strings.Contains(scrollback, want) {
@@ -402,7 +447,9 @@ func TestTUIHelpAndThinkingKeys(t *testing.T) {
 	if !p.helpExpanded() {
 		t.Error("? did not expand the help")
 	}
-	if !strings.Contains(p.view(), "page up") {
+	// "newline" only appears in the expanded help; scrolling is the terminal's
+	// job now, so the pane no longer binds those keys.
+	if !strings.Contains(p.view(), "newline") {
 		t.Errorf("full help missing from the view:\n%s", p.view())
 	}
 	// ctrl+t toggles thinking without touching the editor.
@@ -515,3 +562,162 @@ func turnWithActions(cmd string) model.Message {
 }
 
 func has(t *TUI) bool { return t.HasQuestion() }
+
+func TestTUITranscriptIsAShellSessionNotJSON(t *testing.T) {
+	dir := t.TempDir()
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo one; echo two; exit 3", submitCmd),
+		Env: &env.Local{CWD: dir, Timeout: 10 * time.Second}}
+	p := newTUIForTest(t, c, l)
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	scroll := p.scrollback()
+	for _, want := range []string{"$ echo one; echo two; exit 3", "exit 3"} {
+		if !strings.Contains(scroll, want) {
+			t.Errorf("transcript missing %q:\n%s", want, scroll)
+		}
+	}
+	if !strings.Contains(scroll, "\none\n") || !strings.Contains(scroll, "\ntwo\n") {
+		t.Errorf("output lines missing:\n%s", scroll)
+	}
+	// The directory is shown, though a temp path longer than the pane is
+	// wrapped, so compare ignoring line breaks.
+	if !strings.Contains(p.dense(), "in"+dir) {
+		t.Errorf("transcript missing the directory %q:\n%s", dir, scroll)
+	}
+	for _, notWant := range []string{`"returncode"`, `"output"`, `"raw_output"`} {
+		if strings.Contains(scroll, notWant) {
+			t.Errorf("transcript leaks the model's JSON view (%s):\n%s", notWant, scroll)
+		}
+	}
+}
+
+func TestTUIThinkingStateIsLegible(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	msg := model.Message{
+		"role":              "assistant",
+		"content":           "the plan",
+		"reasoning_content": strings.Repeat("pondering ", 30),
+		"extra":             map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0},
+	}
+	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second},
+		Model: &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}", Outputs: []model.Message{msg}}}
+	p := newTUIForTest(t, c, l)
+
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	// Default: off, and the pane says so twice - in the status line and on the
+	// turn itself, with the size of what is hidden.
+	if !strings.Contains(p.view(), "thinking: off") {
+		t.Errorf("status line does not report the thinking state:\n%s", p.view())
+	}
+	if !strings.Contains(p.scrollback(), "[thinking hidden: 300 chars · ctrl+t]") {
+		t.Errorf("hidden thinking is not announced:\n%s", p.scrollback())
+	}
+	if strings.Contains(p.flat(), "pondering") {
+		t.Error("thinking text leaked while hidden")
+	}
+
+	// Toggle on: the same turn now shows it, without a new message arriving.
+	p.press(tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
+	if !strings.Contains(p.view(), "thinking: on") {
+		t.Errorf("status line still says thinking is off:\n%s", p.view())
+	}
+	flat := p.flat()
+	if !strings.Contains(flat, "thinking: pondering") {
+		t.Errorf("toggling did not re-render the turn:\n%s", p.scrollback())
+	}
+	if strings.Contains(flat, "hidden") {
+		t.Errorf("the hidden marker survived the toggle:\n%s", p.scrollback())
+	}
+}
+
+// TestStreamedTurnRendersLikeTheCommittedTurn is the regression test for the
+// pane showing one shape while a turn streams and another when it lands: there
+// is now a single rendering path, so the in-flight block already carries the
+// header and thinking state, and committing replaces it instead of appending a
+// second copy.
+// A turn streaming more than one screen of thinking must not push the prompt
+// off the bottom: the pane keeps the newest lines and says how many it hid.
+func TestStreamingTurnStaysInsideTheScreen(t *testing.T) {
+	c := newConfig("yolo")
+	l := &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}}
+	p := newTUIForTest(t, c, l)
+	p.m.height = 24
+	p.press(tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl}) // thinking on: it has to be rendered
+	l.Handler.Reasoning(strings.Repeat("reasoning about the repository layout. ", 40))
+	l.Handler.Content("now the answer")
+	raw := ansi.Strip(p.view())
+	flat := strings.Join(strings.Fields(raw), " ")
+	if !strings.Contains(flat, "earlier lines of this turn above") {
+		t.Errorf("hidden streaming lines were not acknowledged:\n%s", raw)
+	}
+	if !strings.Contains(flat, "now the answer") {
+		t.Errorf("the pane lost the newest streamed text:\n%s", raw)
+	}
+	if n := len(strings.Split(strings.TrimRight(raw, "\n"), "\n")); n > 24 {
+		t.Errorf("the pane alone is %d lines tall, larger than the 24 line screen:\n%s", n, raw)
+	}
+}
+
+func TestStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	msg := model.Message{
+		"role":              "assistant",
+		"content":           "I will list the files.",
+		"reasoning_content": "the user wants a listing of the current directory",
+		"extra":             map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0},
+	}
+	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second},
+		Model: &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}", Outputs: []model.Message{msg}}}
+	p := newTUIForTest(t, c, l)
+
+	l.Cfg.CostLimit = 10
+	l.Handler.Reasoning("the user wants a ")
+	l.Handler.Reasoning("listing of the current directory")
+	l.Handler.Content("I will list the files.")
+
+	mid := p.scrollback()
+	if got := ansi.Strip(p.log.all()); got != "" {
+		t.Errorf("an in-flight turn must not be printed yet, got:\n%s", got)
+	}
+	if got := strings.Count(mid, "mini-swe-agent (step "); got != 1 {
+		t.Errorf("the in-flight turn should carry the header it will commit with, got %d:\n%s", got, mid)
+	}
+	if !strings.Contains(mid, "[thinking hidden:") {
+		t.Errorf("in-flight thinking state not announced:\n%s", mid)
+	}
+	if !strings.Contains(mid, "I will list the files.") {
+		t.Errorf("streamed content missing:\n%s", mid)
+	}
+
+	// Commit the same turn: it must replace the live block, not duplicate it.
+	p.Message(msg)
+	after := p.scrollback()
+	printed := ansi.Strip(p.log.all())
+	if !strings.Contains(printed, "I will list the files.") {
+		t.Errorf("the committed turn should have been printed into the scrollback, got:\n%s", printed)
+	}
+	if view := strings.Join(strings.Fields(ansi.Strip(p.view())), " "); strings.Contains(view, "list the files") {
+		t.Errorf("printed lines must leave the pane, which cannot show them twice:\n%s", view)
+	}
+	for _, want := range []string{"I will list the files.", "mini-swe-agent (step"} {
+		if got := strings.Count(after, want); got != 1 {
+			t.Errorf("%q appears %d times after committing, want 1:\n%s", want, got, after)
+		}
+	}
+
+	// A second turn appends below the first rather than reusing its slot.
+	finished := make(chan struct{})
+	go func() { _, _ = l.Run(context.Background(), "T"); close(finished) }()
+	<-finished
+	all := p.scrollback()
+	if !strings.Contains(all, "✓ Submitted") {
+		t.Errorf("run did not finish into the pane:\n%s", all)
+	}
+}

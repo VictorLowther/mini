@@ -13,6 +13,7 @@ import (
 	"charm.land/glamour/v2"
 	"charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/model"
@@ -40,6 +41,8 @@ type TUI struct {
 	configName string
 
 	program *tea.Program
+	// printer delivers committed transcript lines above the pane.
+	printer *printer
 	runCtx  context.Context
 
 	mu       sync.Mutex
@@ -93,7 +96,10 @@ func goid() uint64 {
 	return id
 }
 
-// kick delivers a message to the model the way the event loop would (tests only).
+// kick delivers a message to the model the way the event loop would (tests
+// only). Commands returned by Update are deliberately NOT executed: widget
+// commands (cursor focus, blink) block until a real program consumes them.
+// Tests that need a repaint get it from scheduleRepaint's synchronous path.
 func (t *TUI) kick(m *tuiModel, msg tea.Msg) {
 	t.loopMu.Lock()
 	defer t.loopMu.Unlock()
@@ -122,14 +128,18 @@ type streamState struct {
 	content   strings.Builder
 }
 
-// block is one entry in the scrollback. kind is a message role, or one of
-// "note" / "error" for UI-generated lines.
+// block is one entry in the transcript. kind is a message role, or one of
+// "note" / "error" for UI-generated lines. Blocks keep their source text so the
+// pane can be re-rendered when the thinking toggle flips.
 type block struct {
 	kind  string
 	title string
 	text  string
-	// collapsible blocks (reasoning) hide when the user presses t.
-	reasoning bool
+	// reasoning is the model's thinking text for this turn, shown only while
+	// the thinking toggle is on.
+	reasoning string
+	// transcript holds the rendered shell lines of an executed command.
+	transcript []string
 }
 
 // NewTUI builds the UI and installs itself as the loop's streaming handler.
@@ -167,8 +177,8 @@ func (t *TUI) send(msg tea.Msg) {
 		return
 	}
 	if t.fallback != nil {
-		t.loopMu.Lock()
-		defer t.loopMu.Unlock()
+		// The test fallback owns the loop lock (it delivers through
+		// t.deliver); locking here would deadlock.
 		t.fallback(msg)
 	}
 }
@@ -184,6 +194,11 @@ func (t *TUI) Run(ctx context.Context, task string) (map[string]any, error) {
 	t.runCtx = runCtx
 	m := newTUIModel(t, task, cancelRun)
 	t.program = tea.NewProgram(m)
+	// Finished transcript lines are printed above the pane by this goroutine;
+	// see printer.go for why they cannot be printed from Update.
+	t.printer = newPrinterWith(
+		func(body string) { t.program.Printf("%s", body) },
+		func() { t.program.Send(tea.ClearScreen()) })
 
 	go func() {
 		_, err := t.program.Run()
@@ -266,7 +281,7 @@ func (t *TUI) StreamText() (reasoning, content string) {
 	return t.stream.reasoning.String(), t.stream.content.String()
 }
 
-// Message records a finished message in the scrollback.
+// Message records a finished message in the transcript.
 //
 // The system message and the rendered instance template are skipped: they are
 // prompt plumbing, they are enormous, and at the start of a run they bury
@@ -285,19 +300,22 @@ func (t *TUI) Message(m model.Message) {
 		}
 		return
 	}
-	reasoning := false
-	if r, ok := m["reasoning_content"].(string); ok && r != "" {
-		reasoning = t.showReasoning()
+	b := block{kind: role, text: content}
+	if r, ok := m["reasoning_content"].(string); ok {
+		b.reasoning = r
 	}
-	b := block{kind: role, text: content, reasoning: reasoning}
 	switch role {
 	case "assistant":
-		snap := t.snapshot()
-		b.title = fmt.Sprintf("mini-swe-agent (step %d, $%.2f)", snap.Calls, snap.Cost)
-	case "tool":
-		extra, _ := m["extra"].(map[string]any)
-		code, _ := extra["returncode"].(int)
-		b.title = fmt.Sprintf("exit %d", code)
+		b.title = t.AssistantHeader()
+		// The live block held the streamed text; this message supersedes it, so
+		// the buffer starts fresh for the next turn instead of repeating.
+		t.mu.Lock()
+		t.stream = streamState{}
+		t.mu.Unlock()
+	case "tool", "user":
+		if obs, ok := observationOf(m); ok {
+			b.transcript = obs.lines()
+		}
 	case "exit":
 		extra, _ := m["extra"].(map[string]any)
 		status, _ := extra["exit_status"].(string)
@@ -339,7 +357,7 @@ func (t *TUI) RetryNotice(attempt, max int, err error, wait time.Duration) {
 	t.note(fmt.Sprintf("model call failed (attempt %d/%d), retrying in %s: %v", attempt, max, wait.Round(time.Second), err))
 }
 
-// Write lets ui.slash() print into the scrollback.
+// Write lets ui.slash() print into the transcript.
 func (t *TUI) Write(p []byte) (int, error) {
 	t.note(string(p))
 	return len(p), nil
@@ -409,6 +427,14 @@ func (t *TUI) result() (map[string]any, error) {
 	return t.runInfo, t.runError
 }
 
+// AssistantHeader is the title an assistant block carries, matching the
+// reference's add_messages banner. The streaming preview uses it too, so a turn
+// does not gain a header when it commits.
+func (t *TUI) AssistantHeader() string {
+	snap := t.snapshot()
+	return fmt.Sprintf("mini-swe-agent (step %d, $%.2f)", snap.Calls, snap.Cost)
+}
+
 // CancelCurrentTurn interrupts the command in flight (esc).
 func (t *TUI) CancelCurrentTurn() { t.loop.CancelTurn() }
 
@@ -416,7 +442,8 @@ func (t *TUI) CancelCurrentTurn() { t.loop.CancelTurn() }
 func (t *TUI) RunStats() string {
 	snap := t.snapshot()
 	step, cost := snap.Calls, snap.Cost
-	parts := []string{fmt.Sprintf("step %d", step), fmt.Sprintf("$%.2f", cost), t.cfg.Mode}
+	parts := []string{fmt.Sprintf("step %d", step), fmt.Sprintf("$%.2f", cost), t.cfg.Mode,
+		map[bool]string{true: "thinking: on", false: "thinking: off"}[t.showReasoning()]}
 	if snap.ModelTokens > 0 {
 		parts = append(parts, fmt.Sprintf("%d tok", snap.ModelTokens))
 	}
@@ -496,20 +523,40 @@ var tuiStyler = tuiStyles{
 	badge:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")),
 }
 
-// renderBlock turns one scrollback entry into styled text.
-func renderBlock(b block, width int) string {
+// renderBlock turns one transcript entry into styled text. showThinking decides
+// whether a turn's reasoning text is part of it, so toggling re-renders cleanly.
+//
+// Everything here is wrapped to the pane width: the viewport paints one string
+// per line, so an over-long line would soft-wrap at the terminal's edge and
+// shift the whole layout out from under the cursor.
+func renderBlock(b block, width int, showThinking bool) string {
 	st := tuiStyler
+	thinking := ""
+	if b.reasoning != "" {
+		if showThinking {
+			// Thinking wraps at word boundaries; it is prose, and the model's
+			// sentences are the thing being read.
+			wrapped := ansi.Wordwrap(collapseSpaces(b.reasoning), max(width-4, 20), " ")
+			thinking = st.dim.Render("thinking:\n"+hangingIndent(wrapped, "  ")) + "\n"
+		} else {
+			thinking = st.dim.Render(fmt.Sprintf("[thinking hidden: %d chars · ctrl+t]", len(b.reasoning))) + "\n"
+		}
+	}
+	// An executed action reads like a shell transcript: command, directory,
+	// exit status, output. Output keeps its line structure but is broken to fit,
+	// so a single long path cannot rewrap the pane.
+	if len(b.transcript) > 0 {
+		return thinking + st.dim.Render(strings.Join(fitLines(b.transcript, width), "\n"))
+	}
 	switch b.kind {
 	case "assistant":
 		head := ""
 		if b.title != "" {
 			head = st.title.Render(b.title) + "\n"
 		}
-		return head + markdownCache.markdown(b.text, width)
+		return head + thinking + markdownCache.markdown(b.text, width)
 	case "user", "system":
-		return markdownCache.markdown(b.text, width)
-	case "tool":
-		return st.dim.Render("$ "+b.title) + "\n" + st.dim.Render(b.text)
+		return thinking + markdownCache.markdown(b.text, width)
 	case "exit":
 		return st.ok.Render("✓ "+b.title) + "\n" + b.text
 	case "error":
@@ -517,6 +564,49 @@ func renderBlock(b block, width int) string {
 	default:
 		return st.dim.Render(b.text)
 	}
+}
+
+// fitLines breaks any line longer than the pane, keeping existing line breaks
+// and indenting continuations under the line they belong to, so a long path in
+// the transcript stays readable instead of soft-wrapping at the terminal edge
+// (which shifts every line below it).
+func fitLines(lines []string, width int) []string {
+	if width < 20 {
+		return lines
+	}
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if ansi.StringWidth(l) <= width {
+			out = append(out, l)
+			continue
+		}
+		pad := strings.Repeat(" ", len(l)-len(strings.TrimLeft(l, " ")))
+		parts := strings.Split(ansi.Wrap(strings.TrimLeft(l, " "), width, ""), "\n")
+		out = append(out, pad+parts[0])
+		for _, cont := range parts[1:] {
+			if cont == "" {
+				continue
+			}
+			out = append(out, pad+cont)
+		}
+	}
+	return out
+}
+
+// hangingIndent aligns continuation lines under the first line's text.
+func hangingIndent(s, pad string) string {
+	return strings.ReplaceAll(s, "\n", "\n"+pad)
+}
+
+// collapseSpaces makes running text safe to wrap: model output arrives with
+// soft line breaks sprinkled through it, and re-wrapping hard newlines
+// mid-sentence is what made the thinking block ragged.
+func collapseSpaces(s string) string {
+	lines := strings.Split(strings.Trim(s, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimSpace(l)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // truncateVisible keeps long command output from flooding the pane.

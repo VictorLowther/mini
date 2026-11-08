@@ -46,6 +46,7 @@ func (p *Print) Reasoning(text string) {
 	if !p.reasoningOpen {
 		fmt.Fprint(p.Out, "\n[thinking] ")
 		p.reasoningOpen = true
+		p.reasoningKnown = true
 	}
 	fmt.Fprint(p.Out, text)
 }
@@ -83,6 +84,14 @@ func (p *Print) Message(m model.Message) {
 	content, _ := m["content"].(string)
 	if role == "assistant" {
 		p.closeReasoning()
+		// A model reply that never streamed (a replayed turn, or a non-streaming
+		// server) still shows its thinking, so the transcript says what the
+		// model considered rather than nothing.
+		if !p.reasoningKnown {
+			if r, ok := m["reasoning_content"].(string); ok && r != "" {
+				fmt.Fprintf(p.Out, "\n[thinking] %s\n", r)
+			}
+		}
 		if !p.streamed {
 			p.assistantHeader()
 			fmt.Fprintln(p.Out, content)
@@ -94,7 +103,19 @@ func (p *Print) Message(m model.Message) {
 		return
 	}
 	p.closeReasoning()
-	if role == "system" || role == "user" || role == "tool" || role == "exit" {
+	if role == "system" {
+		return // prompt plumbing, not transcript
+	}
+	if obs, ok := observationOf(m); ok {
+		// What ran, where, how it ended, what it printed. The message content is
+		// the JSON the model was promised; nobody reads that in a transcript.
+		fmt.Fprintf(p.Out, "\n%s:\n", capitalize(role))
+		for _, line := range obs.lines() {
+			fmt.Fprintln(p.Out, line)
+		}
+		return
+	}
+	if role == "user" || role == "tool" || role == "exit" {
 		fmt.Fprintf(p.Out, "\n%s:\n", capitalize(role))
 		fmt.Fprintln(p.Out, content)
 	}

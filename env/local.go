@@ -77,6 +77,7 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 	if perr != nil {
 		return Result{
 			ReturnCode:    -1,
+			CWD:           dir,
 			ExceptionInfo: fmt.Sprintf("An error occurred while executing the command: could not parse command: %v", perr),
 			Extra:         map[string]any{"exception_type": "ParserError", "exception": perr.Error()},
 		}, nil
@@ -130,6 +131,7 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 		return Result{
 			Output:        buf.String(),
 			ReturnCode:    -1,
+			CWD:           dir,
 			ExceptionInfo: "An error occurred while executing the command: " + msg,
 			Extra:         map[string]any{"exception_type": "TimeoutExpired", "exception": msg},
 		}, nil
@@ -144,7 +146,7 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 			code = 1
 		}
 	}
-	return Result{Output: buf.String(), ReturnCode: code}, nil
+	return Result{Output: buf.String(), ReturnCode: code, CWD: dir}, nil
 }
 
 func (l *Local) envList() []string {

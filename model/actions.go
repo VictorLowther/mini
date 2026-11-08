@@ -113,6 +113,11 @@ func formatObservations(actions []Action, results []env.Result, obsTemplate stri
 			"returncode":     result.ReturnCode,
 			"timestamp":      float64(time.Now().UnixMilli()) / 1000,
 			"exception_info": result.ExceptionInfo,
+			// Transcript metadata: the UI shows what ran and where without
+			// having to re-read the assistant message. Never sent to the API,
+			// since extra is stripped before the request.
+			"command": action.Command,
+			"cwd":     result.CWD,
 		}
 		for k, v := range result.Extra {
 			extra[k] = v

@@ -431,6 +431,9 @@ func (l *Loop) Query(ctx context.Context) (model.Message, error) {
 		}
 	}
 	l.NCalls++
+	// Publish before the call so a UI streaming this turn labels it with the
+	// step it belongs to, instead of the previous one.
+	l.publish()
 	msg, err := l.Model.Query(ctx, l.Messages, l.Handler)
 	if err != nil {
 		return nil, err

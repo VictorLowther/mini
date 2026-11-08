@@ -442,7 +442,7 @@ func TestFormatObservations(t *testing.T) {
 		{Command: "ls", ToolCallID: "c1"},
 		{Command: "pwd", ToolCallID: "c2"},
 	}}}
-	results := []env.Result{{Output: "file list\n", ReturnCode: 0}}
+	results := []env.Result{{Output: "file list\n", ReturnCode: 0, CWD: "/work"}}
 	out := s.FormatObservations(msg, results, map[string]any{"task": "T"})
 	if len(out) != 2 {
 		t.Fatalf("got %d messages", len(out))
@@ -466,6 +466,13 @@ func TestFormatObservations(t *testing.T) {
 	extra := Extra(out[0])
 	if extra["raw_output"] != "file list\n" || extra["exception_info"] != "" || extra["returncode"] != 0 {
 		t.Errorf("extra = %#v", extra)
+	}
+	// The UI renders the transcript from these instead of parsing content back.
+	if extra["command"] != "ls" {
+		t.Errorf("extra.command = %v", extra["command"])
+	}
+	if extra["cwd"] != "/work" {
+		t.Errorf("extra.cwd = %v", extra["cwd"])
 	}
 	if _, ok := extra["timestamp"].(float64); !ok {
 		t.Errorf("timestamp must marshal like Python's time.time(): %#v", extra["timestamp"])

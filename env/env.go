@@ -20,6 +20,10 @@ type Result struct {
 	ReturnCode    int
 	ExceptionInfo string
 	Extra         map[string]any
+	// CWD is the directory the command actually ran in, resolved by Execute.
+	// It is transcript metadata for the UI, never part of the observation the
+	// model reads.
+	CWD string
 }
 
 // AsMap is the "output" object the observation template renders.

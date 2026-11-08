@@ -11,7 +11,6 @@ import (
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 )
 
@@ -39,10 +38,6 @@ type tuiKeyMap struct {
 	Quit           key.Binding
 	Cancel         key.Binding
 	Confirm        key.Binding
-	ScrollUp       key.Binding
-	ScrollDown     key.Binding
-	PageUp         key.Binding
-	PageDown       key.Binding
 	ToggleThinking key.Binding
 	Help           key.Binding
 }
@@ -56,10 +51,6 @@ func newKeyMap() tuiKeyMap {
 		Quit:           key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "cancel/quit")),
 		Cancel:         key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "cancel turn")),
 		Confirm:        key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "confirm")),
-		ScrollUp:       key.NewBinding(key.WithKeys("up"), key.WithHelp("up", "scroll")),
-		ScrollDown:     key.NewBinding(key.WithKeys("down"), key.WithHelp("down", "scroll")),
-		PageUp:         key.NewBinding(key.WithKeys("pgup", "ctrl+u"), key.WithHelp("pgup", "page up")),
-		PageDown:       key.NewBinding(key.WithKeys("pgdown", "ctrl+d"), key.WithHelp("pgdn", "page down")),
 		ToggleThinking: key.NewBinding(key.WithKeys("ctrl+t"), key.WithHelp("ctrl+t", "thinking")),
 		Help:           key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 	}
@@ -70,7 +61,7 @@ func (k tuiKeyMap) ShortHelp() []key.Binding {
 }
 
 func (k tuiKeyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.Send, k.Newline, k.Cancel, k.Quit}, {k.ScrollUp, k.ScrollDown, k.PageUp, k.PageDown, k.ToggleThinking}}
+	return [][]key.Binding{{k.Send, k.Newline, k.Cancel, k.Quit, k.ToggleThinking}}
 }
 
 // tuiModel is the bubbletea model. It owns no agent state: everything it shows
@@ -79,21 +70,28 @@ type tuiModel struct {
 	t    *TUI
 	task string
 
-	viewport viewport.Model
-	editor   textarea.Model
-	keymap   tuiKeyMap
-	help     help.Model
+	editor textarea.Model
+	keymap tuiKeyMap
+	help   help.Model
 
 	width, height int
 	ready         bool
 
-	// scrollback, already rendered to styled strings
-	lines []string
-	// streamLine is the rendered in-progress assistant block
-	streaming  bool
+	// blocks is the transcript source of truth; lines holds it rendered. Lines
+	// are *printed* to the terminal as they finish (see printNew), so the pane
+	// only ever holds what has not been printed yet and the terminal's own
+	// scrollback is the history.
+	blocks  []block
+	lines   []string
+	printed int
+	// live is the index of the in-flight turn's block, or -1. Streaming updates
+	// that block in place, so a turn is rendered once, by one code path, whether
+	// it is halfway through or committed. (A separate streaming overlay made the
+	// pane show bare output while a turn streamed and then show it again with its
+	// header when the message landed.)
+	live       int // index into blocks/lines of the in-flight turn, or -1
 	dirty      bool
 	refreshing bool
-	streamText string
 
 	// dialog is the modal on top of everything else
 	dialog    string // "", "quit", "limits"
@@ -107,7 +105,6 @@ type tuiModel struct {
 }
 
 func newTUIModel(t *TUI, task string, cancelRun context.CancelFunc) *tuiModel {
-	vp := viewport.New(viewport.WithWidth(t.width), viewport.WithHeight(t.height))
 	ta := textarea.New()
 	ta.ShowLineNumbers = false
 	ta.CharLimit = -1
@@ -119,10 +116,11 @@ func newTUIModel(t *TUI, task string, cancelRun context.CancelFunc) *tuiModel {
 	ta.SetWidth(t.width - 2)
 	ta.Focus()
 	return &tuiModel{
-		t: t, task: task, viewport: vp, editor: ta,
+		t: t, task: task, editor: ta,
 		keymap: newKeyMap(), help: help.New(),
 		width: t.width, height: t.height,
 		cancelRun: cancelRun,
+		live:      -1,
 	}
 }
 
@@ -143,31 +141,23 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.t.mu.Lock()
 		m.t.width, m.t.height = msg.Width, msg.Height
 		m.t.mu.Unlock()
-		m.viewport.SetWidth(msg.Width)
-		m.viewport.SetHeight(m.viewportHeight())
 		m.editor.SetWidth(msg.Width - 2)
 		m.help.SetWidth(msg.Width)
 		m.ready = true
-		m.rebuild()
 		return m, nil
 
 	case streamMsg:
-		m.streaming = true
-		_, m.streamText = m.t.StreamText()
-		m.dirty = true
+		m.updateLive()
 		return m, m.scheduleRepaint()
 
 	case blockMsg:
-		m.appendBlock(msg.b)
-		m.streaming = false
-		m.streamText = ""
+		m.commit(msg.b)
 		return m, nil
 
 	case repaintMsg:
 		m.refreshing = false
 		if m.dirty {
-			m.dirty = false
-			m.refreshViewport()
+			m.flushRepaint()
 		}
 		return m, nil
 
@@ -187,7 +177,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Two numeric answers in a row: step limit, then cost limit.
 			m.openDialog("limits")
 		}
-		m.rebuild()
 		m.editor.Focus()
 		return m, nil
 
@@ -197,7 +186,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// run keeps the pane open so the error stays readable and the user
 		// decides when to leave.
 		if m.finishRun() {
-			return m, tea.Quit
+			return m, m.drainAndQuit()
 		}
 		return m, nil
 
@@ -246,18 +235,6 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return nil
 	case key.Matches(msg, m.keymap.Newline):
 		m.editor.InsertString("\n")
-		return nil
-	case key.Matches(msg, m.keymap.PageUp):
-		m.viewport.HalfPageUp()
-		return nil
-	case key.Matches(msg, m.keymap.PageDown):
-		m.viewport.HalfPageDown()
-		return nil
-	case key.Matches(msg, m.keymap.ScrollUp) && m.editor.Value() == "":
-		m.viewport.ScrollUp(1)
-		return nil
-	case key.Matches(msg, m.keymap.ScrollDown) && m.editor.Value() == "":
-		m.viewport.ScrollDown(1)
 		return nil
 	case key.Matches(msg, m.keymap.ToggleThinking):
 		m.toggleThinking()
@@ -376,8 +353,10 @@ func (m *tuiModel) answerConfirm(text string) { m.t.resolve(Answer{Text: text}) 
 // toggleThinking expands or collapses the model's reasoning text.
 func (m *tuiModel) toggleThinking() {
 	on := m.t.ToggleReasoning()
+	// Every block renders differently now, and the printed history cannot be
+	// edited in place, so replace it: clear the screen and write it again.
+	m.renderAll()
 	m.noteLocal(map[bool]string{true: "thinking shown", false: "thinking hidden"}[on])
-	m.rebuild()
 }
 
 // commandOrSteer handles the input affordances that work whether or not a
@@ -458,7 +437,16 @@ func (m *tuiModel) quit() tea.Cmd {
 	if m.t.loopRunning() {
 		m.cancelRun()
 	}
-	return tea.Quit
+	return m.drainAndQuit()
+}
+
+// drainAndQuit lets queued transcript lines land before the loop stops reading,
+// since printing after that has no reader. Runs as a command, off the loop.
+func (m *tuiModel) drainAndQuit() tea.Cmd {
+	return func() tea.Msg {
+		m.t.printer.flush(300 * time.Millisecond)
+		return tea.Quit()
+	}
 }
 
 // finishRun records the terminal state and reports whether the pane may close.
@@ -502,26 +490,81 @@ func (w modelWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// appendBlock renders and stores one entry, keeping the viewport pinned to the
-// bottom when the user is already there.
-func (m *tuiModel) appendBlock(b block) {
-	m.lines = append(m.lines, renderBlock(b, m.width-2))
-	if b.reasoning {
-		// The thinking text belongs to the assistant block above it.
-		m.lines[len(m.lines)-1] = renderBlock(block{kind: "note", text: "thinking: " + b.text}, m.width-2)
+// appendBlock adds a block with no streaming predecessor: notes, tool results,
+// UI feedback.
+func (m *tuiModel) appendBlock(b block) { m.commit(b) }
+
+// commit places a message in the scrollback, replacing the in-flight turn's
+// block when it is the committed form of that same turn.
+func (m *tuiModel) commit(b block) {
+	show := m.t.showReasoning()
+	switch {
+	case b.kind == "assistant" && m.live >= 0:
+		m.blocks[m.live] = b
+		m.lines[m.live] = renderBlock(b, m.width-2, show)
+		m.live = -1
+	default:
+		// Something else is ending the turn: release the in-flight block so the
+		// pane stops showing a half-streamed turn, and never let a later commit
+		// overwrite text that already reached the scrollback.
+		if m.live >= 0 {
+			m.live = -1
+			m.printNew()
+		}
+		m.blocks = append(m.blocks, b)
+		m.lines = append(m.lines, renderBlock(b, m.width-2, show))
 	}
-	m.refreshViewport()
+	m.printNew()
 }
 
-// rebuild re-renders the viewport immediately (user-visible state changed
-// outside the stream).
-func (m *tuiModel) rebuild() {
-	m.dirty = false
-	m.refreshViewport()
+// printNew sends every finished line above the pane, into the terminal's own
+// scrollback. bubbletea's Printf scrolls the real screen and writes there, so
+// committed output behaves like shell output: reachable with the wheel or
+// shift-pageup, selectable, and still on screen after mini exits. (A viewport
+// of the transcript could offer none of that: it shows only what fits, and what
+// fell off its top was gone for good.)
+func (m *tuiModel) printNew() {
+	if m.printed >= len(m.lines) {
+		return
+	}
+	body := strings.TrimRight(strings.Join(m.lines[m.printed:], "\n\n"), "\n")
+	m.printed = len(m.lines)
+	m.t.printer.Print(body)
 }
 
-// scheduleRepaint returns at most one pending repaint tick.
+// updateLive re-renders the in-flight turn from whatever has streamed so far.
+func (m *tuiModel) updateLive() {
+	reasoning, content := m.t.StreamText()
+	if reasoning == "" && content == "" {
+		return
+	}
+	b := block{kind: "assistant", text: content, reasoning: reasoning}
+	if m.live < 0 {
+		b.title = m.t.AssistantHeader()
+		m.blocks = append(m.blocks, b)
+		m.lines = append(m.lines, "")
+		m.live = len(m.blocks) - 1
+	} else {
+		b.title = m.blocks[m.live].title
+		if b.title == "" {
+			b.title = m.t.AssistantHeader()
+		}
+		m.blocks[m.live] = b
+	}
+	m.dirty = true
+}
+
+// scheduleRepaint coalesces repaints: at most one tick is in flight, and with
+// no program running (tests drive the loop directly) the repaint happens right
+// here instead, since nothing would ever deliver the tick.
 func (m *tuiModel) scheduleRepaint() tea.Cmd {
+	if !m.dirty {
+		return nil
+	}
+	if m.t.program == nil {
+		m.flushRepaint()
+		return nil
+	}
 	if m.refreshing {
 		return nil
 	}
@@ -532,43 +575,59 @@ func (m *tuiModel) scheduleRepaint() tea.Cmd {
 	}
 }
 
-func (m *tuiModel) refreshViewport() {
-	atBottom := m.viewport.AtBottom()
-	var sb strings.Builder
-	for _, l := range m.lines {
-		sb.WriteString(l)
-		sb.WriteString("\n\n")
+// renderAll re-renders every block (the thinking toggle changes how past turns
+// look) and replaces the printed history with the result. The in-flight turn is
+// left unprinted: it is still the pane's job.
+func (m *tuiModel) renderAll() {
+	show := m.t.showReasoning()
+	m.lines = m.lines[:0]
+	for _, b := range m.blocks {
+		m.lines = append(m.lines, renderBlock(b, m.width-2, show))
 	}
-	if m.streaming {
-		// Thinking text is collapsed by default: it is by far the largest
-		// stream and burying the useful output under it is what makes the pane
-		// unreadable mid-turn. `t` shows it.
-		reasoning, _ := m.t.StreamText()
-		if m.t.showReasoning() && reasoning != "" {
-			sb.WriteString(tuiStyler.dim.Render("thinking: " + truncateVisible(reasoning, 40)))
-			sb.WriteString("\n")
-		} else if reasoning != "" {
-			sb.WriteString(tuiStyler.dim.Render(fmt.Sprintf("thinking… %d chars (t to show)", len(reasoning))))
-			sb.WriteString("\n")
-		}
-		if m.streamText != "" {
-			sb.WriteString(m.streamText)
-		}
+	upTo := len(m.lines)
+	if m.live >= 0 {
+		upTo = m.live
 	}
-	m.viewport.SetContent(sb.String())
-	if atBottom {
-		m.viewport.GotoBottom()
+	m.printed = upTo
+	body := strings.TrimRight(strings.Join(m.lines[:upTo], "\n\n"), "\n")
+	// shortcut: this rewrites the screen but cannot retract the terminal's own
+	// scrollback, so the previous rendering stays above as history (like any
+	// re-printed shell output). Full fidelity lives in the trajectory file.
+	m.t.printer.reprint(body)
+}
+
+// flushRepaint re-renders the in-flight turn. Printed lines keep their render:
+// they are in the terminal's history now.
+func (m *tuiModel) flushRepaint() {
+	m.dirty = false
+	if m.live >= 0 {
+		m.lines[m.live] = renderBlock(m.blocks[m.live], m.width-2, m.t.showReasoning())
 	}
 }
 
 // --------------------------------------------------------------- the view ---
 
-func (m *tuiModel) viewportHeight() int {
-	h := m.height - m.footerHeight() - 2
-	if h < 3 {
-		h = 3
+// liveView returns the unprinted tail of the transcript: the turn in flight.
+// It is capped to the room left above the prompt because anything older has
+// already been printed, or is still arriving.
+func (m *tuiModel) liveView() string {
+	avail := m.height - m.footerHeight() - 2
+	if avail < 1 {
+		avail = 1
 	}
-	return h
+	var raw []string
+	for _, l := range m.lines[m.printed:] {
+		if l != "" {
+			raw = append(raw, strings.Split(l, "\n")...)
+		}
+	}
+	if hidden := len(raw) - avail; hidden > 0 && avail > 1 {
+		// Keep the newest lines and make room for the marker among them: the
+		// beginning of a long turn is already unreachable by other means.
+		marker := tuiStyler.dim.Render(fmt.Sprintf("⋮ %d earlier lines of this turn above", hidden))
+		raw = append([]string{marker}, raw[len(raw)-avail+1:]...)
+	}
+	return strings.Join(raw, "\n")
 }
 
 func (m *tuiModel) footerHeight() int {
@@ -617,7 +676,7 @@ func (m *tuiModel) content() string {
 	var sb strings.Builder
 	header := fmt.Sprintf("mini-go %s · %s @ %s · config %s", agent.Version, m.t.modelName, m.t.baseURL, m.t.configName)
 	sb.WriteString(tuiStyler.dim.Render(header) + "\n")
-	sb.WriteString(m.viewport.View())
+	sb.WriteString(m.liveView())
 	sb.WriteString("\n")
 	if panel := m.pendingPanel(); panel != "" {
 		sb.WriteString(panel + "\n")
