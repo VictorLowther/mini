@@ -57,14 +57,35 @@ func (p *printer) push(fn func()) {
 	}
 }
 
-// Print appends a block above the pane. It never blocks the caller: the queue is
-// unbounded on purpose, so a caller holding the update loop cannot stall on a
-// terminal that is behind.
+// Print appends transcript rows above the pane. It never blocks the caller: the
+// queue is unbounded on purpose, so a caller holding the update loop cannot stall
+// on a terminal that is behind.
+//
+// The insert size is not limited, because the pane is exactly as tall as the
+// screen (see tuiModel.avail): an insert then just scrolls the terminal, and the
+// rows it consumes are the rows being printed. A shorter pane is what breaks -
+// measured, not theorised.
 func (p *printer) Print(s string) {
 	if s == "" {
 		return
 	}
-	p.push(func() { p.out(s) })
+	body := s
+	p.push(func() { p.write(body) })
+}
+
+// write puts one insert above the pane, then demands a full repaint of it.
+//
+// The insert lands in the top rows of the frame - with a frame as tall as the
+// screen there is nowhere else for it - and the window's rows below shift up by
+// the inserted height. The renderer's next frame is a diff, and rows whose text it
+// believes is unchanged are left alone, so stale tails survive where a shorter line
+// now sits. Zero drives the same repair (its throttled stream-clear); the symptom
+// without it is a row like "drwxr-xr-x ..ng." - an old line's leftovers.
+func (p *printer) write(body string) {
+	p.out(body)
+	if p.clear != nil {
+		p.clear()
+	}
 }
 
 // reprint replaces the printed history: the screen is cleared and `s` written in
@@ -76,7 +97,7 @@ func (p *printer) reprint(s string) {
 			p.clear()
 		}
 		if s != "" {
-			p.out(s)
+			p.write(s)
 		}
 	})
 }

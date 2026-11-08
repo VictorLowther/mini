@@ -3,14 +3,17 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/VictorLowther/mini/agent"
@@ -52,6 +55,11 @@ func (p pane) value() string     { var s string; p.doOn(func() { s = p.m.editor.
 func (p pane) view() string      { var s string; p.doOn(func() { s = p.m.View().Content }); return s }
 func (p pane) dialog() string    { var s string; p.doOn(func() { s = p.m.dialog }); return s }
 
+// note appends a transcript entry the way a UI note or tool result would.
+func (p pane) note(text string) {
+	p.doOn(func() { p.m.appendBlock(block{kind: "note", text: text}) })
+}
+
 // scrollback returns the whole transcript - printed lines and pane lines are the
 // same slice of m.lines - with lipgloss padding removed, so assertions read
 // like the transcript instead of like a styled screen.
@@ -65,7 +73,7 @@ func (p pane) dense() string { return strings.Join(strings.Fields(p.scrollback()
 func (p pane) scrollback() string {
 	var s string
 	p.doOn(func() {
-		stripped := ansi.Strip(strings.Join(p.m.lines, "\n"))
+		stripped := ansi.Strip(strings.Join(p.m.allRows(), "\n"))
 		lines := make([]string, 0, 32)
 		for _, l := range strings.Split(stripped, "\n") {
 			lines = append(lines, strings.TrimRight(l, " \t"))
@@ -699,17 +707,30 @@ func TestStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 	// Commit the same turn: it must replace the live block, not duplicate it.
 	p.Message(msg)
 	after := p.scrollback()
-	printed := ansi.Strip(p.log.all())
-	if !strings.Contains(printed, "I will list the files.") {
-		t.Errorf("the committed turn should have been printed into the scrollback, got:\n%s", printed)
-	}
-	if view := strings.Join(strings.Fields(ansi.Strip(p.view())), " "); strings.Contains(view, "list the files") {
-		t.Errorf("printed lines must leave the pane, which cannot show them twice:\n%s", view)
+	// It fits in the frame, so it stays there: printing is for what scrolls out,
+	// and a row printed while still on screen would show up twice.
+	if got := ansi.Strip(p.log.all()); strings.Contains(got, "list the files") {
+		t.Errorf("a turn that still fits the frame must not be printed yet:\n%s", got)
 	}
 	for _, want := range []string{"I will list the files.", "mini-swe-agent (step"} {
 		if got := strings.Count(after, want); got != 1 {
 			t.Errorf("%q appears %d times after committing, want 1:\n%s", want, got, after)
 		}
+	}
+
+	// Push the transcript far enough that the first turn leaves the top of the
+	// frame: only then is it printed, and it leaves the window behind.
+	for range 30 {
+		p.note("filler row")
+	}
+	if got := ansi.Strip(p.log.all()); strings.Count(got, "I will list the files.") != 1 {
+		t.Errorf("the scrolled-out turn should be printed exactly once:\n%s", got)
+	}
+	if view := strings.Join(strings.Fields(ansi.Strip(p.view())), " "); strings.Contains(view, "list the files") {
+		t.Errorf("printed rows must leave the window, which cannot show them twice:\n%s", view)
+	}
+	if got := strings.Count(ansi.Strip(p.scrollback()), "I will list the files."); got != 1 {
+		t.Errorf("the transcript holds the turn %d times, want 1", got)
 	}
 
 	// A second turn appends below the first rather than reusing its slot.
@@ -719,5 +740,157 @@ func TestStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 	all := p.scrollback()
 	if !strings.Contains(all, "✓ Submitted") {
 		t.Errorf("run did not finish into the pane:\n%s", all)
+	}
+}
+
+// The footer must not crawl up the terminal. bubbletea's inline renderer repaints
+// the rows it believes the frame occupies, so a frame that changes height leaves
+// stale rows behind - the symptom is the prompt ending up mid-screen with blank
+// space under it. The frame therefore holds a constant height and prints what
+// overflows instead.
+func TestFrameHeightIsConstant(t *testing.T) {
+	c := newConfig("confirm")
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
+	p := newTUIForTest(t, c, l)
+	p.m.height = 24
+	p.m.width = 90
+	p.m.ready = true
+
+	seen := map[string]int{}
+	measure := func(when string) {
+		// Through the loop lock, exactly as the renderer does it.
+		var h int
+		var wide []int
+		p.doOn(func() {
+			content := p.m.viewContent()
+			h = lipgloss.Height(content)
+			for _, row := range strings.Split(content, "\n") {
+				// A row wider than the pane is wrapped by the terminal instead of
+				// by us, so the frame is taller than the height measured from it.
+				if w := ansi.StringWidth(row); w > p.m.width {
+					wide = append(wide, w)
+					slices.Sort(wide)
+					wide = wide[:1] // keep only the widest
+				}
+			}
+		})
+		if len(wide) > 0 {
+			t.Errorf("%s: frame rows exceed the %d-column pane (widest %d)", when, p.m.width, wide[0])
+		}
+		seen[when] = h
+	}
+	measure("idle")
+	l.Handler.Reasoning(strings.Repeat("thinking it over. ", 40))
+	measure("streaming")
+	p.note(strings.Repeat("long note ", 60))
+	measure("after output")
+	p.press(tea.KeyPressMsg{Code: '?', Text: "?"})
+	measure("help expanded")
+	p.typeText("first line\nsecond line\nthird line")
+	measure("multi-line draft")
+	q := ask(t, p.TUI, Question{Kind: AskConfirm, Title: "proceed?", Actions: []model.Action{{Command: "echo a"}, {Command: "echo b"}}})
+	measure("confirm panel")
+	p.resolve(Answer{Text: "y"})
+	<-q
+	measure("panel answered")
+	p.m.openDialog("limits")
+	measure("limits dialog")
+
+	// The frame fills the screen: that is what lets an insert above it scroll the
+	// terminal instead of swallowing the pane's own rows.
+	want := p.m.height
+	for when, h := range seen {
+		if h != want {
+			t.Errorf("frame height changed to %d rows %s (want a constant %d): the footer would drift", h, when, want)
+		}
+	}
+}
+
+// The startup line is transcript, not part of the pane's chrome: printing above
+// the pane writes into the frame's top rows, so nothing that is not a transcript
+// row may live there. It must therefore appear once for the whole session, not
+// once per repaint.
+func TestSessionHeaderIsPrintedOnce(t *testing.T) {
+	c := newConfig("yolo")
+	l := &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}}
+	p := newTUIForTest(t, c, l)
+	p.press(tea.WindowSizeMsg{Width: 90, Height: 24})
+	p.press(tea.WindowSizeMsg{Width: 90, Height: 24})
+	p.note(strings.Repeat("filler row\n", 40))
+	count := strings.Count(ansi.Strip(p.scrollback()), "mini-go "+agent.Version)
+	if count != 1 {
+		t.Errorf("session header appears %d times, want 1", count)
+	}
+}
+
+// Narrowing the terminal must re-wrap the rows still in the frame: a row rendered
+// for the old width wraps into two and makes the frame taller than the screen,
+// which is the footer drifting again. Rows already printed are in the terminal's
+// history and stay as they are.
+func TestResizeRewrapsTheUnprintedTail(t *testing.T) {
+	c := newConfig("yolo")
+	p := newTUIForTest(t, c, &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}})
+	p.press(tea.WindowSizeMsg{Width: 90, Height: 24})
+	long := strings.Repeat("wide content ", 20)
+	p.note(long)
+	before := p.m.printed
+	p.press(tea.WindowSizeMsg{Width: 50, Height: 24})
+
+	h := 0
+	var wide []int
+	p.doOn(func() {
+		content := p.m.viewContent()
+		h = lipgloss.Height(content)
+		for _, row := range strings.Split(content, "\n") {
+			if w := ansi.StringWidth(row); w > 50 {
+				wide = append(wide, w)
+				t.Logf("over-wide row (%d): %q", w, row)
+			}
+		}
+	})
+	if h != 24 {
+		t.Errorf("after narrowing the frame is %d rows, want the screen's 24", h)
+	}
+	if len(wide) > 0 {
+		// Every row, chrome included: a row the terminal wraps is a row taller
+		// than the measured frame, which is the footer drifting again.
+		t.Errorf("after narrowing to 50 columns, %d frame rows are still wider (widest %d)", len(wide), wide[0])
+	}
+	p.doOn(func() {
+		for _, row := range p.m.rows[p.m.printed:] {
+			if w := ansi.StringWidth(row); w > 48 {
+				t.Fatalf("an unprinted row is %d columns wide after re-wrapping to 50: %q", w, row)
+			}
+		}
+		if p.m.printed < before {
+			t.Errorf("re-wrapping unprinted rows (want the printed frontier to hold at %d, got %d)", before, p.m.printed)
+		}
+	})
+}
+
+// The thinking toggle re-renders and reprints the whole history; a later resize
+// then re-wraps the rows that are still in the frame. The two must not lose
+// transcript: every row that was there before has to still be accounted for.
+func TestToggleThenResizeKeepsTheTranscript(t *testing.T) {
+	c := newConfig("yolo")
+	l := &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}}
+	p := newTUIForTest(t, c, l)
+	p.press(tea.WindowSizeMsg{Width: 90, Height: 24})
+	for i := range 12 {
+		p.note(fmt.Sprintf("turn %d: %s", i, strings.Repeat("some output ", 12)))
+	}
+	p.press(tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
+	before := p.scrollback()
+	p.press(tea.WindowSizeMsg{Width: 60, Height: 24})
+	p.doOn(func() {
+		if p.m.printed != p.m.rowsThroughBlock(p.m.printedMark) {
+			t.Errorf("the print frontier is not on a block boundary: %d rows, marker %d", p.m.printed, p.m.printedMark)
+		}
+	})
+	after := p.scrollback()
+	for _, want := range []string{"turn 0:", "turn 6:", "turn 11:"} {
+		if !strings.Contains(after, want) {
+			t.Errorf("%q lost from the transcript by the toggle+resize; before:\n%s\nafter:\n%s", want, before, after)
+		}
 	}
 }

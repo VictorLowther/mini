@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // Messages sent to the program from the agent goroutine.
@@ -77,13 +79,19 @@ type tuiModel struct {
 	width, height int
 	ready         bool
 
-	// blocks is the transcript source of truth; lines holds it rendered. Lines
-	// are *printed* to the terminal as they finish (see printNew), so the pane
-	// only ever holds what has not been printed yet and the terminal's own
-	// scrollback is the history.
+	// blocks is the transcript source of truth; rows holds every *finished*
+	// block rendered to lines. Rows scroll out of the fixed-height frame into
+	// the terminal's own scrollback (see syncWindow), and printed counts the rows
+	// that already went. The in-flight turn is rendered on demand and never lives
+	// in rows, so streaming cannot disturb the printed history.
 	blocks  []block
-	lines   []string
+	rows    []string
 	printed int
+	// rowCounts is how many rows each finalized block contributed, so the print
+	// frontier can be aligned to block boundaries and the unprinted tail re-wrapped
+	// when the terminal is resized.
+	rowCounts   []int
+	printedMark int // block index the printed prefix ends at
 	// live is the index of the in-flight turn's block, or -1. Streaming updates
 	// that block in place, so a turn is rendered once, by one code path, whether
 	// it is halfway through or committed. (A separate streaming overlay made the
@@ -110,18 +118,22 @@ func newTUIModel(t *TUI, task string, cancelRun context.CancelFunc) *tuiModel {
 	ta.CharLimit = -1
 	ta.DynamicHeight = true
 	ta.MinHeight = 1
-	ta.MaxHeight = 15
+	ta.MaxHeight = 5
 	ta.Prompt = "│ "
 	ta.Placeholder = "message · enter sends · \\ + enter or /m for multi-line · /h commands"
 	ta.SetWidth(t.width - 2)
 	ta.Focus()
-	return &tuiModel{
-		t: t, task: task, editor: ta,
+	m := &tuiModel{
+		t: t, task: task, live: -1, editor: ta,
 		keymap: newKeyMap(), help: help.New(),
 		width: t.width, height: t.height,
 		cancelRun: cancelRun,
-		live:      -1,
 	}
+	// First thing in the transcript: like a shell's banner, it scrolls away with
+	// the history instead of occupying a row of the pane - the frame's top rows
+	// are where printing above the pane lands.
+	m.sessionHeader()
+	return m
 }
 
 // Init runs on bubbletea's update goroutine, which is the identity the send
@@ -135,6 +147,10 @@ func (m *tuiModel) Init() tea.Cmd {
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.t.setInLoop(true)
 	defer m.t.setInLoop(false)
+	// Any message can change the chrome (a panel opening, a draft growing a
+	// line), which changes how many transcript rows fit - so the window is
+	// reconciled on every pass, not only where a block was committed.
+	defer m.syncWindow()
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -144,6 +160,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.editor.SetWidth(msg.Width - 2)
 		m.help.SetWidth(msg.Width)
 		m.ready = true
+		m.rewrap()
 		return m, nil
 
 	case streamMsg:
@@ -473,6 +490,13 @@ func (m *tuiModel) finishRun() (quit bool) {
 // the update loop MUST use this instead of TUI.note: bubbletea's Send is an
 // unbuffered channel hand-off, so sending from inside Update deadlocks the
 // program forever (the pane renders but never reads another key).
+// sessionHeader is the line a shell prints before its first prompt: session info
+// once, into the transcript, where it can scroll away with the history.
+func (m *tuiModel) sessionHeader() {
+	m.noteLocal(tuiStyler.dim.Render(fmt.Sprintf("mini-go %s · %s @ %s · config %s",
+		agent.Version, m.t.modelName, m.t.baseURL, m.t.configName)))
+}
+
 func (m *tuiModel) noteLocal(text string) {
 	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
 		if line != "" {
@@ -494,42 +518,139 @@ func (w modelWriter) Write(p []byte) (int, error) {
 // UI feedback.
 func (m *tuiModel) appendBlock(b block) { m.commit(b) }
 
-// commit places a message in the scrollback, replacing the in-flight turn's
-// block when it is the committed form of that same turn.
+// commit places a finished block in the transcript, replacing the in-flight
+// turn's block when it is the committed form of that same turn.
 func (m *tuiModel) commit(b block) {
-	show := m.t.showReasoning()
 	switch {
 	case b.kind == "assistant" && m.live >= 0:
 		m.blocks[m.live] = b
-		m.lines[m.live] = renderBlock(b, m.width-2, show)
 		m.live = -1
 	default:
-		// Something else is ending the turn: release the in-flight block so the
-		// pane stops showing a half-streamed turn, and never let a later commit
-		// overwrite text that already reached the scrollback.
+		// Something else ended the turn. Keep whatever streamed as its own entry
+		// rather than letting a later commit overwrite rows that may already have
+		// been printed.
 		if m.live >= 0 {
+			m.finalize(m.blocks[m.live])
 			m.live = -1
-			m.printNew()
 		}
 		m.blocks = append(m.blocks, b)
-		m.lines = append(m.lines, renderBlock(b, m.width-2, show))
 	}
-	m.printNew()
+	m.finalize(m.blocks[len(m.blocks)-1])
+	m.syncWindow()
 }
 
-// printNew sends every finished line above the pane, into the terminal's own
-// scrollback. bubbletea's Printf scrolls the real screen and writes there, so
-// committed output behaves like shell output: reachable with the wheel or
-// shift-pageup, selectable, and still on screen after mini exits. (A viewport
-// of the transcript could offer none of that: it shows only what fits, and what
-// fell off its top was gone for good.)
-func (m *tuiModel) printNew() {
-	if m.printed >= len(m.lines) {
-		return
+// finalize appends one block's rows to the transcript. Committed rows never
+// change again, which is what makes printing them exactly once safe.
+func (m *tuiModel) finalize(b block) {
+	rows := blockRows(b, m.width-2, m.t.showReasoning())
+	m.rows = append(m.rows, rows...)
+	m.rowCounts = append(m.rowCounts, len(rows))
+}
+
+// blockRows renders a block into the rows the terminal will hold, plus the blank
+// row that separates it from the next one.
+func blockRows(b block, width int, showThinking bool) []string {
+	return append(strings.Split(renderBlock(b, width, showThinking), "\n"), "")
+}
+
+// liveRows renders the turn in flight: the only transcript text that changes.
+func (m *tuiModel) liveRows() []string {
+	if m.live < 0 {
+		return nil
 	}
-	body := strings.TrimRight(strings.Join(m.lines[m.printed:], "\n\n"), "\n")
-	m.printed = len(m.lines)
-	m.t.printer.Print(body)
+	return blockRows(m.blocks[m.live], m.width-2, m.t.showReasoning())
+}
+
+// syncWindow prints the transcript rows that no longer fit in the frame.
+//
+// The frame keeps a constant height for the whole session (see window), because
+// bubbletea's inline renderer cannot handle a frame that shrinks while lines are
+// printed above it: the footer creeps up the terminal and leaves rows of stale
+// blank space under it. So rather than the pane resizing to its content, content
+// that leaves the top of the pane is written into the terminal's own scrollback -
+// reachable with the wheel or shift-pageup, selectable, and still on screen after
+// mini exits. (A viewport that could only show what fits offered none of that,
+// and what fell off its top was gone for good.)
+func (m *tuiModel) syncWindow() {
+	keep := m.avail() - len(m.liveRows())
+	if keep < 0 {
+		keep = 0
+	}
+	if target := len(m.rows) - keep; target > m.printed {
+		start := m.printed
+		m.advanceFrontier(target)
+		if m.printed > start {
+			m.print(m.rows[start:m.printed])
+		}
+	}
+}
+
+// allRows is the whole transcript, printed or not, plus the turn in flight. The
+// terminal shows it as scrollback above the frame plus the frame's own window;
+// tests and the reprint paths read it as one list.
+func (m *tuiModel) allRows() []string {
+	return append(slices.Clone(m.rows), m.liveRows()...)
+}
+
+// advanceFrontier moves the printed cursor forward to the largest block boundary at
+// or before target, keeping printed (rows) and printedMark (blocks) in step. Rows
+// are printed as they leave the window, and a block split across that frontier could
+// not be re-rendered on resize; aligning to blocks keeps each printed unit exactly
+// what renderBlock produced. The cursor only moves forward, so this is O(1)
+// amortised rather than a rescan of the history on every repaint.
+func (m *tuiModel) advanceFrontier(target int) {
+	if target > len(m.rows) {
+		target = len(m.rows)
+	}
+	for m.printedMark < len(m.rowCounts) && m.printed+m.rowCounts[m.printedMark] <= target {
+		m.printed += m.rowCounts[m.printedMark]
+		m.printedMark++
+	}
+}
+
+// rowsThroughBlock is the number of rows the first n blocks contributed.
+func (m *tuiModel) rowsThroughBlock(n int) int {
+	total := 0
+	for _, c := range m.rowCounts[:max(n, 0)] {
+		total += c
+	}
+	return total
+}
+
+// rewrap re-renders the unprinted tail at the current width. Rows already in the
+// terminal's history are fixed - they cannot be edited in place - but rows still
+// in the frame must match the new width, or they wrap and make the frame taller
+// than the screen again, which is the footer drifting all over.
+func (m *tuiModel) rewrap() {
+	if m.printed != m.rowsThroughBlock(m.printedMark) {
+		// The frontier is block-aligned by construction; clamp rather than
+		// corrupt if an earlier path ever breaks that.
+		m.printed = m.rowsThroughBlock(m.printedMark)
+	}
+	kept := m.printed
+	m.rows = slices.Clone(m.rows[:kept])
+	m.rowCounts = m.rowCounts[:m.printedMark]
+	show := m.t.showReasoning()
+	for _, b := range m.finalizedBlocks()[m.printedMark:] {
+		rows := blockRows(b, m.width-2, show)
+		m.rows = append(m.rows, rows...)
+		m.rowCounts = append(m.rowCounts, len(rows))
+	}
+}
+
+// finalizedBlocks are the blocks whose rows live in m.rows; the in-flight turn is
+// rendered on demand instead.
+func (m *tuiModel) finalizedBlocks() []block {
+	if m.live >= 0 && len(m.blocks) > m.live {
+		return m.blocks[:m.live]
+	}
+	return m.blocks
+}
+
+// print hands rows to the printer goroutine. It must not call program.Printf
+// itself: that hands off to the very loop this runs on.
+func (m *tuiModel) print(rows []string) {
+	m.t.printer.Print(strings.TrimRight(strings.Join(rows, "\n"), "\n"))
 }
 
 // updateLive re-renders the in-flight turn from whatever has streamed so far.
@@ -542,7 +663,6 @@ func (m *tuiModel) updateLive() {
 	if m.live < 0 {
 		b.title = m.t.AssistantHeader()
 		m.blocks = append(m.blocks, b)
-		m.lines = append(m.lines, "")
 		m.live = len(m.blocks) - 1
 	} else {
 		b.title = m.blocks[m.live].title
@@ -576,78 +696,104 @@ func (m *tuiModel) scheduleRepaint() tea.Cmd {
 }
 
 // renderAll re-renders every block (the thinking toggle changes how past turns
-// look) and replaces the printed history with the result. The in-flight turn is
-// left unprinted: it is still the pane's job.
+// look) and replaces the printed history with the result, keeping the newest
+// rows in the frame so the pane does not go blank.
 func (m *tuiModel) renderAll() {
 	show := m.t.showReasoning()
-	m.lines = m.lines[:0]
-	for _, b := range m.blocks {
-		m.lines = append(m.lines, renderBlock(b, m.width-2, show))
+	m.rows = nil
+	m.rowCounts = nil
+	m.printedMark = 0
+	for i, b := range m.blocks {
+		if i == m.live {
+			continue // still streaming: the pane's job, not printed history
+		}
+		rows := blockRows(b, m.width-2, show)
+		m.rows = append(m.rows, rows...)
+		m.rowCounts = append(m.rowCounts, len(rows))
 	}
-	upTo := len(m.lines)
-	if m.live >= 0 {
-		upTo = m.live
-	}
-	m.printed = upTo
-	body := strings.TrimRight(strings.Join(m.lines[:upTo], "\n\n"), "\n")
+	// The tail that still fits the frame stays unprinted and on screen; the
+	// frontier lands on a block boundary, and blockBoundary already left
+	// printedMark pointing there.
+	m.advanceFrontier(max(len(m.rows)-m.avail(), 0))
+	body := strings.TrimRight(strings.Join(m.rows[:m.printed], "\n"), "\n")
 	// shortcut: this rewrites the screen but cannot retract the terminal's own
-	// scrollback, so the previous rendering stays above as history (like any
-	// re-printed shell output). Full fidelity lives in the trajectory file.
+	// scrollback, so the previous rendering stays above as history. The full
+	// fidelity copy is the trajectory file.
 	m.t.printer.reprint(body)
 }
 
-// flushRepaint re-renders the in-flight turn. Printed lines keep their render:
-// they are in the terminal's history now.
+// flushRepaint refreshes the frame for the turn in flight and prints whatever
+// the new rows pushed out of the top.
 func (m *tuiModel) flushRepaint() {
 	m.dirty = false
-	if m.live >= 0 {
-		m.lines[m.live] = renderBlock(m.blocks[m.live], m.width-2, m.t.showReasoning())
-	}
+	m.syncWindow()
 }
 
 // --------------------------------------------------------------- the view ---
 
-// liveView returns the unprinted tail of the transcript: the turn in flight.
-// It is capped to the room left above the prompt because anything older has
-// already been printed, or is still arriving.
-func (m *tuiModel) liveView() string {
-	avail := m.height - m.footerHeight() - 2
-	if avail < 1 {
-		avail = 1
-	}
-	var raw []string
-	for _, l := range m.lines[m.printed:] {
-		if l != "" {
-			raw = append(raw, strings.Split(l, "\n")...)
+// window returns exactly avail rows of transcript: the newest ones, padded with
+// blanks while the session is short. Constant height is the point - the prompt
+// must not move as output flows.
+func (m *tuiModel) window() string {
+	avail := m.avail()
+	rows := slices.Clone(m.rows[m.printed:])
+	rows = append(rows, m.liveRows()...)
+	if hidden := len(rows) - avail; hidden > 0 {
+		if avail > 1 {
+			marker := tuiStyler.dim.Render(fmt.Sprintf("⋮ %d earlier lines of this turn above", hidden))
+			rows = append([]string{marker}, rows[hidden:]...)
+			if len(rows) > avail {
+				rows = rows[:avail]
+			}
+		} else {
+			rows = rows[hidden:]
 		}
 	}
-	if hidden := len(raw) - avail; hidden > 0 && avail > 1 {
-		// Keep the newest lines and make room for the marker among them: the
-		// beginning of a long turn is already unreachable by other means.
-		marker := tuiStyler.dim.Render(fmt.Sprintf("⋮ %d earlier lines of this turn above", hidden))
-		raw = append([]string{marker}, raw[len(raw)-avail+1:]...)
+	for len(rows) < avail {
+		rows = append(rows, "")
 	}
-	return strings.Join(raw, "\n")
+	return strings.Join(rows, "\n")
 }
 
-func (m *tuiModel) footerHeight() int {
-	lines := 1 // status
-	lines += 1 // help
-	if m.dialog != "" {
-		lines += 2
+// avail is the transcript rows inside the frame: the screen minus the chrome
+// actually being drawn, so a panel opening or a draft growing a line moves rows
+// between the window and the chrome but never changes the frame's height.
+//
+// The frame is exactly as tall as the screen, and that is load-bearing. Printing
+// above the pane inserts rows at the top of the frame region, so with a
+// full-height frame the insert simply scrolls the terminal and the rows it
+// consumes are the ones being printed. With a shorter frame the insert swallows
+// the pane's own bottom rows and shifts the whole pane down, and the next repaint
+// (a diff of unchanged content) never puts them back. Measured, not theorised:
+// five 6-row inserts above a 7-row pane stranded the footer at row 7 of 24 with a
+// stale copy of its header left behind, while the same inserts against a
+// full-height pane kept the footer on row 24.
+func (m *tuiModel) avail() int {
+	h := m.height - m.chromeRows()
+	if h < 1 {
+		h = 1
 	}
-	if q := m.pendingVisible(); q != "" {
-		lines += 2
-	}
-	if m.editor.Value() == "" {
-		lines += 1
-	} else {
-		lines += 1 + strings.Count(m.editor.Value(), "\n")
-	}
-	return lines
+	return h
 }
 
-// pendingVisible describes the question being answered, for the status area.
+const windowPlaceholder = "\x00window\x00"
+
+// chromeRows measures the frame's non-transcript rows by building the frame with
+// a placeholder in the transcript slot. Measuring beats counting by hand: the
+// confirm panel, the limits dialog and a multi-line draft all change the chrome,
+// and a chrome estimate that is short by one row is a row the footer drifts.
+func (m *tuiModel) chromeRows() int {
+	bare := strings.Replace(m.frame(windowPlaceholder), windowPlaceholder+"\n", "", 1)
+	return lipgloss.Height(strings.TrimSuffix(bare, "\n"))
+}
+
+// chromeBusy reports whether mandatory chrome (a panel, dialog, question or
+// multi-line draft) has already claimed the space the expanded help would want.
+func (m *tuiModel) chromeBusy() bool {
+	return m.dialog != "" || m.pendingPanel() != "" || m.pendingVisible() != "" ||
+		strings.Contains(m.editor.Value(), "\n")
+}
+
 func (m *tuiModel) pendingVisible() string {
 	if !m.t.HasQuestion() {
 		return ""
@@ -665,46 +811,77 @@ func (m *tuiModel) pendingVisible() string {
 
 func (m *tuiModel) View() tea.View {
 	v := tea.NewView("")
-	v.Content = m.content()
+	if !m.ready {
+		// Nothing has been drawn at the real size yet. Rendering a frame at the
+		// default height first would make the next WindowSizeMsg resize the frame,
+		// and the inline renderer does not re-anchor after a height change: it
+		// leaves the pane that far above the bottom of the terminal for the rest of
+		// the session.
+		return v
+	}
+	v.Content = m.viewContent()
 	// The cursor is always the editor's: the user must be able to see that
 	// typing goes somewhere, even (and especially) while a prompt is waiting.
 	v.Cursor = m.editor.Cursor()
 	return v
 }
 
-func (m *tuiModel) content() string {
+// viewContent is what the renderer is handed. The trailing newline is dropped:
+// it would make the frame one row taller than the screen, and the top row - the
+// header - then scrolls off the terminal for good.
+func (m *tuiModel) viewContent() string {
+	return strings.TrimSuffix(m.frame(m.window()), "\n")
+}
+
+// frame paints the pane: the transcript window, then the chrome under it. The
+// frame is exactly the terminal's height, which is what makes printing above it
+// safe - see avail. Its top row must therefore be transcript: printing above the
+// pane writes into the top rows of the frame region, and with a full-height frame
+// those rows are the ones the printed lines just left. Nothing session-specific
+// belongs there, so the startup header is transcript (sessionHeader), not chrome.
+func (m *tuiModel) frame(transcript string) string {
 	var sb strings.Builder
-	header := fmt.Sprintf("mini-go %s · %s @ %s · config %s", agent.Version, m.t.modelName, m.t.baseURL, m.t.configName)
-	sb.WriteString(tuiStyler.dim.Render(header) + "\n")
-	sb.WriteString(m.liveView())
+	sb.WriteString(transcript + "\n")
 	sb.WriteString("\n")
 	if panel := m.pendingPanel(); panel != "" {
 		sb.WriteString(panel + "\n")
 	}
 	if m.dialog == "quit" {
-		sb.WriteString(tuiStyler.prompt.Render("Quit? y/enter to leave, esc to stay") + "\n")
+		sb.WriteString(tuiStyler.prompt.MaxWidth(m.width).Render("Quit? y/enter to leave, esc to stay") + "\n")
 	}
 	if m.dialog == "limits" {
 		label := "New step limit: "
 		if m.limitsIdx == 1 {
 			label = "New cost limit: "
 		}
-		sb.WriteString(tuiStyler.prompt.Render(label) + m.editor.View() + "\n")
-		sb.WriteString(tuiStyler.status.Render(m.t.RunStats()) + "\n")
+		sb.WriteString(tuiStyler.prompt.MaxWidth(m.width).Render(label) + "\n" + m.editor.View() + "\n")
+		sb.WriteString(tuiStyler.status.MaxWidth(m.width).Render(m.t.RunStats()) + "\n")
 		return sb.String()
 	}
 	if q := m.pendingVisible(); q != "" && m.dialog == "" {
-		sb.WriteString(tuiStyler.prompt.Render(q) + "\n")
+		sb.WriteString(tuiStyler.prompt.MaxWidth(m.width).Render(q) + "\n")
 	}
 	sb.WriteString(m.editor.View() + "\n")
 	sb.WriteString(tuiStyler.status.Render(m.t.RunStats()) + "\n")
-	m.help.ShowAll = m.showFullHelp
-	sb.WriteString(tuiStyler.dim.Render(m.help.View(m.keymap)) + "\n")
+	// Expanded help, a confirm panel, a dialog and a tall draft cannot all fit
+	// on one screen, and a frame that changes height is a frame that drifts: the
+	// optional chrome yields to the mandatory.
+	// A copy: View() must not mutate the model, which chromeRows can leave it
+	// doing from another goroutine.
+	h := m.help
+	h.ShowAll = m.showFullHelp && !m.chromeBusy()
+	// The help bubble lays its groups out for the width it was given but does not
+	// break inside one, so it can still hand back a line wider than a narrow
+	// terminal: wrap it here or the terminal wraps it for us and the frame is a
+	// row taller than measured.
+	sb.WriteString(tuiStyler.dim.MaxWidth(m.width).Render(h.View(m.keymap)) + "\n")
 	return sb.String()
 }
 
 // pendingPanel lists the actions awaiting confirmation: the plan's pending
 // action panel, which is BeforeExecute blocking on the answer channel.
+const panelMaxActions = 4
+
 func (m *tuiModel) pendingPanel() string {
 	if !m.t.HasQuestion() {
 		return ""
@@ -715,9 +892,17 @@ func (m *tuiModel) pendingPanel() string {
 	}
 	var sb strings.Builder
 	sb.WriteString(tuiStyler.badge.Render("commands") + "\n")
-	for _, a := range q.Actions {
-		sb.WriteString("  " + truncateVisible(a.Command, 6) + "\n")
+	shown := q.Actions
+	if len(shown) > panelMaxActions {
+		sb.WriteString(fmt.Sprintf("  +%d more commands\n", len(shown)-panelMaxActions))
+		shown = shown[:panelMaxActions]
+	}
+	for _, a := range shown {
+		// A command can be many lines and arbitrarily wide; the panel's box is
+		// measured like any other row, so it has to fit before it is drawn.
+		cmd := strings.Join(fitLines(strings.Split(truncateVisible(a.Command, 6), "\n"), m.width-6), "\n")
+		sb.WriteString("  " + cmd + "\n")
 	}
 	sb.WriteString(tuiStyler.dim.Render("enter to confirm · type a comment and enter to reject · /y to go yolo · /h for commands"))
-	return tuiStyler.panel.Render(sb.String())
+	return tuiStyler.panel.MaxWidth(m.width).Render(sb.String())
 }

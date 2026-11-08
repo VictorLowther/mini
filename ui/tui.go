@@ -27,6 +27,9 @@ type TUIOptions struct {
 	ConfigName string
 	// Width/Height override the terminal size (tests).
 	Width, Height int
+	// LogWriter is where the process logger writes. The pane mutes it while it
+	// owns the terminal; see LogTarget.
+	LogWriter *LogTarget
 }
 
 // TUI is the bubbletea front end. It is both the UI the agent talks to and the
@@ -43,7 +46,9 @@ type TUI struct {
 	program *tea.Program
 	// printer delivers committed transcript lines above the pane.
 	printer *printer
-	runCtx  context.Context
+	// logWriter is muted for the duration of Run (nil in tests).
+	logWriter *LogTarget
+	runCtx    context.Context
 
 	mu       sync.Mutex
 	pending  chan Answer
@@ -147,10 +152,11 @@ func NewTUI(o TUIOptions) (*TUI, error) {
 	t := &TUI{
 		cfg: o.Cfg, loop: o.Loop,
 		modelName: o.Model.Model, baseURL: o.Model.BaseURL, configName: o.ConfigName,
-		width:    orDefault(o.Width, 80),
-		height:   orDefault(o.Height, 24),
-		runDone:  make(chan struct{}),
-		finished: make(chan struct{}),
+		logWriter: o.LogWriter,
+		width:     orDefault(o.Width, 80),
+		height:    orDefault(o.Height, 24),
+		runDone:   make(chan struct{}),
+		finished:  make(chan struct{}),
 	}
 	if o.Loop != nil {
 		o.Loop.Handler = &model.Handler{Content: t.Content, Reasoning: t.Reasoning}
@@ -190,6 +196,11 @@ func (t *TUI) Interactive() bool { return true }
 // run ends. A non-empty task starts the loop immediately; an empty one asks the
 // user first.
 func (t *TUI) Run(ctx context.Context, task string) (map[string]any, error) {
+	// Nothing may write to this terminal behind the renderer's back: a log line
+	// that scrolls the screen moves the footer and leaves stale rows under it.
+	undo := t.logWriter.Mute()
+	defer undo()
+
 	runCtx, cancelRun := context.WithCancel(ctx)
 	t.runCtx = runCtx
 	m := newTUIModel(t, task, cancelRun)
@@ -526,9 +537,10 @@ var tuiStyler = tuiStyles{
 // renderBlock turns one transcript entry into styled text. showThinking decides
 // whether a turn's reasoning text is part of it, so toggling re-renders cleanly.
 //
-// Everything here is wrapped to the pane width: the viewport paints one string
-// per line, so an over-long line would soft-wrap at the terminal's edge and
-// shift the whole layout out from under the cursor.
+// Everything here is wrapped to the pane width. The frame's height is measured
+// from these rows, so a line the terminal wraps instead of us makes the pane one
+// row taller than the measurement: the top row scrolls off the screen and the
+// footer finishes the run above the bottom of the terminal.
 func renderBlock(b block, width int, showThinking bool) string {
 	st := tuiStyler
 	thinking := ""
@@ -552,17 +564,21 @@ func renderBlock(b block, width int, showThinking bool) string {
 	case "assistant":
 		head := ""
 		if b.title != "" {
-			head = st.title.Render(b.title) + "\n"
+			head = st.title.MaxWidth(width).Render(b.title) + "\n"
 		}
 		return head + thinking + markdownCache.markdown(b.text, width)
 	case "user", "system":
 		return thinking + markdownCache.markdown(b.text, width)
 	case "exit":
-		return st.ok.Render("✓ "+b.title) + "\n" + b.text
+		return st.ok.MaxWidth(width).Render("✓ "+b.title) + "\n" +
+			st.dim.MaxWidth(width).Render(b.text)
+	// Every rendered row must be no wider than the pane: the frame's height is
+	// measured from these strings, and a row the terminal wraps for us adds a row
+	// the measurement never saw - the pane then overflows and the footer drifts.
 	case "error":
-		return st.error.Render(b.text)
-	default:
-		return st.dim.Render(b.text)
+		return st.error.MaxWidth(width).Render(strings.Join(fitLines(strings.Split(b.text, "\n"), width), "\n"))
+	default: // notes: UI feedback, the session header, command results
+		return st.dim.MaxWidth(width).Render(strings.Join(fitLines(strings.Split(b.text, "\n"), width), "\n"))
 	}
 }
 
