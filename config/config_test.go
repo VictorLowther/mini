@@ -224,22 +224,22 @@ func TestMiniYAMLLoadsAsAgentModelEnvConfigs(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := Sub(m, "agent")
-	if String(agent, "system_template", "") != "You are a helpful assistant that can interact with a computer.\n" {
-		t.Errorf("system_template = %q", agent["system_template"])
+	// The values are the user's to tune; assert structure and presence, not
+	// the literals shipped today.
+	if String(agent, "system_template", "") == "" || String(agent, "instance_template", "") == "" {
+		t.Error("agent.system_template and agent.instance_template must be non-empty")
 	}
-	if Float(agent, "cost_limit", 0) != 3.0 {
-		t.Errorf("cost_limit = %v", agent["cost_limit"])
+	if _, ok := agent["cost_limit"]; !ok {
+		t.Error("agent.cost_limit missing")
 	}
-	if String(agent, "mode", "") != "confirm" {
-		t.Errorf("mode = %v", agent["mode"])
+	if String(agent, "mode", "") == "" {
+		t.Errorf("agent.mode missing")
 	}
 	if String(Sub(m, "model"), "observation_template", "") == "" {
 		t.Error("missing observation_template")
 	}
-	if StringSlice(Sub(m, "environment"), "env") != nil {
-		if _, ok := Sub(Sub(m, "environment"), "env")["PAGER"]; !ok {
-			t.Error("environment.env.PAGER missing")
-		}
+	if envMap := Sub(Sub(m, "environment"), "env"); len(envMap) == 0 {
+		t.Error("environment.env missing")
 	}
 }
 

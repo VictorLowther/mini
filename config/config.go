@@ -53,14 +53,15 @@ func Merge(ms ...map[string]any) map[string]any {
 
 // Resolve finds the YAML file for a config spec (a path, a bare name, or a
 // name relative to MINI_CONFIG_DIR) and returns its contents plus the
-// resolved name. The search order mirrors minisweagent.config.get_config_path.
+// resolved name. Candidates are tried in order: the literal path, MINI_CONFIG_DIR,
+// then the configs/ subdirectory of the working directory or of the binary's
+// embedded copy (config/configs).
 func Resolve(spec string) (data []byte, name string, err error) {
 	spec = forceYAMLSuffix(spec)
 	candidates := []string{
 		spec,
 		filepath.Join(os.Getenv("MINI_CONFIG_DIR"), spec),
 		filepath.Join("configs", spec),
-		filepath.Join("configs", "benchmarks", spec),
 	}
 	for _, c := range candidates {
 		if b, err := os.ReadFile(c); err == nil {

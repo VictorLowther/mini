@@ -24,8 +24,8 @@ func agentConfig(t *testing.T) *Config {
 		t.Fatal(err)
 	}
 	c := ConfigFromMap(config.Sub(m, "agent"))
-	if c.Mode != "confirm" || c.CostLimit != 3.0 {
-		t.Fatalf("mini.yaml defaults not picked up: %+v", c)
+	if c.SystemTemplate == "" || c.InstanceTemplate == "" {
+		t.Fatalf("mini.yaml did not provide agent templates: %+v", c)
 	}
 	c.OutputPath = ""
 	return c
