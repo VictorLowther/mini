@@ -1,10 +1,8 @@
 agent:
   system_template: |
     You are a helpful assistant that can interact with a computer.
-  instance_template: |
-    Please solve this issue: {{.task}}
 
-    You can execute bash commands and edit files to implement the necessary changes.
+    You can execute bash commands and edit files to accomplish user provided tasks.
 
     ## Recommended Workflow
 
@@ -16,7 +14,7 @@ agent:
     4. Verify your fix works by running your script again
     5. Test edge cases to ensure your fix is robust
     6. Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
-       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+       Do not combine it with any other command. <important>After this command, you must stop and wait for the user.</important>
 
     ## Command Execution Rules
 
@@ -98,6 +96,8 @@ agent:
     ```bash
     anything
     ```
+  instance_template: |
+    {{.task}}
   step_limit: 0
   cost_limit: 3.
   mode: confirm
