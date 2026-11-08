@@ -14,12 +14,17 @@ var modeCommands = map[string]string{"/u": "human", "/c": "confirm", "/y": "yolo
 
 func isModeCommand(s string) bool { _, ok := modeCommands[s]; return ok }
 
+// quitCommand ends the run at the exit prompt. Leaving is always deliberate:
+// an empty enter there is a no-op, and ctrl-c opens the same exit dialog.
+const quitCommand = "/quit"
+
 // helpText is the /h block.
 const helpText = `/y to switch to yolo mode (execute LM commands without confirmation)
 /c to switch to confirmation mode (ask for confirmation before executing LM commands)
 /u to switch to human mode (execute commands issued by the user)
 /m to enter multiline comment
-/t to show or hide the model's thinking text`
+/t to show or hide the model's thinking text
+/quit to leave when the agent wants to finish (empty enter re-asks, never quits)`
 
 // promptLine is the "> " input marker.
 func promptLine() string { return "> " }
@@ -58,7 +63,7 @@ func confirmationTitle(n int) string {
 	return fmt.Sprintf("Execute %d action(s)? Enter to confirm, type a comment to reject, or /h to show available commands", n)
 }
 
-const newTaskTitle = "Agent wants to finish. Type new task or Enter to quit (/h for commands)"
+const newTaskTitle = "Agent wants to finish. Type new task, /quit to leave, or ctrl-c (/h for commands)"
 const interruptionTitle = "Interrupted. Type a comment or command (/h for available commands)"
 
 // TaskPrompt is the opening question when no -t/--task was given.

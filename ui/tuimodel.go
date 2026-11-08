@@ -295,6 +295,12 @@ func (m *tuiModel) handleInput(text string) tea.Cmd {
 		// Input is never dropped: slash commands apply at once (they change the
 		// mode the next prompt will use) and prose is queued as steering, which
 		// lands in the history before the model's next call.
+		if text == quitCommand {
+			// Leaving is deliberate even with no question pending: after a
+			// failed run the pane stays up, and /quit closes it the same
+			// way ctrl-c (then enter) does.
+			return m.quit()
+		}
 		if text == "" {
 			if !m.t.loopRunning() {
 				m.noteLocal("nothing is waiting for input")
@@ -305,7 +311,7 @@ func (m *tuiModel) handleInput(text string) tea.Cmd {
 			return nil
 		}
 		if !m.t.loopRunning() {
-			m.noteLocal("the run has ended: press esc then y to leave")
+			m.noteLocal("the run has ended: /quit or ctrl-c to leave")
 			return nil
 		}
 		m.t.queueSteering(text)
@@ -473,7 +479,7 @@ func (m *tuiModel) finishRun() (quit bool) {
 	switch {
 	case err != nil && status == "":
 		m.appendBlock(block{kind: "error", text: "run ended: " + err.Error()})
-		m.appendBlock(block{kind: "note", text: "press esc then y to quit"})
+		m.appendBlock(block{kind: "note", text: "press ctrl-c (then enter) or type /quit to leave"})
 		return false
 	default:
 		if status == "" {

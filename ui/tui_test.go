@@ -179,7 +179,17 @@ func TestTUIConfirmPanelDrivesTheLoop(t *testing.T) {
 	if view := p.view(); !strings.Contains(view, "Agent wants to finish") {
 		t.Errorf("view = %q", view)
 	}
-	p.enter() // Enter quits
+	p.enter() // no-op: enter no longer quits, only ctrl-c or /quit do
+	select {
+	case <-done:
+		t.Fatal("an empty enter at the exit prompt ended the run")
+	case <-time.After(300 * time.Millisecond):
+	}
+	waitFor(t, "the exit prompt after the no-op enter", func() bool {
+		return p.HasQuestion() && p.PendingQuestion().Kind == AskNewTask
+	})
+	p.typeText("/quit")
+	p.enter()
 
 	select {
 	case <-done:
@@ -290,6 +300,36 @@ func TestTUIQuitDialog(t *testing.T) {
 	}
 }
 
+func TestTUIQuitCommandWithoutAPendingQuestion(t *testing.T) {
+	// The pane stays open after a run ends, with nothing left to answer.
+	// There too, leaving is explicit: /quit closes the pane, an empty enter
+	// does not.
+	c := newConfig("yolo")
+	tui, err := NewTUI(TUIOptions{
+		Cfg:        c,
+		Model:      &model.Sushi{Model: "test-model", BaseURL: "http://127.0.0.1:1"},
+		ConfigName: "mini", Width: 90, Height: 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tui.printer = newSyncPrinter(func(string) {}, func() {})
+	m := newTUIModel(tui, "", func() {})
+	m.width, m.height = 90, 30
+	m.ready = true
+
+	if cmd := m.handleInput(""); cmd != nil {
+		t.Errorf("empty enter produced %v, want no action", cmd)
+	}
+	cmd := m.handleInput(quitCommand)
+	if cmd == nil {
+		t.Fatal("/quit did not produce a command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("/quit did not quit the pane")
+	}
+}
+
 func TestTUISlashCommandsWorkInPane(t *testing.T) {
 	c := newConfig("confirm")
 	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
@@ -387,6 +427,8 @@ func TestTUITrajectoryMatchesPrintMode(t *testing.T) {
 	waitFor(t, "the exit confirmation", func() bool {
 		return p.HasQuestion() && p.PendingQuestion().Kind == AskNewTask
 	})
+	p.enter() // no-op on both front ends; the print side's last line is EOF
+	p.typeText("/quit")
 	p.enter()
 	<-done
 

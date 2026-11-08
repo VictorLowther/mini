@@ -175,12 +175,13 @@ func (p *Print) Ask(ctx context.Context, q Question) (Answer, error) {
 		fmt.Fprintf(p.Out, "\n%s\n%s", q.Title, promptLine())
 		line, err := p.readLine(ctx)
 		if errors.Is(err, errNoInput) {
-			// Nobody is left to answer. Enter-to-quit at the exit prompt is the
-			// documented default, so that ends the run cleanly; anywhere else
-			// the run stops with an error instead of spinning on a rejection
-			// that will never change.
+			// Nobody is left to answer. The exit prompt no longer quits on an
+			// empty enter, so an exhausted stdin there would re-ask forever:
+			// treat EOF as the explicit /quit and end the run cleanly. Anywhere
+			// else the run stops with an error instead of spinning on a
+			// rejection that will never change.
 			if q.Kind == AskNewTask {
-				return Answer{}, nil
+				return Answer{Text: quitCommand}, nil
 			}
 			return Answer{}, errNoInput
 		}

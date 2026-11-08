@@ -91,7 +91,12 @@ func (h *Interactive) OnSubmit(ctx context.Context, exitMsg model.Message) error
 		case ans.RePrompt:
 			continue // /h, or /c on a config already in confirmation mode
 		case ans.Text == "":
-			return nil // Enter quits
+			// Enter is a no-op. Leaving is deliberate: ctrl-c or /quit. A
+			// stray keystroke at the end of a turn must not end the run,
+			// so re-ask instead.
+			continue
+		case ans.Text == quitCommand:
+			return nil // the explicit way to agree the run is over
 		case ans.Text == "/u":
 			// Continue in human mode, without recording a new task.
 			return interruptUser("Switched to human mode.", model.KindUserInterruption)

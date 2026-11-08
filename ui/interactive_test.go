@@ -137,7 +137,7 @@ func contentsOf(msgs []model.Message) string {
 
 func TestEnterConfirms(t *testing.T) {
 	c := newConfig("confirm")
-	l, h := pair(t, c, []string{"echo hi", submitCmd}, &env.Local{}, "\n\n\n", true)
+	l, h := pair(t, c, []string{"echo hi", submitCmd}, &env.Local{}, "\n\n/quit\n", true)
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestEnterConfirms(t *testing.T) {
 func TestTypedTextRejectsAndReappearsInHistory(t *testing.T) {
 	c := newConfig("confirm")
 	l, h := pair(t, c, []string{"echo not-run", submitCmd + "echo first\n"}, &env.Local{},
-		"no, use printf instead\n\n\n", true)
+		"no, use printf instead\n\n/quit\n", true)
 	info, err := l.Run(context.Background(), "T")
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestWhitelistIsPrefixAnchored(t *testing.T) {
 
 func TestSlashYConfirmsAndStopsLaterPrompts(t *testing.T) {
 	c := newConfig("confirm")
-	l, h := pair(t, c, []string{"echo one", "echo two", submitCmd}, &env.Local{}, "/y\n\n", true)
+	l, h := pair(t, c, []string{"echo one", "echo two", submitCmd}, &env.Local{}, "/y\n/quit\n", true)
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestHumanModeSkipsTheModel(t *testing.T) {
 
 func TestAlreadyInModeRePrompts(t *testing.T) {
 	c := newConfig("confirm")
-	l, h := pair(t, c, []string{"echo hi", submitCmd}, &env.Local{}, "/c\n\n\n\n", true)
+	l, h := pair(t, c, []string{"echo hi", submitCmd}, &env.Local{}, "/c\n\n\n/quit\n", true)
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestAlreadyInModeRePrompts(t *testing.T) {
 
 func TestSlashHShowsHelpWithoutAnswering(t *testing.T) {
 	c := newConfig("confirm")
-	l, h := pair(t, c, []string{"echo hi", submitCmd}, &env.Local{}, "/h\n\n\n\n", true)
+	l, h := pair(t, c, []string{"echo hi", submitCmd}, &env.Local{}, "/h\n\n\n/quit\n", true)
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,29 @@ func TestSubmittedWithTypedTaskContinuesTheRun(t *testing.T) {
 	}
 }
 
-func TestSubmittedWithEnterFinishes(t *testing.T) {
+func TestEnterAtExitPromptReprompts(t *testing.T) {
+	// Enter at the end of a turn is a no-op, not a quit signal: the run
+	// survived both empty enters and only the explicit /quit ended it.
+	c := newConfig("yolo")
+	l, h := pair(t, c, []string{submitCmd + "echo first\n"}, &env.Local{}, "\n\n/quit\n", true)
+	info, err := l.Run(context.Background(), "T")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info["exit_status"] != "Submitted" || info["submission"] != "first\n" {
+		t.Errorf("info = %#v", info)
+	}
+	if kinds(h) != "new-task,new-task,new-task" {
+		t.Errorf("questions = %s, want a re-prompt per empty enter", kinds(h))
+	}
+	if !strings.Contains(h.output(), newTaskTitle) {
+		t.Errorf("the exit prompt was not re-asked:\n%s", h.output())
+	}
+}
+
+func TestEOFAtExitPromptEndsTheRunInsteadOfLooping(t *testing.T) {
+	// Re-prompting an exhausted stdin would spin forever: EOF at the exit
+	// prompt stands in for the explicit /quit and ends the run cleanly.
 	c := newConfig("yolo")
 	l, h := pair(t, c, []string{submitCmd + "echo first\n"}, &env.Local{}, "\n", true)
 	info, err := l.Run(context.Background(), "T")
@@ -318,8 +340,8 @@ func TestSubmittedWithEnterFinishes(t *testing.T) {
 	if info["exit_status"] != "Submitted" || info["submission"] != "first\n" {
 		t.Errorf("info = %#v", info)
 	}
-	if kinds(h) != "new-task" {
-		t.Errorf("questions = %s", kinds(h))
+	if kinds(h) != "new-task,new-task" {
+		t.Errorf("questions = %s, want the re-prompt that hit EOF", kinds(h))
 	}
 }
 
