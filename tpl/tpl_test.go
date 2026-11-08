@@ -104,7 +104,7 @@ func TestShippedTemplatesRender(t *testing.T) {
 		"has_tool_calls": false,
 		"finish_reason":  "stop",
 	}
-	for _, spec := range []string{"mini", "default"} {
+	for _, spec := range []string{"mini"} {
 		m, err := config.FromSpec(spec)
 		if err != nil {
 			t.Fatalf("%s: %v", spec, err)

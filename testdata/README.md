@@ -6,8 +6,6 @@ read-only: `git status --porcelain testdata/` must stay clean after
 
 |Item|What it is|Regenerate with|
 |---|---|---|
-|`local.traj.json`|Recorded 6-message Python run (text-mode model), replayed by `agent.TestReplayLocalTrajectory`.|`cp ../mini-swe-agent/tests/test_data/local.traj.json testdata/`|
-|`github_issue.traj.json`|Recorded 22-message Python run ending in `git diff --cached`, replayed by `agent.TestReplayGitHubIssueTrajectory`.|`cp ../mini-swe-agent/tests/test_data/github_issue.traj.json testdata/`|
 |`contexts/*.json`|The fixed render contexts shared by both template engines. Named `<spec>__<template_key>__<case>.json`.|`python3 testdata/gen_goldens.py --write-contexts`|
 |`templates/*.golden`|Bytes rendered by the real Jinja engine from the Python checkout, diffed by `tpl.TestGolden` (which skips when absent).|`uv run --with jinja2 --with pyyaml python3 testdata/gen_goldens.py`|
 |`sushi/*.sse`|Hand-written OpenAI-style SSE scripts (one turn per file) with sushi's exact frame shapes: keepalive comments, `finish_reason` `length`/`error`, a complete tool call in one delta, a fragmented one, parallel calls, an `include_usage` chunk with `timings`.|edit by hand; `testdata/fakesushi` replays them byte-for-byte|

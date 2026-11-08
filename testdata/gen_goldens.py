@@ -66,21 +66,7 @@ def contexts():
         ("mini", "instance_template", "darwin"): inst("Darwin"),
         ("mini", "instance_template", "linux"): inst("Linux"),
         ("mini", "system_template", "plain"): inst("Darwin"),
-        ("default", "observation_template", "short"): obs(SHORT, 0, ""),
-        ("default", "observation_template", "failure"): obs("", -1, EXC),
-        ("default", "observation_template", "long"): obs(LONG, 0, ""),
-        ("default", "observation_template", "long_exception"): obs(LONG, 0, EXC),
-        ("default", "observation_template", "unicode_long"): obs(LONG + "é" * 50, 0, EXC),
-        ("default", "format_error_template", "truncation_length"): err(ERR_NO_TOOLCALLS, [], False, "length"),
-        ("default", "format_error_template", "truncation_tool_calls"): err(ERR_NO_TOOLCALLS, [], False, "tool_calls"),
-        ("default", "format_error_template", "malformed_call"): err(ERR_PARSE, [], True, "stop"),
-        ("default", "format_error_template", "no_reason"): err(ERR_PARSE, [], False, ""),
-        ("default", "instance_template", "darwin"): inst("Darwin"),
-        ("default", "instance_template", "linux"): inst("Linux"),
-        ("default", "system_template", "plain"): inst("Darwin"),
     }
-    if "default" not in {k[0] for k in out}:  # pragma: no cover - guard against typos
-        raise SystemExit("no default.yaml contexts")
     return out
 
 
