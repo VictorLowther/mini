@@ -157,7 +157,10 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	closeLog := setupLogging(o.logFile, stderr)
+	// The logger writes through an indirection the TUI can mute: raw writes to
+	// the pane's terminal scroll the screen out from under the renderer.
+	logTarget := ui.NewLogTarget(stderr)
+	closeLog := setupLogging(o.logFile, logTarget)
 	defer closeLog()
 
 	loadGlobalEnv()
@@ -228,7 +231,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return exitCode(info, err)
 	}
 
-	t, err := ui.NewTUI(ui.TUIOptions{Cfg: agentCfg, Loop: l, Model: m, ConfigName: configName})
+	t, err := ui.NewTUI(ui.TUIOptions{Cfg: agentCfg, Loop: l, Model: m, ConfigName: configName, LogWriter: logTarget})
 	if err == nil {
 		// A stalled pane with no explanation is indistinguishable from a crash,
 		// so the retry schedule goes into the scrollback.
