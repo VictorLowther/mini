@@ -18,10 +18,10 @@ prompts driving agents like the one reading this file.
 | `agent` | The linear query–execute loop (port of `agents/default.py` + interactive control flow): step/cost/wall-time limits, format-error retries, trajectory JSON dumping. |
 | `env` | Command execution. `Local` interprets bash in-process via `mvdan.cc/sh` (so `[[ ]]`, arrays, heredocs behave identically everywhere); `exec_*.go` handle process plumbing per-OS. |
 | `model` | HTTP/SSE client for the sushi server: streaming (`stream.go`), tool-call → action parsing (`actions.go`), cost stats (`stats.go`), and a scriptable `testmodel`. |
-| `tpl` | Prompt rendering: upstream Jinja templates mechanically translated to `text/template`, plus the filters the translation needs. |
+| `tpl` | Prompt rendering: a `text/template` engine for the prompt templates in `mini.yaml`, plus the custom filters they use (`toJSON`, `head`/`tail`/`charlen`, arithmetic). |
 | `config` | mini-swe-agent's config layering: recursive merge with an UNSET sentinel, config-spec resolution (file / embedded name / `key=value`), global `.env` handling. Embedded configs live in `config/configs/`; `mini.yaml` is the only supported system config. |
 | `ui` | The human end: a bubbletea/glamour TUI (`tui.go`/`tuimodel.go`) and a plain `--print` mode (`print.go`), slash-commands/modes (`slash.go`), and `Interactive` adapting a UI to `agent.Hooks` (confirm/yolo modes, whitelists). Both front ends render the run as a shell transcript (`transcript.go`: command, cwd, exit, output) from a message's `extra`; the TUI runs inline (no alternate screen) with a pane exactly as tall as the terminal, holding the transcript's newest rows plus the prompt, and pushes rows that leave the top of the pane into the terminal's own scrollback through an off-loop `printer` goroutine (`printer.go`) — that keeps the footer pinned to the bottom, which a pane that resizes to its content does not. The startup header is transcript, not chrome, for the same reason. It also mutes the process logger while it owns the terminal (`logtarget.go`), because a stray log write scrolls the screen behind the renderer. |
-| `testdata` | Offline fixtures: render contexts, Jinja golden outputs (`gen_goldens.py` regenerates), hand-written SSE scripts, and `fakesushi`, an HTTP replay server for GPU-free testing. See `testdata/README.md`. |
+| `testdata` | Offline fixtures: hand-written SSE scripts and `fakesushi`, an HTTP replay server for GPU-free testing. See `testdata/README.md`. |
 
 ## Usage
 
@@ -43,6 +43,3 @@ Everything is offline and read-only against `testdata/`:
 ```bash
 go test ./...
 ```
-
-`tpl` golden tests diff Go-rendered prompts against real Jinja output from a
-sibling `../mini-swe-agent` checkout (skipped when absent).

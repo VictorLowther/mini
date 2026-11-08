@@ -93,8 +93,8 @@ func TestRenderWhitespaceAndMissingKey(t *testing.T) {
 	}
 }
 
-// TestShippedTemplatesRender guards the embedded configs against a template
-// syntax error; byte-exactness against Jinja is checked by TestGolden.
+// TestShippedTemplatesRender guards the embedded config against template
+// syntax errors and missing render keys.
 func TestShippedTemplatesRender(t *testing.T) {
 	ctx := map[string]any{
 		"task": "T", "system": "Darwin", "release": "R", "version": "V", "machine": "M",
