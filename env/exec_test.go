@@ -2,6 +2,7 @@ package env
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 )
@@ -19,12 +20,12 @@ func TestExitCodesFromExternalCommands(t *testing.T) {
 		{"ls /definitely/missing >/dev/null", 2},
 		{"cat /definitely/missing >&2", 1},
 	} {
-		res, err := l.Execute(context.Background(), c.cmd, "")
+		res, err := l.Execute(context.Background(), c.cmd, "", io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if res.ReturnCode != c.want {
-			t.Errorf("%q rc = %d, want %d (out=%q)", c.cmd, res.ReturnCode, c.want, res.Output)
+			t.Errorf("%q rc = %d, want %d", c.cmd, res.ReturnCode, c.want)
 		}
 	}
 }

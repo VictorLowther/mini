@@ -1,14 +1,12 @@
 package env
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"mvdan.cc/sh/v3/expand"
@@ -38,35 +36,19 @@ func (l *Local) timeout() time.Duration {
 	return l.Timeout
 }
 
-// syncBuffer is the single writer for stdout and stderr, merging them into one
-// chronological buffer exactly like subprocess's stderr=STDOUT.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
 // Execute runs one command and returns its Result. The only Go error it
 // returns is the caller's context cancellation, which the agent turns into a
 // user interruption; timeouts come back as a partial-output Result.
-func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result, err error) {
+func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer) (result Result, err error) {
 	dir := cwd
 	if dir == "" {
 		dir = l.CWD
 	}
 	if dir == "" {
 		dir, _ = os.Getwd()
+	}
+	if out == nil {
+		out = io.Discard
 	}
 
 	// yagni: no per-call timeout override; nothing in the reference passes one.
@@ -83,7 +65,6 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 		}, nil
 	}
 
-	buf := &syncBuffer{}
 	devnull, derr := os.Open(os.DevNull)
 	if derr == nil {
 		defer devnull.Close()
@@ -91,7 +72,16 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 	runner, rerr := interp.New(
 		// /dev/null as stdin: immediate EOF for children and for `read`,
 		// without mvdan's pipe-copy goroutine.
-		interp.StdIO(orNil(devnull, derr), buf, buf),
+		//
+		// `out, out` is deliberate, not a typo to fix: interp assigns the same
+		// writer to cmd.Stdout and cmd.Stderr (interp/handler.go:155-156),
+		// and os/exec returns an *os.File writer unchanged (exec.go:591-603),
+		// so fd 1 and fd 2 are dup'd from one file description and share one
+		// offset — the kernel's own ordering, byte-identical to
+		// `cmd > file 2>&1`, with no copying goroutine and no cap. Wrapping
+		// the file in a counting writer would destroy that property, which is
+		// why output_bytes comes from Stat.
+		interp.StdIO(orNil(devnull, derr), out, out),
 		interp.Interactive(false),
 		interp.Env(expand.ListEnviron(append(os.Environ(), l.envList()...)...)),
 		interp.Dir(dir),
@@ -105,10 +95,11 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 	}
 
 	// interp.Run can panic on exotic input; a panic must not kill the agent.
+	// The command's bytes are already in out, so the Result only reports the
+	// failure itself.
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = Result{
-				Output:        buf.String(),
 				ReturnCode:    -1,
 				ExceptionInfo: fmt.Sprintf("An error occurred while executing the command: command execution panic: %v", rec),
 				Extra:         map[string]any{"exception_type": "Panic", "exception": fmt.Sprint(rec)},
@@ -125,11 +116,11 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 		// interruption, not an observation.
 		return Result{}, ctx.Err()
 	case errors.Is(cctx.Err(), context.DeadlineExceeded):
-		// Killed the whole process group, so partial output is all we get;
-		// returncode -1 mirrors subprocess.TimeoutExpired handling.
+		// Killed the whole process group, so partial output (already in out)
+		// is all we get; returncode -1 mirrors subprocess.TimeoutExpired
+		// handling.
 		msg := fmt.Sprintf("Command %q timed out after %d seconds", command, int(l.timeout().Seconds()))
 		return Result{
-			Output:        buf.String(),
 			ReturnCode:    -1,
 			CWD:           dir,
 			ExceptionInfo: "An error occurred while executing the command: " + msg,
@@ -146,7 +137,7 @@ func (l *Local) Execute(ctx context.Context, command, cwd string) (result Result
 			code = 1
 		}
 	}
-	return Result{Output: buf.String(), ReturnCode: code, CWD: dir}, nil
+	return Result{ReturnCode: code, CWD: dir}, nil
 }
 
 func (l *Local) envList() []string {

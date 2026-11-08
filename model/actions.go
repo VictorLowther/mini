@@ -85,10 +85,11 @@ func formatError(errTemplate, errMsg string, hasToolCalls bool, ctx map[string]a
 // formatObservations is the port of format_toolcall_observation_messages:
 // missing outputs are padded with "action was not executed", each observation
 // renders the observation template with `output` plus the full agent template
-// vars, and the raw result is kept in extra for the trajectory.
+// vars. The result text itself never sits here: `output` is the bounded view
+// and extra names the result file that holds everything.
 func formatObservations(actions []Action, results []env.Result, obsTemplate string, tvars map[string]any) []Message {
 	padded := make([]env.Result, len(actions))
-	notExecuted := env.Result{Output: "", ReturnCode: -1, ExceptionInfo: "action was not executed"}
+	notExecuted := env.Result{ReturnCode: -1, ExceptionInfo: "action was not executed"}
 	for i := range padded {
 		if i < len(results) {
 			padded[i] = results[i]
@@ -106,10 +107,9 @@ func formatObservations(actions []Action, results []env.Result, obsTemplate stri
 		ctx["output"] = result.AsMap()
 		content, err := tpl.Render("observation", obsTemplate, ctx)
 		if err != nil {
-			content = result.Output + fmt.Sprintf("\n[observation_template failed to render: %v]", err)
+			content = fmt.Sprintf("[observation_template failed to render: %v]\noutput_path: %s", err, result.OutputPath)
 		}
 		extra := map[string]any{
-			"raw_output":     result.Output,
 			"returncode":     result.ReturnCode,
 			"timestamp":      float64(time.Now().UnixMilli()) / 1000,
 			"exception_info": result.ExceptionInfo,
@@ -118,6 +118,9 @@ func formatObservations(actions []Action, results []env.Result, obsTemplate stri
 			// since extra is stripped before the request.
 			"command": action.Command,
 			"cwd":     result.CWD,
+			// The complete output, untrimmed, in this file; the loop adds
+			// tcno/tcr_offset/elided_lines when the call has a database row.
+			"tcr_path": result.OutputPath,
 		}
 		for k, v := range result.Extra {
 			extra[k] = v

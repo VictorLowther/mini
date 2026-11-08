@@ -8,44 +8,55 @@ import (
 	"github.com/VictorLowther/mini/model"
 )
 
-// maxTranscriptLines bounds how much command output the transcript shows. The
-// full text stays in the trajectory.
-const maxTranscriptLines = 200
-
 // observation is one executed action in displayable form. Both front ends
 // render from the message's extra rather than its content: content is the JSON
 // (or XML) block the model was promised, which is unreadable as a transcript
-// and, when the model is mid-mistake, wrong.
+// and, when the model is mid-mistake, wrong. Live and resumed turns take one
+// path: the transcript shows the stored view, the same bytes the model was
+// shown, read from the result file at its offset.
 type observation struct {
 	Command   string
 	CWD       string
 	Exit      int
 	HasExit   bool
-	Output    string
+	Path      string
+	Output    string // ReadView of Path from Offset
+	Offset    int64  // byte of Path where Output starts
+	End       int64  // recorded file size at completion
+	Elided    int    // lines that came before Output
+	Err       string // Path could not be read
 	Exception string
 }
 
 func observationOf(m model.Message) (observation, bool) {
 	extra, ok := m["extra"].(map[string]any)
-	if !ok {
+	if !ok || !model.IsToolResult(m) {
 		return observation{}, false
 	}
-	out, isOutput := extra["raw_output"]
-	if !isOutput {
-		return observation{}, false
+	o := observation{
+		Command:   str(extra["command"]),
+		CWD:       str(extra["cwd"]),
+		Path:      str(extra["tcr_path"]),
+		Exception: str(extra["exception_info"]),
+		Elided:    asIntDefault(extra["elided_lines"]),
+		Offset:    int64(asIntDefault(extra["tcr_offset"])),
+		End:       int64(asIntDefault(extra["tcr_bytes"])),
 	}
-	o := observation{Output: str(out)}
-	o.Command, _ = extra["command"].(string)
-	o.CWD, _ = extra["cwd"].(string)
-	o.Exception, _ = extra["exception_info"].(string)
 	if code, ok := extra["returncode"]; ok {
 		o.Exit, o.HasExit = asInt(code)
+	}
+	if o.Path != "" {
+		var err error
+		if o.Output, err = model.ReadView(o.Path, o.Offset, o.End); err != nil {
+			o.Err = err.Error()
+		}
 	}
 	return o, true
 }
 
 // lines renders the block as a shell transcript: what ran, where, how it ended,
-// and what it printed.
+// and what it printed. The view is already capped at the model's bounds, so no
+// display-specific line arithmetic exists here.
 func (o observation) lines() []string {
 	var out []string
 	if o.Command != "" {
@@ -69,6 +80,12 @@ func (o observation) lines() []string {
 	if o.Exception != "" {
 		out = append(out, o.Exception)
 	}
+	if o.Err != "" {
+		return append(out, "(tool result unreadable: "+o.Path+")")
+	}
+	if o.Elided > 0 {
+		out = append(out, fmt.Sprintf("… %d more lines (full output: %s)", o.Elided, o.Path))
+	}
 	body := strings.TrimRight(o.Output, "\n")
 	if body == "" {
 		if o.Command != "" || o.HasExit {
@@ -76,13 +93,7 @@ func (o observation) lines() []string {
 		}
 		return out
 	}
-	lines := strings.Split(body, "\n")
-	if len(lines) > maxTranscriptLines {
-		kept := lines[:maxTranscriptLines]
-		kept = append(kept, fmt.Sprintf("… %d more lines (full output in the trajectory)", len(lines)-maxTranscriptLines))
-		lines = kept
-	}
-	return append(out, lines...)
+	return append(out, strings.Split(body, "\n")...)
 }
 
 func str(v any) string {
@@ -94,6 +105,8 @@ func asInt(v any) (int, bool) {
 	switch t := v.(type) {
 	case int:
 		return t, true
+	case int64:
+		return int(t), true
 	case float64:
 		return int(t), true
 	case string:
@@ -101,4 +114,10 @@ func asInt(v any) (int, bool) {
 		return n, err == nil
 	}
 	return 0, false
+}
+
+// asIntDefault reads an optional count key; absent or unparseable is 0.
+func asIntDefault(v any) int {
+	n, _ := asInt(v)
+	return n
 }

@@ -68,6 +68,17 @@ func (p *Print) closeReasoning() {
 	p.reasoningKnown = true
 }
 
+// Resume prints a stored transcript before the run continues, so a resumed
+// -p session is not a blank screen. note names where the history came from.
+func (p *Print) Resume(msgs []model.Message, note string) {
+	if note != "" {
+		fmt.Fprintf(p.Out, "%s\n", note)
+	}
+	for _, m := range msgs {
+		p.Message(m)
+	}
+}
+
 // assistantHeader is the add_messages banner:
 // "mini-swe-agent (step N, $X.XX):"
 func (p *Print) assistantHeader() {

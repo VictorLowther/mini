@@ -42,6 +42,31 @@ func EnsureConfigDir() (string, error) {
 	return dir, os.MkdirAll(dir, 0o700)
 }
 
+// StateDir is where cross-session state lives: the session database and the
+// tool-call result logs. $MINI_STATE_DIR wins so tests can redirect it.
+func StateDir() string {
+	if d := os.Getenv("MINI_STATE_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".mini")
+}
+
+// SessionDB is the global session database inside StateDir.
+func SessionDB() string { return filepath.Join(StateDir(), "sessions.db") }
+
+// ToolCallResultsDir is where per-session tool-call result logs live.
+func ToolCallResultsDir() string { return filepath.Join(StateDir(), "tcr") }
+
+// EnsureStateDir creates StateDir if needed and returns its path.
+func EnsureStateDir() (string, error) {
+	dir := StateDir()
+	return dir, os.MkdirAll(dir, 0o700)
+}
+
 // FirstEnv returns the first non-empty value among the given environment keys.
 func FirstEnv(keys ...string) string {
 	for _, k := range keys {

@@ -1,7 +1,9 @@
 package env
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,13 +13,25 @@ import (
 	"time"
 )
 
-func run(t *testing.T, l *Local, command string) Result {
+// run executes the command into a temp result file and returns the Result plus
+// the complete text the file holds, so every output assertion means exactly
+// what it meant when the buffer lived in memory.
+func run(t *testing.T, l *Local, command, cwd string) (Result, string) {
 	t.Helper()
-	res, err := l.Execute(context.Background(), command, "")
+	f, err := os.CreateTemp(t.TempDir(), "tc-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := l.Execute(context.Background(), command, cwd, f)
 	if err != nil {
 		t.Fatalf("Execute(%q) error: %v", command, err)
 	}
-	return res
+	f.Close()
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res, string(b)
 }
 
 func TestExecuteBasics(t *testing.T) {
@@ -36,10 +50,67 @@ func TestExecuteBasics(t *testing.T) {
 		{"echo one; exit 3; echo two", "one\n", 3},
 	}
 	for _, c := range cases {
-		res := run(t, l, c.command)
-		if res.Output != c.want || res.ReturnCode != c.code {
-			t.Errorf("Execute(%q) = (%q, %d), want (%q, %d) [exc=%q]", c.command, res.Output, res.ReturnCode, c.want, c.code, res.ExceptionInfo)
+		res, out := run(t, l, c.command, "")
+		if out != c.want || res.ReturnCode != c.code {
+			t.Errorf("Execute(%q) = (%q, %d), want (%q, %d) [exc=%q]", c.command, out, res.ReturnCode, c.want, c.code, res.ExceptionInfo)
 		}
+	}
+}
+
+// The sink is one *os.File handed to stdout AND stderr, so the file must be
+// byte-identical to what `cmd > file 2>&1` leaves: the merged stream in the
+// kernel's own order, no separate channels, nothing inserted.
+func TestExecuteFileIsRedirectEquivalent(t *testing.T) {
+	l := &Local{Timeout: 10 * time.Second}
+	_, got := run(t, l, "printf 'A\\n'; printf 'B\\n' >&2", "")
+	if got != "A\nB\n" {
+		t.Errorf("merged stream = %q, want %q", got, "A\nB\n")
+	}
+	// The reference side by side: a real shell redirecting both streams into
+	// the same file, exactly like `cmd > out.log 2>&1`.
+	path := filepath.Join(t.TempDir(), "redirect.log")
+	rf, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", "-c", "printf 'A\\n'; printf 'B\\n' >&2")
+	cmd.Stdout, cmd.Stderr = rf, rf // Run must not be CombinedOutput: it would replace the handles
+	if err := cmd.Run(); err != nil {
+		rf.Close()
+		t.Fatalf("reference redirect: %v", err)
+	}
+	rf.Close()
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Errorf("ours %q != `> file 2>&1` %q", got, want)
+	}
+}
+
+// No cap in env: a multi-megabyte command lands complete in the file.
+func TestExecuteLargeOutputLandsComplete(t *testing.T) {
+	l := &Local{Timeout: 30 * time.Second}
+	res, out := run(t, l, "seq 1 200000", "")
+	if res.ReturnCode != 0 {
+		t.Fatalf("rc = %d exc = %q", res.ReturnCode, res.ExceptionInfo)
+	}
+	if n := bytes.Count([]byte(out), []byte{'\n'}); n != 200000 {
+		t.Errorf("file has %d lines, want 200000 (len %d)", n, len(out))
+	}
+}
+
+// A timed-out command's partial output survives in the file, past any cap an
+// in-memory buffer could have had.
+func TestExecuteTimeoutKeepsPartialFile(t *testing.T) {
+	l := &Local{Timeout: time.Second}
+	res, out := run(t, l, "echo start; sleep 5", "")
+	if out != "start\n" {
+		t.Errorf("partial file = %q, want %q", out, "start\n")
+	}
+	if res.ReturnCode != -1 {
+		t.Errorf("returncode = %d, want -1", res.ReturnCode)
 	}
 }
 
@@ -63,25 +134,25 @@ func TestBashGrammar(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			res := run(t, l, c.cmd)
-			if res.Output != c.want {
-				t.Errorf("Execute(%q) = %q (code %d, exc %q), want %q", c.cmd, res.Output, res.ReturnCode, res.ExceptionInfo, c.want)
+			res, out := run(t, l, c.cmd, "")
+			if out != c.want {
+				t.Errorf("Execute(%q) = %q (code %d, exc %q), want %q", c.cmd, out, res.ReturnCode, res.ExceptionInfo, c.want)
 			}
 		})
 	}
 	// A heredoc must actually write the file.
 	dir := t.TempDir()
-	res := run(t, l, "cat <<'EOF' > "+dir+"/f.txt\nhello\nEOF\ncat "+dir+"/f.txt")
-	if res.Output != "hello\n" {
-		t.Errorf("heredoc: %q code=%d exc=%q", res.Output, res.ReturnCode, res.ExceptionInfo)
+	_, out := run(t, l, "cat <<'EOF' > "+dir+"/f.txt\nhello\nEOF\ncat "+dir+"/f.txt", "")
+	if out != "hello\n" {
+		t.Errorf("heredoc: %q", out)
 	}
 }
 
 func TestEnvPrecedence(t *testing.T) {
 	t.Setenv("MINI_TEST_VAR", "from-process")
 	l := &Local{Env: map[string]string{"MINI_TEST_VAR": "from-config", "MINI_ONLY": "added"}, Timeout: 10 * time.Second}
-	if got := run(t, l, `echo $MINI_TEST_VAR $MINI_ONLY`).Output; got != "from-config added\n" {
-		t.Errorf("config env must win and extend the process env, got %q", got)
+	if _, out := run(t, l, `echo $MINI_TEST_VAR $MINI_ONLY`, ""); out != "from-config added\n" {
+		t.Errorf("config env must win and extend the process env, got %q", out)
 	}
 	// The config env block also reaches the prompt variables.
 	if vars := l.TemplateVars(); vars["MINI_TEST_VAR"] != "from-process" {
@@ -98,31 +169,27 @@ func TestCWDPrecedence(t *testing.T) {
 	os.MkdirAll(b, 0o755)
 
 	l := &Local{Timeout: 10 * time.Second}
-	if got, want := strings.TrimSpace(run(t, l, "pwd").Output), base; got != want {
-		t.Errorf("default cwd = %q, want the process cwd %q", got, want)
+	if _, out := run(t, l, "pwd", ""); strings.TrimSpace(out) != base {
+		t.Errorf("default cwd = %q, want the process cwd %q", out, base)
 	}
 	l.CWD = b
-	if got, want := strings.TrimSpace(run(t, l, "pwd").Output), b; got != want {
-		t.Errorf("config cwd = %q, want %q", got, want)
+	if _, out := run(t, l, "pwd", ""); strings.TrimSpace(out) != b {
+		t.Errorf("config cwd = %q, want %q", out, b)
 	}
-	res, err := l.Execute(context.Background(), "pwd", a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := strings.TrimSpace(res.Output), a; got != want {
-		t.Errorf("argument cwd = %q, want %q", got, want)
+	if _, out := run(t, l, "pwd", a); strings.TrimSpace(out) != a {
+		t.Errorf("argument cwd = %q, want %q", out, a)
 	}
 }
 
 func TestTimeoutReturnsPartialOutput(t *testing.T) {
 	l := &Local{Timeout: time.Second}
 	start := time.Now()
-	res := run(t, l, "echo $((111*9)); sleep 30")
+	res, out := run(t, l, "echo $((111*9)); sleep 30", "")
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("timeout not enforced, took %v", elapsed)
 	}
-	if !strings.Contains(res.Output, "999") {
-		t.Errorf("partial output lost: %q", res.Output)
+	if !strings.Contains(out, "999") {
+		t.Errorf("partial output lost: %q", out)
 	}
 	if res.ReturnCode != -1 {
 		t.Errorf("returncode = %d, want -1", res.ReturnCode)
@@ -143,9 +210,9 @@ func TestNoOrphanProcesses(t *testing.T) {
 		t.Skip("no process groups")
 	}
 	l := &Local{Timeout: time.Second}
-	res := run(t, l, "echo $((111*9)); sleep 30 & sleep 30")
-	if !strings.Contains(res.Output, "999") {
-		t.Fatalf("expected partial output, got %q", res.Output)
+	_, out := run(t, l, "echo $((111*9)); sleep 30 & sleep 30", "")
+	if !strings.Contains(out, "999") {
+		t.Fatalf("expected partial output, got %q", out)
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -171,7 +238,7 @@ func TestBusyLoopStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	start := time.Now()
-	_, err := l.Execute(ctx, "while :; do :; done", "")
+	_, err := l.Execute(ctx, "while :; do :; done", "", io.Discard)
 	if err == nil {
 		t.Fatal("expected the cancelled context to surface as an error")
 	}
@@ -182,9 +249,13 @@ func TestBusyLoopStopsOnContextCancel(t *testing.T) {
 
 func TestNoStdinDoesNotHang(t *testing.T) {
 	l := &Local{Timeout: 3 * time.Second}
+	f, err := os.CreateTemp(t.TempDir(), "cat-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan Result, 1)
 	go func() {
-		res, err := l.Execute(context.Background(), "cat", "")
+		res, err := l.Execute(context.Background(), "cat", "", f)
 		if err != nil {
 			t.Error(err)
 		}
@@ -192,9 +263,11 @@ func TestNoStdinDoesNotHang(t *testing.T) {
 	}()
 	select {
 	case res := <-done:
-		if res.Output != "" {
-			t.Errorf("cat on /dev/null should be empty, got %q", res.Output)
+		f.Close()
+		if b, err := os.ReadFile(f.Name()); err != nil || len(b) != 0 {
+			t.Errorf("cat on /dev/null should write nothing, got %q (%v)", b, err)
 		}
+		_ = res
 	case <-time.After(10 * time.Second):
 		t.Fatal("`cat` blocked forever; stdin must reach EOF immediately")
 	}
@@ -202,7 +275,7 @@ func TestNoStdinDoesNotHang(t *testing.T) {
 
 func TestParseErrorIsAnObservation(t *testing.T) {
 	l := &Local{Timeout: 5 * time.Second}
-	res := run(t, l, "if then fi")
+	res, _ := run(t, l, "if then fi", "")
 	if res.ReturnCode != -1 || !strings.Contains(res.ExceptionInfo, "could not parse command") {
 		t.Errorf("got %#v", res)
 	}

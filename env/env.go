@@ -6,17 +6,31 @@ package env
 
 import (
 	"context"
+	"io"
 	"os"
 	"strings"
 )
 
-// Result is one executed action: the merged stdout+stderr buffer, the exit
-// code, and the exception details when the command could not run to
+// Result is one executed action: where its merged stdout+stderr went, the
+// exit code, and the exception details when the command could not run to
 // completion. It is always returned as data, never as a Go error, so a broken
 // command reaches the model as an observation (that is the whole point of the
 // agent) instead of unwinding the loop.
 type Result struct {
-	Output        string
+	// OutputPath is the file holding the complete merged stdout+stderr and
+	// OutputBytes its size. View is the bounded text the model reads, with
+	// ViewOffset the byte of the file it starts at and ElidedLines the lines in
+	// front of it; Truncated is ViewOffset > 0. All four are filled by the loop
+	// after the command finishes: nothing here holds the whole output.
+	OutputPath  string
+	OutputBytes int64
+	View        string
+	ViewOffset  int64
+	ElidedLines int
+	Truncated   bool
+	// ViewError is set by the loop when the view could not be read from the
+	// file; the observation reports it instead of silently showing nothing.
+	ViewError     string
 	ReturnCode    int
 	ExceptionInfo string
 	Extra         map[string]any
@@ -26,11 +40,18 @@ type Result struct {
 	CWD string
 }
 
-// AsMap is the "output" object the observation template renders.
+// AsMap is the "output" object the observation template renders. The "output"
+// key carries the bounded view, so the non-truncated template branch does not
+// change when the full text moves to disk.
 func (r Result) AsMap() map[string]any {
 	m := map[string]any{
-		"output":         r.Output,
+		"output":         r.View,
+		"elided_lines":   r.ElidedLines,
+		"bytes":          r.OutputBytes,
+		"path":           r.OutputPath,
+		"truncated":      r.Truncated,
 		"returncode":     r.ReturnCode,
+		"output_error":   r.ViewError,
 		"exception_info": r.ExceptionInfo,
 	}
 	if r.Extra != nil {
@@ -43,24 +64,67 @@ func (r Result) AsMap() map[string]any {
 // a docker/singularity environment can be dropped in later without touching
 // the loop, exactly as in the Python original.
 type Environment interface {
-	Execute(ctx context.Context, command, cwd string) (Result, error)
+	// Execute runs command, writing its merged stdout+stderr to out. Passing
+	// the same *os.File as out is what makes the file byte-identical to
+	// `cmd > file 2>&1`; a nil out discards.
+	Execute(ctx context.Context, command, cwd string, out io.Writer) (Result, error)
 	TemplateVars() map[string]any
 	Serialize() map[string]any
 }
 
+const (
+	// markerReadLimit bounds the head read that tests the sentinel line: the
+	// sentinel is echoed on its own first line, so 4 KiB is generous.
+	markerReadLimit = 4096
+	// maxSubmissionBytes caps the submit text read back out of the result
+	// file. shortcut: a submission over 1 MiB is truncated; mini's prompts ask
+	// for a prose answer, and the cap only bounds the submit command's own
+	// output.
+	maxSubmissionBytes = 1 << 20
+)
+
 // SubmitMarker is the sentinel the prompts instruct the model to echo when it
 // is done: if the first line of the output is that command and the command
 // succeeded, everything after that line is the submission. Checked on the
-// success and the error path alike.
+// success and the error path alike, streaming from the result file so the
+// whole output never sits in memory.
 func SubmitMarker(r Result) (map[string]any, bool) {
-	if r.ReturnCode != 0 {
+	if r.ReturnCode != 0 || r.OutputPath == "" {
 		return nil, false
 	}
-	lines := splitKeepEnds(strings.TrimLeft(r.Output, " \t\n\r\v\f"))
+	f, err := os.Open(r.OutputPath)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	rawHead := make([]byte, markerReadLimit)
+	n, _ := f.ReadAt(rawHead, 0) // a short file ends in io.EOF; that is fine
+	head := strings.TrimLeft(string(rawHead[:n]), " \t\n\r\v\f")
+	lines := splitKeepEnds(head)
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" {
 		return nil, false
 	}
-	submission := strings.Join(lines[1:], "")
+	// The submission is everything after the sentinel line, streamed from the
+	// file up to maxSubmissionBytes. A head chunk whose first line is not the
+	// sentinel cannot match: the sentinel is a whole line.
+	sentinelEnd := n - len(head) + len(lines[0])
+	sub := []byte{}
+	chunk := make([]byte, 32*1024)
+	// ReadAt leaves the file offset at 0, so seek just past the sentinel's
+	// terminator before streaming the submission.
+	if _, err := f.Seek(int64(sentinelEnd), io.SeekStart); err == nil {
+		for len(sub) < maxSubmissionBytes {
+			m, rerr := f.Read(chunk)
+			sub = append(sub, chunk[:m]...)
+			if m < len(chunk) || rerr != nil {
+				break
+			}
+		}
+	}
+	if len(sub) > maxSubmissionBytes {
+		sub = sub[:maxSubmissionBytes]
+	}
+	submission := string(sub)
 	return map[string]any{
 		"role":    "exit",
 		"content": submission,

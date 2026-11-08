@@ -4,6 +4,7 @@ package model
 
 import (
 	"context"
+	"os"
 
 	"github.com/VictorLowther/mini/env"
 )
@@ -18,6 +19,31 @@ type Message = map[string]any
 type Action struct {
 	Command    string `json:"command"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// ToolCall is an issued call plus the open file its complete merged output is
+// written to. Number is the session's tool-call number and Path the file name;
+// File is handed straight to the shell as stdout *and* stderr, so the file ends
+// up exactly as `> out.log 2>&1` would leave it. The zero value means "not
+// recorded", and the loop then omits the path from the result's extra and the
+// observation renders without one.
+type ToolCall struct {
+	Number int
+	Path   string
+	File   *os.File
+	Action Action
+}
+
+// ToolOutcome is what a finished command left behind, every field already
+// measured on the closed result file so the database holds it once and nothing
+// recalculates it: Bytes is the file size, ViewOffset the byte the model's view
+// starts at, ViewElided the lines in front of it.
+type ToolOutcome struct {
+	Bytes      int64
+	ViewOffset int64
+	ViewElided int
+	ReturnCode int
+	CWD        string
 }
 
 // InterruptKind names the control-flow conditions the loop reacts to. They are

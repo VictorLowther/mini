@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,11 +17,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"uuid"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
 	"github.com/VictorLowther/mini/model"
+	"github.com/VictorLowther/mini/session"
 	"github.com/VictorLowther/mini/ui"
 )
 
@@ -90,6 +93,46 @@ type options struct {
 	printMode       bool
 	logFile         string
 	showVersion     bool
+	resume          resumeFlag
+}
+
+// resumeFlag distinguishes `-r` (resume newest, no value) from `-r <id>`
+// (resume a specific session) from the flag being absent. IsBoolFlag makes
+// the flag package treat a bare -r as valueless instead of eating "-t".
+type resumeFlag struct {
+	present bool
+	value   string
+}
+
+func (r *resumeFlag) String() string { return r.value }
+func (r *resumeFlag) Set(v string) error {
+	r.present = true
+	r.value = v
+	return nil
+}
+func (r *resumeFlag) IsBoolFlag() bool { return true }
+
+// resumeArgs rewrites argv so Go's flag package — which has no native
+// optional-value flag — always sees the =-form: a bare -r gets the empty
+// value (resume the newest session), `-r <id>` binds the id, and neither
+// ever swallows the following flag. Session ids never start with "-", so a
+// dash after -r means the next flag, not the value.
+func resumeArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-r" || a == "--r" || a == "-resume" || a == "--resume" {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				out = append(out, a+"="+args[i+1])
+				i++
+			} else {
+				out = append(out, a+"=")
+			}
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 func parseFlags(args []string) (*options, error) {
@@ -114,6 +157,8 @@ func parseFlags(args []string) (*options, error) {
 	fs.BoolVar(&o.printMode, "print", false, "no TUI: plain stdout plus stdin prompts")
 	fs.StringVar(&o.logFile, "log-file", "", "also write DEBUG logs here")
 	fs.BoolVar(&o.showVersion, "version", false, "print the version and exit")
+	fs.Var(&o.resume, "r", "resume a session for this repo (optionally: -r <uuid prefix>)")
+	fs.Var(&o.resume, "resume", "resume a session for this repo (optionally: -r <uuid prefix>)")
 	fs.Usage = func() {
 		var b strings.Builder
 		fs.SetOutput(&b)
@@ -121,7 +166,7 @@ func parseFlags(args []string) (*options, error) {
 		fs.SetOutput(os.Stderr)
 		_, _ = io.WriteString(os.Stderr, helpText+b.String()+helpEpilog)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(resumeArgs(args)); err != nil {
 		return nil, err
 	}
 	if fs.NArg() > 0 {
@@ -134,6 +179,16 @@ func parseFlags(args []string) (*options, error) {
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "config" {
 		if err := runConfigCommand(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "mini: "+err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "sessions" {
+		if err := runSessionsCommand(os.Args[2:], os.Stdout); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
 			fmt.Fprintln(os.Stderr, "mini: "+err.Error())
 			os.Exit(1)
 		}
@@ -194,6 +249,29 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	}
 	e := newEnvironment(envCfg)
 
+	// A store that cannot be opened is fatal: a transcript source of truth
+	// that silently stopped recording is worse than a run that refuses to
+	// start.
+	if _, err := config.EnsureStateDir(); err != nil {
+		fmt.Fprintln(stderr, "mini: session store:", err)
+		return 1
+	}
+	store, err := session.Open(config.SessionDB(), config.ToolCallResultsDir())
+	if err != nil {
+		fmt.Fprintln(stderr, "mini: session store:", err)
+		return 1
+	}
+	defer store.Close()
+
+	// Project identity: the git toplevel, else the canonical working
+	// directory, so `mini sessions` and `mini -r` find the runs started in
+	// this checkout from anywhere inside it.
+	startDir := e.CWD
+	if startDir == "" {
+		startDir, _ = os.Getwd()
+	}
+	workdir, project := projectOf(startDir)
+
 	if !o.printMode && !isTerminal(stdout) {
 		o.printMode = true
 	}
@@ -204,6 +282,44 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 
 	l := &agent.Loop{Cfg: agentCfg, Model: m, Env: e, Logger: slog.Default()}
 
+	// Fresh runs get a row (Title backfilled by the store when the task
+	// message lands, which is what titles the TUI's ask-for-a-task flow
+	// too); -r runs load the stored transcript and continue it.
+	var (
+		sess       *session.Session
+		resumeMsgs []model.Message
+		resumeNote string
+	)
+	if o.resume.present {
+		found, err := findResumable(store, project, o.resume.value)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				fmt.Fprintln(stderr, "mini: no session for this directory")
+			} else {
+				fmt.Fprintln(stderr, "mini: session store:", err)
+			}
+			return 1
+		}
+		msgs, err := found.Transcript()
+		if err != nil {
+			fmt.Fprintln(stderr, "mini: session store:", err)
+			return 1
+		}
+		sess = found
+		resumeMsgs = msgs
+		resumeNote = fmt.Sprintf("resumed session %s (%d turns)", sess.ID, len(msgs))
+		l.Cost, l.NCalls = sess.Cost, sess.NCalls
+		l.Resume(msgs)
+	} else {
+		created, err := store.Create(session.Row{ID: uuid.NewV7(), Workdir: workdir, Project: project, ModelName: m.Model})
+		if err != nil {
+			fmt.Fprintln(stderr, "mini: session store:", err)
+			return 1
+		}
+		sess = created
+	}
+	l.Recorder = sess
+
 	if o.printMode {
 		p := ui.NewPrint(stdout, stdin, agentCfg)
 		p.Loop = l
@@ -213,6 +329,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 			return 1
 		}
 		l.Hooks = h
+		p.Resume(resumeMsgs, resumeNote)
 		if o.task == "" {
 			if !p.Interactive() {
 				fmt.Fprintln(stderr, "mini: no task given and no terminal to ask for one")
@@ -228,6 +345,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		info, err := l.Run(ctx, o.task)
 		reportRun(l, info, err)
 		fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", agentCfg.OutputPath)
+		fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", sess.ID, sess.ID)
 		return exitCode(info, err)
 	}
 
@@ -251,9 +369,12 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return 1
 	}
 	l.Hooks = h
+	t.SetSessionID(sess.ID.String())
+	t.Resume(resumeMsgs, resumeNote)
 	info, err := t.Run(ctx, o.task)
 	reportRun(l, info, err)
 	fmt.Fprintf(stderr, "Saved trajectory to '%s'\n", agentCfg.OutputPath)
+	fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", sess.ID, sess.ID)
 	return exitCode(info, err)
 }
 
@@ -371,6 +492,48 @@ func defaultOutputPath() string {
 		return "last_mini_run.traj.json"
 	}
 	return filepath.Join(dir, "last_mini_run.traj.json")
+}
+
+// projectOf canonicalises dir and walks up to the nearest directory containing
+// a .git entry (a worktree's .git file counts). It returns (workdir, workdir)
+// when nothing does, "" workdir only if it cannot be made absolute. No git
+// exec, no hashing: harness hashed a raw cwd, so symlinked checkouts and
+// /var vs /private/var forked separate histories.
+func projectOf(dir string) (workdir, project string) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", ""
+	}
+	workdir = abs
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		workdir = real
+	}
+	for p := workdir; ; {
+		if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+			return workdir, p
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return workdir, workdir
+		}
+		p = parent
+	}
+}
+
+// findResumable resolves -r: a value is a uuid prefix inside project; a bare
+// -r takes the project's most recently updated session.
+func findResumable(store *session.Store, project, prefix string) (*session.Session, error) {
+	if prefix != "" {
+		return store.Find(project, prefix)
+	}
+	rows, err := store.List(project, false, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return store.Get(rows[0].ID)
 }
 
 // newEnvironment builds the local environment from the `environment:` section.

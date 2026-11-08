@@ -38,6 +38,7 @@ agent:
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
     - Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
+    - Every command's complete output is saved to a file. When a result reports `output_path`, the text you were shown is only its last lines: read `output_path` with `sed -n`, `tail`, or `grep` before concluding anything about the omitted part.
 
     Example of a CORRECT response:
     <example_response>
@@ -110,19 +111,25 @@ environment:
     TQDM_DISABLE: '1'
 model:
   observation_template: |
-    {{- if lt (charlen .output.output) 10000 -}}
+    {{- if .output.truncated -}}
     {
       "returncode": {{ .output.returncode }},
-      "output": {{ .output.output | tojson }}
+      "output_tail": {{ .output.output | tojson }},
+      "elided_lines": {{ .output.elided_lines }},
+      "output_bytes": {{ .output.bytes }},
+      "output_path": {{ .output.path | tojson }}
+      {{- if .output.path }},
+      "warning": "Output truncated to its last lines. output_path holds the complete, untruncated output: read it with sed -n '1,200p' <path>, tail <path>, or grep <pattern> <path>."
+      {{- end }}
+      {{- if .output.output_error }}, "output_error": {{ .output.output_error | tojson }}{{ end }}
       {{- if .output.exception_info }}, "exception_info": {{ .output.exception_info | tojson }}{{ end }}
     }
     {{- else -}}
     {
       "returncode": {{ .output.returncode }},
-      "output_head": {{ tojson (head .output.output 5000) }},
-      "output_tail": {{ tojson (tail .output.output 5000) }},
-      "elided_chars": {{ sub (charlen .output.output) 10000 }},
-      "warning": "Output too long."
+      "output": {{ .output.output | tojson }}
+      {{- if .output.bytes }}, "output_bytes": {{ .output.bytes }}, "output_path": {{ .output.path | tojson }}{{ end }}
+      {{- if .output.output_error }}, "output_error": {{ .output.output_error | tojson }}{{ end }}
       {{- if .output.exception_info }}, "exception_info": {{ .output.exception_info | tojson }}{{ end }}
     }
     {{- end -}}

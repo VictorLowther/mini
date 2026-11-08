@@ -179,6 +179,7 @@ func TestRunPrintModeEndToEnd(t *testing.T) {
 	srv := fixtureServer(t, "toolcall.sse", "submit.sse")
 	t.Cleanup(srv.Close)
 	cfgDir := t.TempDir()
+	t.Setenv("MINI_STATE_DIR", t.TempDir())
 	t.Setenv("MINI_GLOBAL_CONFIG_DIR", cfgDir)
 	t.Setenv("MINI_CONFIGURED", "true")
 	t.Setenv("MINI_MODEL_NAME", "test-model")

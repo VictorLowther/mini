@@ -133,6 +133,24 @@ func newTUIModel(t *TUI, task string, cancelRun context.CancelFunc) *tuiModel {
 	// the history instead of occupying a row of the pane - the frame's top rows
 	// are where printing above the pane lands.
 	m.sessionHeader()
+	// A resumed session replays its stored transcript before the first new
+	// turn, so the pane is not blank. blockFor is the same path a live
+	// message takes; noteLocal because we are inside the model's
+	// construction, not the agent goroutine.
+	for _, msg := range t.resume {
+		// The stored system and instance rows are prompt plumbing, exactly as
+		// in a live run: they never reach the pane (and blockFor's note()
+		// side effect must not fire during construction).
+		if _, built := msg["extra"]; !built {
+			continue
+		}
+		if b, ok := t.blockFor(msg); ok {
+			m.appendBlock(b)
+		}
+	}
+	if t.resumeNote != "" {
+		m.noteLocal(t.resumeNote)
+	}
 	return m
 }
 
@@ -499,8 +517,12 @@ func (m *tuiModel) finishRun() (quit bool) {
 // sessionHeader is the line a shell prints before its first prompt: session info
 // once, into the transcript, where it can scroll away with the history.
 func (m *tuiModel) sessionHeader() {
-	m.noteLocal(tuiStyler.dim.Render(fmt.Sprintf("mini-go %s · %s @ %s · config %s",
-		agent.Version, m.t.modelName, m.t.baseURL, m.t.configName)))
+	suffix := ""
+	if m.t.sessionID != "" {
+		suffix = " · session " + m.t.sessionID
+	}
+	m.noteLocal(tuiStyler.dim.Render(fmt.Sprintf("mini-go %s · %s @ %s · config %s%s",
+		agent.Version, m.t.modelName, m.t.baseURL, m.t.configName, suffix)))
 }
 
 func (m *tuiModel) noteLocal(text string) {

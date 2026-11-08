@@ -17,6 +17,28 @@ import (
 	"github.com/VictorLowther/mini/env"
 )
 
+// resultFile writes output to a temp result file and returns the Result the
+// loop would have built for it: OutputPath/OutputBytes from the file and the
+// view from the one place that computes it. Mutators adjust the execution
+// facts (returncode, cwd, exception) the way Execute leaves them.
+func resultFile(t *testing.T, output string, mutators ...func(*env.Result)) env.Result {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "out.log")
+	if err := os.WriteFile(path, []byte(output), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := env.Result{OutputPath: path, OutputBytes: int64(len(output))}
+	view, offset, elided, err := ViewOf(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.View, res.ViewOffset, res.ElidedLines, res.Truncated = view, offset, elided, offset > 0
+	for _, fn := range mutators {
+		fn(&res)
+	}
+	return res
+}
+
 func templates(t *testing.T) (obs, errTmpl string) {
 	t.Helper()
 	m, err := config.FromSpec("mini")
@@ -442,7 +464,7 @@ func TestFormatObservations(t *testing.T) {
 		{Command: "ls", ToolCallID: "c1"},
 		{Command: "pwd", ToolCallID: "c2"},
 	}}}
-	results := []env.Result{{Output: "file list\n", ReturnCode: 0, CWD: "/work"}}
+	results := []env.Result{resultFile(t, "file list\n", func(r *env.Result) { r.CWD = "/work" })}
 	out := s.FormatObservations(msg, results, map[string]any{"task": "T"})
 	if len(out) != 2 {
 		t.Fatalf("got %d messages", len(out))
@@ -464,8 +486,17 @@ func TestFormatObservations(t *testing.T) {
 		t.Errorf("padded observation = %q", second)
 	}
 	extra := Extra(out[0])
-	if extra["raw_output"] != "file list\n" || extra["exception_info"] != "" || extra["returncode"] != 0 {
+	// Tool text is never in the message any more: extra names the file that
+	// holds it.
+	if extra["raw_output"] != nil {
+		t.Errorf("raw_output must not come back: %#v", extra)
+	}
+	if extra["exception_info"] != "" || extra["returncode"] != 0 {
 		t.Errorf("extra = %#v", extra)
+	}
+	path, _ := extra["tcr_path"].(string)
+	if b, err := os.ReadFile(path); err != nil || string(b) != "file list\n" {
+		t.Errorf("tcr_path %q does not hold the output: %q, %v", path, b, err)
 	}
 	// The UI renders the transcript from these instead of parsing content back.
 	if extra["command"] != "ls" {
@@ -482,24 +513,29 @@ func TestFormatObservations(t *testing.T) {
 func TestObservationElidesLongOutput(t *testing.T) {
 	obs, _ := templates(t)
 	s := &Sushi{ObsTemplate: obs}
-	long := strings.Repeat("x", 12000)
+	// 120 lines of 60 chars: the view is the last MaxViewLines lines, the
+	// rest is elided and named by output_path.
+	long := strings.Repeat(strings.Repeat("x", 60)+"\n", 120)
 	msg := Message{"extra": map[string]any{"actions": []Action{{Command: "cat big", ToolCallID: "c1"}}}}
-	out := s.FormatObservations(msg, []env.Result{{Output: long, ReturnCode: 0}}, nil)
+	out := s.FormatObservations(msg, []env.Result{resultFile(t, long)}, nil)
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(out[0]["content"].(string)), &parsed); err != nil {
 		t.Fatalf("not JSON: %v", err)
 	}
-	if parsed["elided_chars"].(float64) != 2000 {
-		t.Errorf("elided_chars = %v, want 2000", parsed["elided_chars"])
+	if parsed["elided_lines"].(float64) != 20 {
+		t.Errorf("elided_lines = %v, want 20", parsed["elided_lines"])
 	}
-	if len(parsed["output_head"].(string)) != 5000 || len(parsed["output_tail"].(string)) != 5000 {
-		t.Errorf("head/tail lengths = %d/%d", len(parsed["output_head"].(string)), len(parsed["output_tail"].(string)))
+	if parsed["output_bytes"].(float64) != float64(len(long)) {
+		t.Errorf("output_bytes = %v, want %d", parsed["output_bytes"], len(long))
 	}
-	if parsed["warning"] != "Output too long." {
-		t.Errorf("warning = %v", parsed["warning"])
+	if tail, _ := parsed["output_tail"].(string); tail != strings.Repeat(strings.Repeat("x", 60)+"\n", 100) {
+		t.Errorf("output_tail is not the last 100 lines (len %d)", len(tail))
+	}
+	if parsed["warning"] == "" || parsed["output_path"] == "" {
+		t.Errorf("parsed = %#v", parsed)
 	}
 	if _, ok := parsed["output"]; ok {
-		t.Error("the full output must be replaced by head/tail when eliding")
+		t.Error("the full output must be replaced by the tail when eliding")
 	}
 }
 
@@ -507,7 +543,11 @@ func TestObservationCarriesResultExtra(t *testing.T) {
 	obs, _ := templates(t)
 	s := &Sushi{ObsTemplate: obs}
 	msg := Message{"extra": map[string]any{"actions": []Action{{Command: "sleep 100", ToolCallID: "c1"}}}}
-	res := env.Result{Output: "partial", ReturnCode: -1, ExceptionInfo: "timed out", Extra: map[string]any{"exception_type": "TimeoutExpired"}}
+	res := resultFile(t, "partial", func(r *env.Result) {
+		r.ReturnCode = -1
+		r.ExceptionInfo = "timed out"
+		r.Extra = map[string]any{"exception_type": "TimeoutExpired"}
+	})
 	out := s.FormatObservations(msg, []env.Result{res}, nil)
 	extra := Extra(out[0])
 	if extra["exception_type"] != "TimeoutExpired" {
@@ -526,7 +566,7 @@ func TestHumanActionGetsUserObservation(t *testing.T) {
 	obs, _ := templates(t)
 	s := &Sushi{ObsTemplate: obs}
 	msg := Message{"extra": map[string]any{"actions": []Action{{Command: "ls"}}}}
-	out := s.FormatObservations(msg, []env.Result{{Output: "x\n", ReturnCode: 0}}, nil)
+	out := s.FormatObservations(msg, []env.Result{resultFile(t, "x\n")}, nil)
 	if out[0]["role"] != "user" {
 		t.Errorf("role = %v, want user for actions without a tool_call_id", out[0]["role"])
 	}

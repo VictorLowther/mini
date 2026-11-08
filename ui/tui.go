@@ -71,6 +71,11 @@ type TUI struct {
 	// task is the run's task text, shown on one line in place of the rendered
 	// instance template.
 	task string
+	// resume/replay into the pane at startup (see TUI.Resume); sessionID is
+	// the sessions row this run writes, shown in the header.
+	resume     []model.Message
+	resumeNote string
+	sessionID  string
 	// loopGID is the goroutine bubbletea runs Update on, captured in Init. The
 	// one hard rule of this UI is that Send must never be called from it:
 	// program.Send is an unbuffered hand-off, so doing so deadlocks the pane
@@ -300,6 +305,17 @@ func (t *TUI) StreamText() (reasoning, content string) {
 // instead. Only messages the agent produced (every one of them carries an
 // "extra" map) reach the pane.
 func (t *TUI) Message(m model.Message) {
+	b, ok := t.blockFor(m)
+	if !ok {
+		return
+	}
+	t.send(blockMsg{b})
+}
+
+// blockFor turns one message into its transcript block, and says when the
+// message is prompt plumbing that never reaches the pane. TUI.Message and the
+// resume replay share it, so a resumed pane cannot drift from a live one.
+func (t *TUI) blockFor(m model.Message) (block, bool) {
 	role, _ := m["role"].(string)
 	content, _ := m["content"].(string)
 	if _, built := m["extra"]; !built {
@@ -309,7 +325,7 @@ func (t *TUI) Message(m model.Message) {
 			t.mu.Unlock()
 			t.note("task: " + firstLine(task))
 		}
-		return
+		return block{}, false
 	}
 	b := block{kind: role, text: content}
 	if r, ok := m["reasoning_content"].(string); ok {
@@ -332,8 +348,18 @@ func (t *TUI) Message(m model.Message) {
 		status, _ := extra["exit_status"].(string)
 		b.title = status
 	}
-	t.send(blockMsg{b})
+	return b, true
 }
+
+// Resume queues a stored transcript for replay into the pane, with a note
+// naming where it came from. Empty msgs and note (a fresh run) replay nothing.
+// Call before the program starts.
+func (t *TUI) Resume(msgs []model.Message, note string) {
+	t.resume, t.resumeNote = msgs, note
+}
+
+// SetSessionID labels the pane header with the session this run writes to.
+func (t *TUI) SetSessionID(id string) { t.sessionID = id }
 
 func (t *TUI) showReasoning() bool {
 	t.mu.Lock()

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -100,12 +101,33 @@ type Hooks interface {
 	OnInterrupt(ctx context.Context) error
 }
 
+// Recorder is the session store's write side. One call records one thing;
+// every method is called from the agent goroutine only. *session.Session
+// satisfies it structurally; agent never imports session, only model, so
+// storage can be dropped or replaced without touching the loop.
+type Recorder interface {
+	// RecordMessage appends one turn and returns its number.
+	RecordMessage(m model.Message) (turn int64, err error)
+	RecordProgress(cost float64, nCalls int) error
+	// OpenToolCall records that action idx of msg is about to run and returns
+	// the call with its result file open for writing.
+	OpenToolCall(msg model.Message, idx int, action model.Action) (model.ToolCall, error)
+	// CompleteToolCall closes the call's row with the outcome the loop
+	// measured on the closed file, including the byte offset of the model's
+	// view.
+	CompleteToolCall(c model.ToolCall, out model.ToolOutcome) error
+}
+
 // Loop is the DefaultAgent equivalent.
 type Loop struct {
 	Cfg   *Config
 	Model model.Model
 	Env   env.Environment
 	Hooks Hooks
+	// Recorder persists the transcript; nil turns persistence off, but never
+	// the capture: the loop still writes each command's output to a scratch
+	// file it reads back.
+	Recorder Recorder
 	// Handler receives streamed reasoning/content while Model.Query runs.
 	Handler *model.Handler
 	Logger  *slog.Logger
@@ -116,6 +138,7 @@ type Loop struct {
 
 	consecutiveFormatErrors int
 	start                   time.Time
+	resumed                 []model.Message
 	extraVars               map[string]any
 	mu                      sync.Mutex
 	cancelTurn              context.CancelFunc
@@ -124,7 +147,29 @@ type Loop struct {
 	pending                 Snapshot
 	runCtx                  context.Context
 	queued                  []model.Message
+	// scratchDir holds the temp result files of a run without a Recorder;
+	// empty otherwise. It must live until Run returns, not merely until its
+	// turn is rendered, because the trajectory written after every step
+	// reads the result files back.
+	scratchDir string
 }
+
+// scratchToolCall is the no-store fallback: an anonymous temp file in the
+// run's scratch directory. Number stays 0, which is the "not recorded"
+// sentinel the loop and CompleteToolCall both respect.
+func (l *Loop) scratchToolCall(action model.Action) (model.ToolCall, error) {
+	f, err := os.CreateTemp(l.scratchDir, "*.log")
+	if err != nil {
+		return model.ToolCall{}, err
+	}
+	return model.ToolCall{Path: f.Name(), File: f, Action: action}, nil
+}
+
+// Resume seeds the history from the session store before Run. The stored
+// transcript already carries the system and instance messages, so Run will not
+// render or append them again; Cost and NCalls are seeded by the caller from
+// the session row.
+func (l *Loop) Resume(msgs []model.Message) { l.resumed = msgs }
 
 // QueueMessage appends a user message to the history before the next model
 // call. This is the TUI's steering input: the user can always type, even while
@@ -157,6 +202,12 @@ func (l *Loop) publish() {
 	l.mu.Lock()
 	l.snap = l.pending
 	l.mu.Unlock()
+	if l.Recorder != nil {
+		// A killed run still has spend/call counters to resume from.
+		if err := l.Recorder.RecordProgress(l.Cost, l.NCalls); err != nil {
+			l.logger().Error("session store: could not record progress", "err", err)
+		}
+	}
 }
 
 // Snapshot returns the most recently published progress view.
@@ -232,6 +283,15 @@ func (l *Loop) render(name, template string) (string, error) {
 
 func (l *Loop) addMessages(msgs ...model.Message) []model.Message {
 	l.Messages = append(l.Messages, msgs...)
+	if l.Recorder != nil {
+		for _, m := range msgs {
+			// The recorder stamps the turn number into the message's own
+			// extra. Persistence failure must not kill the agent.
+			if _, err := l.Recorder.RecordMessage(m); err != nil {
+				l.logger().Error("session store: could not record turn", "err", err)
+			}
+		}
+	}
 	if l.Hooks != nil {
 		for _, m := range msgs {
 			l.Hooks.OnMessage(m)
@@ -252,6 +312,14 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 		l.cancelTurn = nil
 		l.mu.Unlock()
 	}()
+	if l.Recorder == nil {
+		// A store-backed run must not litter $TMPDIR: the real result files
+		// outlive the run by design. The scratch directory lives for the
+		// whole run because the trajectory written after every step reads the
+		// result files back.
+		l.scratchDir, _ = os.MkdirTemp("", "mini-tcr-")
+		defer func() { _ = os.RemoveAll(l.scratchDir) }()
+	}
 	l.start = time.Now()
 	l.extraVars = map[string]any{"task": task}
 	for _, kw := range kwargs {
@@ -261,18 +329,34 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	}
 	l.Messages = nil
 
-	system, err := l.render("system_template", l.Cfg.SystemTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("rendering system_template: %w", err)
+	// Resume seeds the history from the session store. The stored transcript
+	// already carries the system and instance messages, so Run must not
+	// render or append them again; the stored system prompt wins even when
+	// the config changed under it, because the database is the source of
+	// truth for a resumed run.
+	if l.resumed != nil {
+		l.Messages = l.resumed
+		if task != "" {
+			l.addMessages(model.Message{
+				"role":    "user",
+				"content": "The user added a new task: " + task,
+				"extra":   map[string]any{"interrupt_type": "UserNewTask"},
+			})
+		}
+	} else {
+		system, err := l.render("system_template", l.Cfg.SystemTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("rendering system_template: %w", err)
+		}
+		instance, err := l.render("instance_template", l.Cfg.InstanceTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("rendering instance_template: %w", err)
+		}
+		l.addMessages(
+			model.Message{"role": "system", "content": system},
+			model.Message{"role": "user", "content": instance},
+		)
 	}
-	instance, err := l.render("instance_template", l.Cfg.InstanceTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("rendering instance_template: %w", err)
-	}
-	l.addMessages(
-		model.Message{"role": "system", "content": system},
-		model.Message{"role": "user", "content": instance},
-	)
 
 	for {
 		stepCtx, cancel := context.WithCancel(ctx)
@@ -495,15 +579,75 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 	}
 
 	var submitMsg model.Message
-	for _, action := range actions {
-		res, err := l.Env.Execute(ctx, action.Command, "")
+	for i, action := range actions {
+		// One call row and one result file per action. The file is the sink
+		// even when the database row failed: the observation must always
+		// have something to read.
+		var tc model.ToolCall
+		if l.Recorder != nil {
+			var err error
+			tc, err = l.Recorder.OpenToolCall(msg, i, action)
+			if err != nil {
+				l.logger().Error("session store: could not record tool call", "err", err)
+				tc = model.ToolCall{}
+			}
+		}
+		if tc.File == nil {
+			var err error
+			if tc, err = l.scratchToolCall(action); err != nil {
+				tc = model.ToolCall{}
+			}
+		}
+		var sink io.Writer
+		if tc.File != nil {
+			sink = tc.File
+		}
+		res, err := l.Env.Execute(ctx, action.Command, "", sink)
+		// Stop the shell's writes and measure the file once, before any
+		// branch returns: this is the only place tail arithmetic happens.
+		// Closing first keeps the fd from leaking on the cancellation path;
+		// res is returned by value, so these fields survive an early return.
+		if tc.File != nil {
+			_ = tc.File.Sync()
+			_ = tc.File.Close()
+			res.OutputPath = tc.Path
+			res.OutputBytes = sizeOf(tc.Path)
+			view, offset, elided, verr := model.ViewOf(tc.Path)
+			res.View, res.ViewOffset, res.ElidedLines, res.Truncated = view, offset, elided, offset > 0
+			if verr != nil {
+				res.ViewError = verr.Error()
+			}
+		}
 		if err != nil {
 			// Context cancellation: a user interruption, not an observation.
+			// The call row stays status='started' — the honest record that
+			// the command never finished — and gets no observation turn, so
+			// its unset view_offset is never read. Do not complete it.
 			if l.Hooks == nil {
 				return err
 			}
 			l.addMessages(l.Model.FormatObservations(msg, results, l.TemplateVars())...)
 			return l.interrupted(err)
+		}
+		if l.Recorder != nil {
+			if err := l.Recorder.CompleteToolCall(tc, model.ToolOutcome{
+				Bytes:      res.OutputBytes,
+				ViewOffset: res.ViewOffset,
+				ViewElided: res.ElidedLines,
+				ReturnCode: res.ReturnCode,
+				CWD:        res.CWD,
+			}); err != nil {
+				l.logger().Error("session store: could not record tool call outcome", "err", err)
+			}
+		}
+		if tc.Number != 0 {
+			if res.Extra == nil {
+				res.Extra = map[string]any{}
+			}
+			res.Extra["tcno"] = tc.Number
+			res.Extra["tcr_offset"] = res.ViewOffset
+			res.Extra["tcr_bytes"] = res.OutputBytes
+			res.Extra["elided_lines"] = res.ElidedLines
 		}
 		results = append(results, res)
 		if exitMsg, ok := env.SubmitMarker(res); ok {
@@ -538,10 +682,7 @@ func (l *Loop) Serialize(extra ...map[string]any) map[string]any {
 			lastExtra = e
 		}
 	}
-	messages := l.Messages
-	if messages == nil {
-		messages = []model.Message{}
-	}
+	messages := withRawOutputs(l.Messages)
 	agentData := map[string]any{
 		"info": map[string]any{
 			"model_stats": map[string]any{
@@ -565,6 +706,48 @@ func (l *Loop) Serialize(extra ...map[string]any) map[string]any {
 func stringOr(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// withRawOutputs copies the history and gives every observation turn an
+// extra["raw_output"] holding its result file's complete bytes, which is what
+// the trajectory format has always carried and the only reason anything reads
+// a whole result file. Turns with no file (the "action was not executed"
+// padding) get "", exactly as before. Live messages are never mutated: the
+// copies own the key, so nothing else in the process sees tool text in memory.
+func withRawOutputs(msgs []model.Message) []model.Message {
+	out := make([]model.Message, 0, len(msgs))
+	for _, m := range msgs {
+		if !model.IsToolResult(m) {
+			out = append(out, m)
+			continue
+		}
+		cp := model.Message{}
+		for k, v := range m {
+			cp[k] = v
+		}
+		src, _ := m["extra"].(map[string]any)
+		extra := make(map[string]any, len(src)+1)
+		for k, v := range src {
+			extra[k] = v
+		}
+		raw := ""
+		if p, _ := extra["tcr_path"].(string); p != "" {
+			if b, err := os.ReadFile(p); err == nil {
+				raw = string(b)
+			}
+		}
+		extra["raw_output"] = raw
+		cp["extra"] = extra
+		out = append(out, cp)
+	}
+	return out
+}
+
+func sizeOf(path string) int64 {
+	if info, err := os.Stat(path); err == nil {
+		return info.Size()
+	}
+	return 0
 }
 
 // Save writes the trajectory; the parent directory is created on demand.
