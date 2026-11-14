@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -49,6 +50,7 @@ Examples:
   mini -t "add a main() guard to a.py, then submit"
   mini -p -y -t "run 'echo hi' then submit" -o /tmp/traj.json
   mini -c mini.yaml -c model.max_tokens=2048
+  mini -cpuprofile cpu.pprof -memprofile heap.pprof   # profile the whole run
 
 By default the config comes from the embedded mini.yaml; adding a -c spec
 replaces that default file, so pass "-c mini" first when you only want to
@@ -98,6 +100,8 @@ type options struct {
 	exitImmediately bool
 	printMode       bool
 	logFile         string
+	cpuProfile      string
+	memProfile      string
 	showVersion     bool
 	resume          resumeFlag
 }
@@ -162,6 +166,8 @@ func parseFlags(args []string) (*options, error) {
 	fs.BoolVar(&o.printMode, "p", false, "headless: plain stdout plus stdin prompts, no GUI window")
 	fs.BoolVar(&o.printMode, "print", false, "headless: plain stdout plus stdin prompts, no GUI window")
 	fs.StringVar(&o.logFile, "log-file", "", "also write DEBUG logs here")
+	fs.StringVar(&o.cpuProfile, "cpuprofile", "", "write a CPU profile of the whole run to FILE")
+	fs.StringVar(&o.memProfile, "memprofile", "", "write a heap profile at the end of the run to FILE")
 	fs.BoolVar(&o.showVersion, "version", false, "print the version and exit")
 	fs.Var(&o.resume, "r", "resume a session for this repo (optionally: -r <uuid prefix>)")
 	fs.Var(&o.resume, "resume", "resume a session for this repo (optionally: -r <uuid prefix>)")
@@ -216,6 +222,49 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	if o.showVersion {
 		fmt.Fprintf(stdout, "mini-go %s\n", agent.Version)
 		return 0
+	}
+
+	// Profiling brackets the whole run: the CPU profile covers everything
+	// from before config resolution to the last deferred act of run, and the
+	// heap profile is written as run returns, while everything the run built
+	// is still resident. (The subcommands that never reach run - config,
+	// sessions - are not profiled: there is no suspect there.) A profile
+	// file that cannot be opened aborts the run: a measurement that silently
+	// did not happen is worthless.
+	if o.cpuProfile != "" {
+		f, err := os.Create(o.cpuProfile)
+		if err != nil {
+			fmt.Fprintln(stderr, "mini: -cpuprofile:", err)
+			return 1
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			f.Close()
+			_ = os.Remove(o.cpuProfile)
+			fmt.Fprintln(stderr, "mini: -cpuprofile:", err)
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			if err := f.Close(); err != nil {
+				fmt.Fprintln(stderr, "mini: closing -cpuprofile:", err)
+			}
+		}()
+	}
+	if o.memProfile != "" {
+		defer func() {
+			f, err := os.Create(o.memProfile)
+			if err != nil {
+				fmt.Fprintln(stderr, "mini: -memprofile:", err)
+				return
+			}
+			defer f.Close()
+			// The heap profile carries both resident and cumulative
+			// allocations; debug=0 is the complete protobuf form every pprof
+			// reader takes.
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				fmt.Fprintln(stderr, "mini: writing -memprofile:", err)
+			}
+		}()
 	}
 
 	// A stdout that is not a terminal (or an explicit -p) means the headless

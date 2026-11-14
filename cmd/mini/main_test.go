@@ -194,6 +194,53 @@ func TestNewEnvironmentReadsTheConfigSection(t *testing.T) {
 	}
 }
 
+// TestProfileFlagsWritePprofFiles is the plan's CLI check for the
+// investigation tooling: -cpuprofile and -memprofile must bracket the whole
+// run and land as real pprof files (gzip-framed protobuf, what every pprof
+// reader expects) whatever else the run does.
+func TestProfileFlagsWritePprofFiles(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MINI_STATE_DIR", t.TempDir())
+	t.Setenv("MINI_GLOBAL_CONFIG_DIR", dir)
+	t.Setenv("MINI_CONFIGURED", "true")
+	t.Setenv("MINI_MODEL_NAME", "test-model")
+	t.Setenv("MINI_SILENT_STARTUP", "1")
+	srv := fixtureServer(t, "toolcall.sse", "submit.sse")
+	defer srv.Close()
+
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	stdout, err := os.CreateTemp(t.TempDir(), "mini-out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdout.Close()
+
+	cpu := filepath.Join(dir, "cpu.pprof")
+	heap := filepath.Join(dir, "heap.pprof")
+	code := run([]string{"-p", "-y", "--exit-immediately", "-t", "profiled run",
+		"--url", srv.URL, "-o", filepath.Join(dir, "traj.json"),
+		"-cpuprofile", cpu, "-memprofile", heap}, devnull, stdout, os.Stderr)
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	for _, path := range []string{cpu, heap} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("%s: %v", path, err)
+			continue
+		}
+		// The gzip frame is the only claim worth making without a decoder
+		// import: content validation is pprof's own readers' job.
+		if len(b) < 32 || b[0] != 0x1f || b[1] != 0x8b {
+			t.Errorf("%s: %d bytes, magic %x: not a pprof profile", path, len(b), b[:min(2, len(b))])
+		}
+	}
+}
+
 // TestRunPrintModeEndToEnd is the plan's CLI check: --print, --yolo, a fake
 // sushi, and a trajectory whose exit_status is Submitted.
 func TestRunPrintModeEndToEnd(t *testing.T) {

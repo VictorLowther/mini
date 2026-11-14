@@ -31,6 +31,7 @@ go build ./cmd/mini
 ./mini -t "add a main() guard to a.py, then submit"        # desktop window
 ./mini -p -y -t "run 'echo hi' then submit" -o traj.json   # headless yolo run
 ./mini -c mini.yaml -c model.max_tokens=2048               # config overrides
+./mini -cpuprofile cpu.pprof -memprofile heap.pprof -r     # profile the whole run
 ```
 
 By default the config comes from the embedded `mini.yaml`; passing `-c`
