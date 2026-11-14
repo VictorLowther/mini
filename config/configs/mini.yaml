@@ -13,8 +13,8 @@ agent:
     3. Edit the source code to resolve the issue
     4. Verify your fix works by running your script again
     5. Test edge cases to ensure your fix is robust
-    6. Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
-       Do not combine it with any other command. <important>After this command, you must stop and wait for the user.</important>
+    6. Summarize the completed work in a final response that makes no tool call.
+       <important>A response without a tool call signals that you are done and ready for the user's next prompt - nothing more will be executed after it, so do not send one until the task is truly finished.</important>
 
     ## Command Execution Rules
 
@@ -25,7 +25,7 @@ agent:
     3. You see the result(s)
     4. You write your next command(s)
 
-    Each response should include:
+    Each working response should include:
 
     1. **Reasoning text** where you explain your analysis and plan
     2. At least one tool call with your command
@@ -33,11 +33,10 @@ agent:
     **CRITICAL REQUIREMENTS:**
 
     - Your response SHOULD include reasoning text explaining what you're doing
-    - Your response MUST include AT LEAST ONE bash tool call
+    - While work remains, your response MUST include at least one bash tool call
+    - A response without any tool call ends the task: it tells the user your work is done and you are ready for your next prompt. The text of that response is your submission, so make it a summary worth reading.
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
-    - Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
-      Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
     - Every command's complete output is saved to a file. When a result reports `output_path`, the text you were shown is only its last lines: read `output_path` with `sed -n`, `tail`, or `grep` before concluding anything about the omitted part.
 
     Example of a CORRECT response:
@@ -46,6 +45,11 @@ agent:
 
     [Makes bash tool call with {"command": "ls -la"} as arguments]
     </example_response>
+
+    Example of a CORRECT final response, when the work is done - reasoning and summary only, no tool call:
+    <example_final_response>
+    The issue is fixed: a.py now has a main() guard and the reproduction script exits 0. I also checked the empty-file edge case, which now behaves. Nothing is left pending.
+    </example_final_response>
 
     <system_information>
     {{.system}} {{.release}} {{.version}} {{.machine}}
@@ -135,7 +139,7 @@ model:
     {{- end -}}
   format_error_template: |
     {{- if or (eq .finish_reason "length") (and (eq .finish_reason "tool_calls") (not .has_tool_calls)) -}}
-    Your previous response reached the output token limit (finish_reason={{.finish_reason}}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call. If you need to think more, do so briefly.
+    Your previous response reached the output token limit (finish_reason={{.finish_reason}}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call (or with no tool call at all, if the task is already complete). If you need to think more, do so briefly.
     {{- else -}}
     Tool call error:
 
@@ -145,14 +149,13 @@ model:
 
     Here is general guidance on how to submit correct toolcalls:
 
-    Every response needs to use the 'bash' tool at least once to execute commands.
+    Every working response must use the 'bash' tool at least once to execute commands.
 
     Call the bash tool with your command as the argument:
     - Tool: bash
     - Arguments: {"command": "your_command_here"}
 
-    If you want to end the task, please issue the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
-    without any other command.
+    When your work is complete, respond with a summary and no tool call: that signals you are done and ready for the user's next prompt.
     {{- end }}
   model_kwargs:
     drop_params: true

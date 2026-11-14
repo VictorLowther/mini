@@ -158,7 +158,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.Var(&o.configSpecs, "c", "config file, name, or key=value (repeatable; replaces the default mini.yaml)")
 	fs.StringVar(&o.output, "o", "", "trajectory file")
 	fs.StringVar(&o.output, "output", "", "trajectory file")
-	fs.BoolVar(&o.exitImmediately, "exit-immediately", false, "don't prompt when the agent wants to finish")
+	fs.BoolVar(&o.exitImmediately, "exit-immediately", false, "don't prompt when the agent is ready; end the run at the submission")
 	fs.BoolVar(&o.printMode, "p", false, "headless: plain stdout plus stdin prompts, no GUI window")
 	fs.BoolVar(&o.printMode, "print", false, "headless: plain stdout plus stdin prompts, no GUI window")
 	fs.StringVar(&o.logFile, "log-file", "", "also write DEBUG logs here")

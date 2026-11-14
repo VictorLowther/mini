@@ -13,7 +13,7 @@ import (
 // Question kinds: the five prompts agents/interactive.py actually contains.
 const (
 	AskConfirm  = "confirm"      // execute these actions?
-	AskNewTask  = "new-task"     // agent wants to finish
+	AskNewTask  = "new-task"     // agent is ready for the next task
 	AskLimits   = "limits"       // step/cost limit reached on a terminal
 	AskHuman    = "human"        // human mode: command for the agent to run
 	AskTask     = "task"         // what do you want to do?

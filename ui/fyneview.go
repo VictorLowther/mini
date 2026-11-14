@@ -899,9 +899,7 @@ func (v *guiView) showQuestion(q Question) {
 		v.openDialog("limits")
 		return
 	default: // new-task, human, interruption, task
-		// The shared prompt names ctrl-c; the window leaves with the native
-		// hotkey instead, so say the true key.
-		v.setPanel(plainRT(strings.ReplaceAll(q.Title, "ctrl-c", quitKeyName())))
+		v.setPanel(plainRT(q.Title))
 	}
 	v.refreshStatus()
 }

@@ -111,20 +111,21 @@ func TestRunPrintModeWritesSession(t *testing.T) {
 		t.Errorf("transcript has %d turns, want >= 6", len(msgs))
 	}
 
-	// Result files: ls -la + the submit echo, named 1.log and 2.log.
+	// Result files: ls -la only. The completion turn makes no tool call, so
+	// it earns no call row and no result file.
 	logs, err := os.ReadDir(filepath.Join(stateDir, "tcr", s.ID.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 2 {
-		t.Fatalf("result files = %v, want 1.log + 2.log", logs)
+	if len(logs) != 1 {
+		t.Fatalf("result files = %v, want just 1.log", logs)
 	}
-	submitBytes, err := os.ReadFile(filepath.Join(stateDir, "tcr", s.ID.String(), "2.log"))
+	lsBytes, err := os.ReadFile(filepath.Join(stateDir, "tcr", s.ID.String(), "1.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(submitBytes) != "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\nhi\n" {
-		t.Errorf("submit result file = %q", submitBytes)
+	if !strings.Contains(string(lsBytes), "total ") {
+		t.Errorf("ls result file = %q, want a directory listing", lsBytes)
 	}
 
 	// The trajectory export keeps raw_output, read back from the files.

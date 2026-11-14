@@ -257,7 +257,7 @@ func TestGUIConfirmPanelDrivesTheLoop(t *testing.T) {
 	dir := t.TempDir()
 	c := newConfig("confirm")
 	c.OutputPath = filepath.Join(dir, "gui.traj.json")
-	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi", submitCmd+"echo done\n"), Env: &env.Local{Timeout: 10 * time.Second}}
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi", "echo done", submit("done\n")), Env: &env.Local{Timeout: 10 * time.Second}}
 	p := newGUIForTest(t, c, l)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -288,7 +288,7 @@ func TestGUIConfirmPanelDrivesTheLoop(t *testing.T) {
 	waitFor(t, "the exit confirmation", func() bool {
 		return p.HasQuestion() && p.PendingQuestion().Kind == AskNewTask
 	})
-	if panel := p.panel(); !strings.Contains(panel, "Agent wants to finish") {
+	if panel := p.panel(); !strings.Contains(panel, "Agent is ready") {
 		t.Errorf("panel = %q", panel)
 	}
 	p.enter() // no-op: an empty enter re-asks, it never ends the run
@@ -333,7 +333,9 @@ func TestGUIConfirmPanelDrivesTheLoop(t *testing.T) {
 func TestGUITypeToReject(t *testing.T) {
 	c := newConfig("confirm")
 	c.ConfirmExit = false
-	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo not-run", submitCmd), Env: &env.Local{Timeout: 10 * time.Second}}
+	// The sentinel echo is an ordinary command now, so a no-action turn must
+	// follow it to end the run.
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo not-run", submitCmd, submit("done")), Env: &env.Local{Timeout: 10 * time.Second}}
 	p := newGUIForTest(t, c, l)
 	done := make(chan struct{})
 	go func() { _, _ = l.Run(context.Background(), "T"); close(done) }()
@@ -576,7 +578,7 @@ func TestGUICommandAtPromptDoesNotDeadlock(t *testing.T) {
 		t.Run(cmd, func(t *testing.T) {
 			c := newConfig("confirm")
 			c.ConfirmExit = false
-			l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi", submitCmd), Env: &env.Local{Timeout: 10 * time.Second}}
+			l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi", submit("done")), Env: &env.Local{Timeout: 10 * time.Second}}
 			p := newGUIForTest(t, c, l)
 			done := make(chan struct{})
 			go func() { _, _ = l.Run(context.Background(), "T"); close(done) }()
@@ -585,8 +587,10 @@ func TestGUICommandAtPromptDoesNotDeadlock(t *testing.T) {
 			p.enter()
 			for i := 0; i < 6 && !isClosed(done); i++ {
 				if p.HasQuestion() {
-					if p.PendingQuestion().Kind == AskHuman {
-						p.typeText(submitCmd)
+					if p.PendingQuestion().Kind == AskHuman && c.Mode == "human" {
+						// Typed text no longer ends the run; switching out of
+						// human mode lets the scripted no-action turn submit.
+						p.typeText("/c")
 					}
 					p.enter()
 				}
@@ -608,7 +612,7 @@ func TestGUISteeringLandsInTheHistory(t *testing.T) {
 	l.Model = &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}|{{ .output.output }}", Outputs: []model.Message{
 		turnWithActions("/sleep 0.4"),
 		turnWithActions("echo first-turn"),
-		turnWithActions(submitCmd + "echo done\n"),
+		submit("done"),
 	}}
 	p := newGUIForTest(t, c, l)
 	done := make(chan struct{})
@@ -653,7 +657,7 @@ func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 		"role":              "assistant",
 		"content":           "I will list the files.",
 		"reasoning_content": "the user wants a listing of the current directory",
-		"extra":             map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0},
+		"extra":             map[string]any{"actions": []model.Action{{Command: "echo hi", ToolCallID: "c"}}, "cost": 1.0},
 	}
 	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second},
 		Model: &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}", Outputs: []model.Message{msg}}}
@@ -701,7 +705,7 @@ func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
 	msg := model.Message{
 		"role":    "assistant",
 		"content": tall,
-		"extra":   map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0},
+		"extra":   map[string]any{"actions": []model.Action{{Command: "echo hi", ToolCallID: "c"}}, "cost": 1.0},
 	}
 	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second},
 		Model: &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}", Outputs: []model.Message{msg}}}
@@ -745,11 +749,13 @@ func TestGUIThinkingStateIsLegible(t *testing.T) {
 	c := newConfig("yolo")
 	c.ConfirmExit = false
 	reasoning := strings.Repeat("pondering ", 30)
+	// The turn makes no tool call, which is the contract's way of ending the
+	// run; the test only cares how the committed thinking renders.
 	msg := model.Message{
 		"role":              "assistant",
 		"content":           "the plan",
 		"reasoning_content": reasoning,
-		"extra":             map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0},
+		"extra":             map[string]any{"cost": 1.0},
 	}
 	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second},
 		Model: &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}", Outputs: []model.Message{msg}}}
@@ -819,7 +825,7 @@ func TestGUIResumeReplaysStoredTranscript(t *testing.T) {
 // TestGUITrajectoryMatchesPrintMode: the same scripted model through the GUI
 // and through --print must produce the same trajectory.
 func TestGUITrajectoryMatchesPrintMode(t *testing.T) {
-	commands := []string{"echo hi", submitCmd + "echo same\n"}
+	commands := []any{"echo hi", "echo same", submit("done")}
 
 	guiPath := filepath.Join(t.TempDir(), "gui.json")
 	c1 := newConfig("confirm")
@@ -863,7 +869,7 @@ func TestGUITranscriptIsAShellSessionNotJSON(t *testing.T) {
 	dir := t.TempDir()
 	c := newConfig("yolo")
 	c.ConfirmExit = false
-	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo one; echo two; exit 3", submitCmd),
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo one; echo two; exit 3", submit("done")),
 		Env: &env.Local{CWD: dir, Timeout: 10 * time.Second}}
 	p := newGUIForTest(t, c, l)
 	p.do(func() { p.prepareTranscript() })
@@ -920,7 +926,7 @@ func TestGUILiveCardsAreCreatedAndGrownPerTurn(t *testing.T) {
 	}
 
 	msg2 := model.Message{"role": "assistant", "content": "second answer",
-		"extra": map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0}}
+		"extra": map[string]any{"actions": []model.Action{{Command: "echo done", ToolCallID: "c"}}, "cost": 1.0}}
 	l.Handler.Content("second ans")
 	mid := p.transcript()
 	if got := strings.Count(mid, "LLM output"); got != 2 {
@@ -944,7 +950,7 @@ func TestGUILiveCardsAreCreatedAndGrownPerTurn(t *testing.T) {
 func TestGUITaskIsARightJustifiedUserEntry(t *testing.T) {
 	c := newConfig("yolo")
 	c.ConfirmExit = false
-	l := &agent.Loop{Cfg: c, Model: outputs(t, submitCmd), Env: &env.Local{Timeout: 10 * time.Second}}
+	l := &agent.Loop{Cfg: c, Model: outputs(t, submit("done")), Env: &env.Local{Timeout: 10 * time.Second}}
 	p := newGUIForTest(t, c, l)
 	p.setTask("fix the flaky test")
 	if _, err := l.Run(context.Background(), "fix the flaky test"); err != nil {

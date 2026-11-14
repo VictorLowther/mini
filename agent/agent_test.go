@@ -15,8 +15,6 @@ import (
 	"github.com/VictorLowther/mini/model"
 )
 
-const submitCommand = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-
 func agentConfig(t *testing.T) *Config {
 	t.Helper()
 	m, err := config.FromSpec("mini")
@@ -56,8 +54,15 @@ func turnActions(content string, actions ...model.Action) model.Message {
 	}
 }
 
-func submitted(extra string) string {
-	return submitCommand + "\necho '" + extra + "'"
+// done builds the canned completion turn: an assistant message that makes no
+// tool call. Under the prompt contract that is the model putting its tools
+// down, and the text becomes the submission.
+func done(text string) model.Message {
+	return model.Message{
+		"role":    "assistant",
+		"content": text,
+		"extra":   map[string]any{"cost": 1.0},
+	}
 }
 
 func run(t *testing.T, l *Loop, task string) (map[string]any, error) {
@@ -68,7 +73,7 @@ func run(t *testing.T, l *Loop, task string) (map[string]any, error) {
 func TestSuccessfulCompletion(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("I'll echo a message", "echo 'hello world'"),
-		turn("Now finishing", submitted("Task completed successfully")),
+		done("Task completed successfully"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	info, err := run(t, l, "Echo hello world then finish")
@@ -78,15 +83,15 @@ func TestSuccessfulCompletion(t *testing.T) {
 	if info["exit_status"] != "Submitted" {
 		t.Fatalf("exit_status = %v", info["exit_status"])
 	}
-	if info["submission"] != "Task completed successfully\n" {
+	if info["submission"] != "Task completed successfully" {
 		t.Errorf("submission = %q", info["submission"])
 	}
 	if l.NCalls != 2 {
 		t.Errorf("n_calls = %d, want 2", l.NCalls)
 	}
 	// system, user, assistant, observation, assistant, exit: the submitting
-	// action produces no observation, because DefaultAgent raises out of
-	// execute_actions before format_observation_messages runs.
+	// turn makes no tool call, so there is nothing to execute and nothing to
+	// observe - its text is the submission.
 	if got := roles(l.Messages); got != "system,user,assistant,user,assistant,exit" {
 		t.Errorf("roles = %s", got)
 	}
@@ -98,12 +103,13 @@ func TestSuccessfulCompletion(t *testing.T) {
 	}
 }
 
-func TestHooksPathRecordsPaddedObservationOnSubmit(t *testing.T) {
+func TestHooksPathSubmitsWithoutObservation(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("finishing", submitted("done")),
+		done("done"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
-	l.Hooks = &stubHooks{}
+	stub := &stubHooks{}
+	l.Hooks = stub
 	info, err := run(t, l, "finish immediately")
 	if err != nil {
 		t.Fatal(err)
@@ -111,14 +117,16 @@ func TestHooksPathRecordsPaddedObservationOnSubmit(t *testing.T) {
 	if info["exit_status"] != "Submitted" {
 		t.Fatalf("info = %#v", info)
 	}
-	// InteractiveAgent formats observations in its finally block, so the
-	// submitting action shows up as "action was not executed".
-	if got := roles(l.Messages); got != "system,user,assistant,user,exit" {
-		t.Errorf("roles = %s", got)
+	if stub.submitPrompts != 1 {
+		t.Errorf("submit prompts = %d, want 1", stub.submitPrompts)
 	}
-	obs, _ := l.Messages[3]["content"].(string)
-	if !strings.Contains(obs, "action was not executed") {
-		t.Errorf("observation = %q", obs)
+	// The completion turn was never confirmed (there was nothing to confirm)
+	// and produces no observation: no action ran, none is padded.
+	if stub.beforeCalls != 0 {
+		t.Errorf("BeforeExecute ran %d times for a turn with no actions", stub.beforeCalls)
+	}
+	if got := roles(l.Messages); got != "system,user,assistant,exit" {
+		t.Errorf("roles = %s", got)
 	}
 }
 
@@ -186,14 +194,14 @@ func TestWallTimeLimit(t *testing.T) {
 func TestTimeoutHandling(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("Long sleep", "sleep 5"),
-		turn("Quick finish", submitted("recovered")),
+		done("recovered"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: time.Second})
 	info, err := run(t, l, "Test timeout handling")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info["exit_status"] != "Submitted" || info["submission"] != "recovered\n" {
+	if info["exit_status"] != "Submitted" || info["submission"] != "recovered" {
 		t.Fatalf("info = %#v", info)
 	}
 	timedOut := 0
@@ -210,11 +218,11 @@ func TestTimeoutHandling(t *testing.T) {
 func TestTimeoutCapturesPartialOutput(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("Output then sleep", "echo $((111*9)); sleep 10"),
-		turn("Quick finish", submitted("recovered")),
+		done("recovered"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: time.Second})
 	info, _ := run(t, l, "Test timeout with partial output")
-	if info["submission"] != "recovered\n" {
+	if info["submission"] != "recovered" {
 		t.Fatalf("info = %#v", info)
 	}
 	var obs string
@@ -247,17 +255,17 @@ func TestMultipleStepsBeforeCompletion(t *testing.T) {
 		turn("Step 1", "echo 'first'"),
 		turn("Step 2", "echo 'second'"),
 		turn("Step 3", "echo 'third'"),
-		turn("Final step", submitted("completed all steps")),
+		done("completed all steps"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.CostLimit = 5 })
 	info, _ := run(t, l, "Multi-step task")
-	if info["exit_status"] != "Submitted" || info["submission"] != "completed all steps\n" || l.NCalls != 4 {
+	if info["exit_status"] != "Submitted" || info["submission"] != "completed all steps" || l.NCalls != 4 {
 		t.Fatalf("info = %#v n_calls = %d", info, l.NCalls)
 	}
 }
 
 func TestCustomTemplates(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{turn("Test response", submitted("custom config works"))}}
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("custom config works")}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) {
 		c.SystemTemplate = "You are a test assistant."
 		c.InstanceTemplate = "Task: {{.task}}. Return bash command."
@@ -265,7 +273,7 @@ func TestCustomTemplates(t *testing.T) {
 		c.CostLimit = 1.0
 	})
 	info, _ := run(t, l, "Test custom config")
-	if info["submission"] != "custom config works\n" {
+	if info["submission"] != "custom config works" {
 		t.Fatalf("info = %#v", info)
 	}
 	if l.Messages[0]["content"] != "You are a test assistant." {
@@ -279,7 +287,7 @@ func TestCustomTemplates(t *testing.T) {
 func TestTemplateVarsReachTemplates(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("a", "echo one"), turn("b", "echo two"),
-		turn("stop", submitted("x")),
+		done("x"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) {
 		c.InstanceTemplate = `calls={{.n_model_calls}} cost={{.model_cost}} task={{.task}} system={{.system}} custom={{.custom}}`
@@ -307,20 +315,21 @@ func TestTemplateVarsReachTemplates(t *testing.T) {
 	}
 }
 
-func TestEmptyActionsContinueTheRun(t *testing.T) {
+func TestEmptyActionsSubmitTheRun(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turnActions("No actions here"),
-		turn("Now with action", submitted("done")),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	info, _ := run(t, l, "Test empty actions")
-	if info["exit_status"] != "Submitted" || info["submission"] != "done\n" {
+	if info["exit_status"] != "Submitted" || info["submission"] != "No actions here" {
 		t.Fatalf("info = %#v", info)
 	}
-	if l.NCalls != 2 {
+	if l.NCalls != 1 {
 		t.Errorf("n_calls = %d", l.NCalls)
 	}
-	if got := roles(l.Messages); got != "system,user,assistant,assistant,exit" {
+	// A turn with no actions is the submission itself: no second query, no
+	// observation.
+	if got := roles(l.Messages); got != "system,user,assistant,exit" {
 		t.Errorf("roles = %s, want no observation for an actionless turn", got)
 	}
 }
@@ -350,11 +359,11 @@ func TestFormatErrorCounterResetsOnSuccess(t *testing.T) {
 		formatErrorTurn(),
 		turn("listing", "echo hello"),
 		formatErrorTurn(),
-		turn("done", submitted("ok")),
+		done("ok"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.MaxConsecutiveFormatErrors = 2 })
 	info, _ := run(t, l, "Test counter reset")
-	if info["exit_status"] != "Submitted" || info["submission"] != "ok\n" {
+	if info["exit_status"] != "Submitted" || info["submission"] != "ok" {
 		t.Fatalf("info = %#v", info)
 	}
 }
@@ -428,7 +437,8 @@ func TestSaveWritesTrajectoryAfterEachStep(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "nested", "traj.json")
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("a", "echo one"), turn("b", submitted("two"))}}
+		turn("a", "echo one"), done("two"),
+	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.OutputPath = out })
 	run(t, l, "save test")
 
@@ -441,7 +451,7 @@ func TestSaveWritesTrajectoryAfterEachStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	info := traj["info"].(map[string]any)
-	if info["exit_status"] != "Submitted" || info["submission"] != "two\n" {
+	if info["exit_status"] != "Submitted" || info["submission"] != "two" {
 		t.Errorf("info = %#v", info)
 	}
 	if info["mini_version"] != "mini-go/"+Version {
@@ -489,7 +499,7 @@ func TestSaveWritesTrajectoryAfterEachStep(t *testing.T) {
 func TestTurnCancellationInterruptsButKeepsTheRunAlive(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("long", "sleep 20"),
-		turn("b", submitted("back again")),
+		done("back again"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 30 * time.Second})
 	l.Hooks = &stubHooks{}
@@ -504,7 +514,8 @@ func TestTurnCancellationInterruptsButKeepsTheRunAlive(t *testing.T) {
 	if info["exit_status"] != "Submitted" {
 		t.Fatalf("info = %#v", info)
 	}
-	if got := roles(l.Messages); got != "system,user,assistant,user,user,assistant,user,exit" {
+	// The completion turn ran nothing and earns no observation.
+	if got := roles(l.Messages); got != "system,user,assistant,user,user,assistant,exit" {
 		t.Errorf("roles = %s", got)
 	}
 	if !strings.Contains(contents(l.Messages)[4], "Temporary interruption caught") {
@@ -584,7 +595,7 @@ func (s *stubHooks) OnLimits(_ context.Context, cfg *Config, _ *model.Interrupt)
 func TestRejectionSkipsExecutionButRecordsObservations(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("a", "echo not-run"),
-		turn("b", submitted("done")),
+		done("done"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	l.Hooks = &stubHooks{
@@ -605,9 +616,9 @@ func TestRejectionSkipsExecutionButRecordsObservations(t *testing.T) {
 	if info["exit_status"] != "Submitted" {
 		t.Fatalf("info = %#v", info)
 	}
-	// instance, assistant, padded observation, rejection, assistant, padded
-	// observation (the submitting turn gets one under the interactive path), exit
-	if got := roles(l.Messages); got != "system,user,assistant,user,user,assistant,user,exit" {
+	// instance, assistant, padded observation, rejection, assistant, exit:
+	// the completion turn runs nothing, so it earns no observation.
+	if got := roles(l.Messages); got != "system,user,assistant,user,user,assistant,exit" {
 		t.Errorf("roles = %s\nmessages: %v", got, contents(l.Messages))
 	}
 	if !strings.Contains(l.Messages[3]["content"].(string), "action was not executed") {
@@ -632,7 +643,8 @@ func contents(msgs []model.Message) []string {
 
 func TestLimitsHookCanLiftTheCeiling(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("a", "echo one"), turn("b", submitted("two"))}}
+		turn("a", "echo one"), done("two"),
+	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.CostLimit = 0.5 })
 	h := &stubHooks{liftLimits: true}
 	l.Hooks = h
@@ -650,8 +662,8 @@ func TestLimitsHookCanLiftTheCeiling(t *testing.T) {
 
 func TestOnSubmitCanStartANewTask(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("a", submitted("first")),
-		turn("b", submitted("second")),
+		done("first"),
+		done("second"),
 	}}
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	h := &newTaskHooks{once: true}
@@ -660,10 +672,10 @@ func TestOnSubmitCanStartANewTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info["submission"] != "second\n" {
+	if info["submission"] != "second" {
 		t.Errorf("info = %#v", info)
 	}
-	if !strings.Contains(contents(l.Messages)[4], "The user added a new task") {
+	if !strings.Contains(contents(l.Messages)[3], "The user added a new task") {
 		t.Errorf("messages = %v", contents(l.Messages))
 	}
 }

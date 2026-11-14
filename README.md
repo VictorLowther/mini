@@ -54,7 +54,7 @@ prompts — left-justified, so the two never read alike), `thinking`,
 area's header uses the body's own font and names its kind plus the message's
 generated token count, generation time, and cost when non-zero
 (`LLM output · 254 tok · 3.1s · $0.02`). The input box stays live whenever
-the harness is waiting — including at the "Agent wants to finish?" prompt,
+the harness is waiting — including at the "Agent is ready" prompt,
 where a new task continues the run — and the only ways to leave are `/quit`,
 the native quit hotkey (⌘Q / Ctrl+Q, or the menu), or closing the window;
 Enter sends, Shift+Enter (or ⌥Enter on macOS) adds a newline — multi-line

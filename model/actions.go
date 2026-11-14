@@ -10,13 +10,22 @@ import (
 	"github.com/VictorLowther/mini/tpl"
 )
 
-// parseToolCallActions is the port of parse_toolcall_actions: the error texts
-// are reproduced verbatim, concatenated in the same order and stripped, and
-// every failure becomes a FormatError carrying the rendered template plus the
+// parseToolCallActions is the port of parse_toolcall_actions, with one
+// deliberate departure from the Python original: a response that ended
+// naturally with no tool calls is not an error but a submission - the model
+// putting its tools down and going quiet, which the prompts define as "the
+// task is done, I am ready for the user's next prompt". Only a call-less
+// response that did NOT end naturally (truncated, or a stream that died
+// without a finish reason) is a FormatError. Error texts are reproduced
+// verbatim otherwise, concatenated in the same order and stripped, and every
+// failure becomes a FormatError carrying the rendered template plus the
 // {error, actions, has_tool_calls, finish_reason} context.
 func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx map[string]any) ([]Action, error) {
 	if len(toolCalls) == 0 {
-		return nil, formatError(errTemplate, "No tool calls found in the response. Every response MUST include at least one tool call.", false, ctx)
+		if fr, _ := ctx["finish_reason"].(string); fr == "stop" {
+			return nil, nil // a valid submission turn: no actions, no error
+		}
+		return nil, formatError(errTemplate, "No tool calls found in the response. Every response must either include at least one tool call or be a final answer without one.", false, ctx)
 	}
 	actions := make([]Action, 0, len(toolCalls))
 	for _, tc := range toolCalls {

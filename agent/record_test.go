@@ -115,7 +115,7 @@ func newRecorderLoop(t *testing.T, m model.Model, e env.Environment) (*Loop, *fa
 func TestRecorderSeesEveryTurn(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("echo", "echo hi"),
-		turn("done", submitted("all finished")),
+		done("all finished"),
 	}}
 	spy := &spyEnv{inner: &env.Local{Timeout: 5 * time.Second}}
 	l, rec := newRecorderLoop(t, m, spy)
@@ -151,10 +151,10 @@ func TestRecorderSeesEveryTurn(t *testing.T) {
 		t.Errorf("result file = %q, %v; want %q", b, err, "hi\n")
 	}
 
-	// The submit action is executed to completion too, so it gets its own
-	// outcome; only the observation formatting is skipped.
-	if len(rec.comps) != 2 {
-		t.Fatalf("completes = %d, want 2", len(rec.comps))
+	// Only the one command runs: the submitting turn has no actions, so the
+	// recorder sees exactly one completed call.
+	if len(rec.comps) != 1 {
+		t.Fatalf("completes = %d, want 1", len(rec.comps))
 	}
 	c := rec.comps[0]
 	if c.number != 1 || c.out.Bytes != 3 || c.out.ViewOffset != 0 || c.out.ViewElided != 0 || c.out.ReturnCode != 0 || c.out.CWD == "" {
@@ -214,15 +214,15 @@ func TestRecorderPerParallelCall(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turnActions("both", model.Action{Command: "echo one", ToolCallID: "call_1"},
 			model.Action{Command: "echo two", ToolCallID: "call_2"}),
-		turn("done", submitted("bye")),
+		done("bye"),
 	}}
 	l, rec := newRecorderLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	if _, err := run(t, l, "two commands then finish"); err != nil {
 		t.Fatal(err)
 	}
-	// 2 actions of this turn + the following submit turn's own action.
-	if len(rec.opens) != 3 || len(rec.comps) != 3 {
-		t.Fatalf("opens=%d comps=%d, want 3/3", len(rec.opens), len(rec.comps))
+	// The 2 actions of the parallel turn; the submit turn has nothing to run.
+	if len(rec.opens) != 2 || len(rec.comps) != 2 {
+		t.Fatalf("opens=%d comps=%d, want 2/2", len(rec.opens), len(rec.comps))
 	}
 	var assistantTurn int64
 	for _, msg := range rec.seen {
@@ -258,21 +258,30 @@ func TestRecorderPerParallelCall(t *testing.T) {
 	}
 }
 
-// A padded "action was not executed" observation exports raw_output "" — a
-// command that never ran claims no file.
+// A padded "action was not executed" observation exports raw_output "" - a
+// command that never ran claims no file. The padding comes from rejection
+// today: a refused batch reaches format_observation_messages with no results.
 func TestPaddedObservationHasNoFile(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("two but submits on first",
-			model.Action{Command: "echo " + strings.TrimSpace(submitForTest("x")), ToolCallID: "call_1"},
+		turnActions("rejected batch",
+			model.Action{Command: "echo one", ToolCallID: "call_1"},
 			model.Action{Command: "echo never", ToolCallID: "call_2"}),
+		done("bye"),
 	}}
 	l, rec := newRecorderLoop(t, m, &env.Local{Timeout: 5 * time.Second})
-	l.Hooks = &stubHooks{}
-	if _, err := run(t, l, "submit mid batch"); err != nil {
+	l.Hooks = &stubHooks{rejectOnce: true, rejectWith: &model.Interrupt{
+		Kind: model.KindUserInterruption,
+		Messages: []model.Message{{
+			"role":    "user",
+			"content": "Commands not executed. The user rejected your commands with the following message: nope",
+			"extra":   map[string]any{"interrupt_type": "UserRejection"},
+		}},
+	}}
+	if _, err := run(t, l, "reject the batch"); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.opens) != 1 {
-		t.Fatalf("opens = %d, want 1: the second action never ran", len(rec.opens))
+	if len(rec.opens) != 0 {
+		t.Fatalf("opens = %d, want 0: a rejected action never starts, so no call row exists", len(rec.opens))
 	}
 	traj, _ := l.Save("")
 	raw, _ := json.Marshal(traj["messages"])
@@ -293,13 +302,9 @@ func TestPaddedObservationHasNoFile(t *testing.T) {
 			}
 		}
 	}
-	if padded == 0 {
-		t.Error("no padded observation found")
+	if padded != 2 {
+		t.Errorf("padded observations = %d, want 2 (the whole rejected batch)", padded)
 	}
-}
-
-func submitForTest(s string) string {
-	return "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\necho " + s
 }
 
 // Without a Recorder nothing is persisted, but the capture still happens in a
@@ -308,7 +313,7 @@ func submitForTest(s string) string {
 func TestNoRecorderScratchLifecycle(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("echo", "echo hi"),
-		turn("done", submitted("bye")),
+		done("bye"),
 	}}
 	cfg := agentConfig(t)
 	trajPath := filepath.Join(t.TempDir(), "traj.json")
@@ -352,6 +357,16 @@ func TestNoRecorderScratchLifecycle(t *testing.T) {
 // defer clears the directory from disk), the scratch dir, the first result
 // file's bytes, the trajectory as saved during the run, and the writer type
 // the loop handed to Execute.
+func (p *scratchPeeker) OnSubmit(_ context.Context, _ model.Message) error {
+	// The completion turn appends no tool result, so this is the last moment
+	// inside the run when the trajectory (saved after every step) can be read
+	// before Run's defer clears the scratch directory.
+	if b, err := os.ReadFile(p.l.Cfg.OutputPath); err == nil {
+		p.seen["traj"] = string(b)
+	}
+	return nil
+}
+
 type scratchPeeker struct {
 	stubHooks
 	seen map[string]string

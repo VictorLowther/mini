@@ -226,14 +226,15 @@ func TestRunPrintModeEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(data, &traj); err != nil {
 		t.Fatal(err)
 	}
-	if traj.Info.ExitStatus != "Submitted" || traj.Info.Submission != "hi\n" {
+	if traj.Info.ExitStatus != "Submitted" || traj.Info.Submission != "Everything verified; the task is complete." {
 		t.Errorf("info = %+v", traj.Info)
 	}
 	if traj.TrajectoryFormat != "mini-swe-agent-1.1" {
 		t.Errorf("format = %s", traj.TrajectoryFormat)
 	}
-	// system, user, assistant, tool, assistant, tool, exit
-	if len(traj.Messages) != 7 {
+	// system, user, assistant, tool, assistant, exit: the completion turn
+	// makes no tool call, so it has no observation.
+	if len(traj.Messages) != 6 {
 		t.Errorf("%d messages:\n%s", len(traj.Messages), string(data))
 	}
 	if traj.Info.ModelStats.APICalls != 2 {

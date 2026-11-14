@@ -245,7 +245,6 @@ func TestFormatErrors(t *testing.T) {
 		wantNotIn  string
 		hasToolCfg bool
 	}{
-		{"no_tool_calls.sse", "Tool call error:", "reached the output token limit", false},
 		{"bad_args.sse", "Error parsing tool call arguments:", "", true},
 		{"unknown_tool.sse", "Unknown tool 'python'.", "Missing 'command'", true},
 		{"missing_command.sse", "Missing 'command' argument in bash tool call.", "", true},
@@ -286,13 +285,30 @@ func TestFormatErrors(t *testing.T) {
 	}
 }
 
-func TestExactErrorStrings(t *testing.T) {
+// A plain-text turn that ends with finish_reason=stop is the submission
+// itself, not an error: no actions to run, and the text comes back intact.
+func TestPlainResponseIsTheSubmission(t *testing.T) {
 	srv, _, _ := newServer(t, "no_tool_calls.sse")
+	s := newSushi(t, srv.URL)
+	msg, err := s.Query(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("a stop-terminated plain response must not error: %v", err)
+	}
+	if got, _ := msg["content"].(string); got != "I think we are done here." {
+		t.Errorf("content = %q", got)
+	}
+	if acts := ActionsOf(msg); len(acts) != 0 {
+		t.Errorf("actions = %v, want none", acts)
+	}
+}
+
+func TestExactErrorStrings(t *testing.T) {
+	srv, _, _ := newServer(t, "no_finish_reason.sse")
 	s := newSushi(t, srv.URL)
 	s.ErrTemplate = "{{ .error }}"
 	_, err := s.Query(context.Background(), nil, nil)
 	in := interruptOf(t, err)
-	want := "No tool calls found in the response. Every response MUST include at least one tool call."
+	want := "No tool calls found in the response. Every response must either include at least one tool call or be a final answer without one."
 	if got := in.Messages[0]["content"]; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
@@ -579,7 +595,9 @@ func ptr[T any](v T) *T { return &v }
 
 func TestStreamIgnoresForeignFrameLines(t *testing.T) {
 	// "data:" with no payload and a short non-data line must be skipped, not
-	// crash the reader (some proxies add event:/id: lines).
+	// crash the reader (some proxies add event:/id: lines). The stream itself
+	// is a plain-text stop turn: valid under the prompt contract, so it comes
+	// back parsed rather than as an error.
 	body := "data:\n\nid: 7\nevent: message\n: keepalive\n" +
 		"data: " + `{"choices":[{"index":0,"delta":{"content":"ok"}}]}` + "\n\n" +
 		"data: " + `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
@@ -590,9 +608,11 @@ func TestStreamIgnoresForeignFrameLines(t *testing.T) {
 	t.Cleanup(srv.Close)
 	s := newSushi(t, srv.URL)
 	s.ErrTemplate = "{{.error}}"
-	_, err := s.Query(context.Background(), nil, nil)
-	var in *Interrupt
-	if !errors.As(err, &in) || !strings.Contains(in.Messages[0]["content"].(string), "No tool calls found") {
+	msg, err := s.Query(context.Background(), nil, nil)
+	if err != nil {
 		t.Fatalf("err = %v", err)
+	}
+	if got, _ := msg["content"].(string); got != "ok" {
+		t.Errorf("content = %q, want ok", got)
 	}
 }

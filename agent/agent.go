@@ -562,14 +562,31 @@ func exitMessage(kind, submission string) model.Message {
 	}
 }
 
-// ExecuteActions runs the model's commands and appends the observations. The
-// branching follows the two Python classes it ports: DefaultAgent lets a
-// submission skip the observation formatting entirely, while InteractiveAgent
-// records the (padded) observations in its finally block, after asking the user
-// whether the run really ends.
+// ExecuteActions runs the model's commands and appends the observations.
+// A turn with no tool calls is the model putting its tools down: the prompt
+// contract says that response - and only that response - ends the task, and
+// its text becomes the submission. Turns that do run commands follow the
+// Python InteractiveAgent's ordering: observations are recorded in the
+// finally block, after asking the user whether the run really ends.
 func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 	actions := model.ActionsOf(msg)
 	var results []env.Result
+
+	if len(actions) == 0 {
+		submission, _ := msg["content"].(string)
+		exitMsg := model.Message{
+			"role":    "exit",
+			"content": submission,
+			"extra":   map[string]any{"exit_status": model.KindSubmitted, "submission": submission},
+		}
+		if l.Hooks == nil {
+			return &model.Interrupt{Kind: model.KindSubmitted, Messages: []model.Message{exitMsg}}
+		}
+		if err := l.Hooks.OnSubmit(ctx, exitMsg); err != nil {
+			return err
+		}
+		return &model.Interrupt{Kind: model.KindSubmitted, Messages: []model.Message{exitMsg}}
+	}
 
 	if l.Hooks != nil {
 		if err := l.Hooks.BeforeExecute(ctx, actions, l.TemplateVars()); err != nil {
@@ -578,7 +595,6 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		}
 	}
 
-	var submitMsg model.Message
 	for i, action := range actions {
 		// One call row and one result file per action. The file is the sink
 		// even when the database row failed: the observation must always
@@ -650,22 +666,6 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 			res.Extra["elided_lines"] = res.ElidedLines
 		}
 		results = append(results, res)
-		if exitMsg, ok := env.SubmitMarker(res); ok {
-			submitMsg = exitMsg
-			break
-		}
-	}
-
-	if submitMsg != nil {
-		if l.Hooks == nil {
-			return &model.Interrupt{Kind: model.KindSubmitted, Messages: []model.Message{submitMsg}}
-		}
-		err := l.Hooks.OnSubmit(ctx, submitMsg)
-		l.addMessages(l.Model.FormatObservations(msg, results[:len(results)-1], l.TemplateVars())...)
-		if err != nil {
-			return err
-		}
-		return &model.Interrupt{Kind: model.KindSubmitted, Messages: []model.Message{submitMsg}}
 	}
 
 	l.addMessages(l.Model.FormatObservations(msg, results, l.TemplateVars())...)

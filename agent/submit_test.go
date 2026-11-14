@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -13,10 +12,12 @@ import (
 	"github.com/VictorLowther/mini/model"
 )
 
-func TestSubmitMarkerCarriesGitDiff(t *testing.T) {
-	// The marker mixed into a chain still submits, because its output's first
-	// line is the marker alone, and the submission is everything after it (the
-	// staged diff).
+// The old contract read COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT out of command
+// output and treated the run as over. That marker is dead: the echo now runs
+// like any other command, earns its observation, and the loop keeps going -
+// only a response without a tool call ends the run, and its text is the
+// submission.
+func TestSentinelEchoIsJustACommand(t *testing.T) {
 	dir := t.TempDir()
 	gitRun(t, dir, "init", "-q")
 	os.WriteFile(filepath.Join(dir, "a.py"), []byte("print(1)\n"), 0o644)
@@ -26,22 +27,35 @@ func TestSubmitMarkerCarriesGitDiff(t *testing.T) {
 
 	l := &Loop{
 		Cfg: &Config{SystemTemplate: "s", InstanceTemplate: "t", CostLimit: 10},
-		Model: &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{turn("done",
-			"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached")}},
+		Model: &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+			turn("chained", "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"),
+			done("The staged change is the only edit: print(1) became print(2)."),
+		}},
 		Env: &env.Local{CWD: dir, Timeout: 20 * time.Second},
 	}
 	info, err := l.Run(context.Background(), "commit the change")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub, _ := info["submission"].(string)
+	if l.NCalls != 2 {
+		t.Errorf("n_calls = %d, want 2: the marker echo must not end the run by itself", l.NCalls)
+	}
 	if info["exit_status"] != "Submitted" {
 		t.Fatalf("info = %#v", info)
 	}
-	for _, want := range []string{"diff --git a/a.py b/a.py", "-print(1)", "+print(2)"} {
-		if !strings.Contains(sub, want) {
-			t.Errorf("submission missing %q:\n%s", want, sub)
+	if sub, _ := info["submission"].(string); sub != "The staged change is the only edit: print(1) became print(2)." {
+		t.Errorf("submission = %q", sub)
+	}
+	// The marker turn earned an observation: its output is an executed
+	// command's result, not an exit.
+	observed := false
+	for _, msg := range l.Messages {
+		if e, ok := msg["extra"].(map[string]any); ok && e["command"] != nil {
+			observed = true
 		}
+	}
+	if !observed {
+		t.Error("the marker turn produced no observation - it was treated as special")
 	}
 }
 
@@ -50,7 +64,8 @@ func gitRun(t *testing.T, dir string, args ...string) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }

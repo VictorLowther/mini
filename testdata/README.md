@@ -16,5 +16,5 @@ go run ./testdata/fakesushi -addr :8009 -delay 150ms &
 /tmp/mini -p -y -m test-model --url http://127.0.0.1:8009 \
   -t "run 'echo hi', verify, then submit" --exit-immediately -o /tmp/out.traj.json
 python3 -c "import json;d=json.load(open('/tmp/out.traj.json'));print(d['info']['exit_status'],repr(d['info']['submission']),len(d['messages']))"
-# Submitted 'hi\n' 7
+# Submitted 'Everything verified; the task is complete.' 6
 ```
