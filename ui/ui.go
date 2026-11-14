@@ -1,6 +1,6 @@
 // Package ui is the human end of the agent: what it prints and what it asks.
-// Both the plain --print mode and the bubbletea TUI satisfy the same UI
-// interface, and ui.Interactive adapts a UI to agent.Hooks.
+// Both the Fyne GUI and the plain --print mode satisfy the same UI interface,
+// and ui.Interactive adapts a UI to agent.Hooks.
 package ui
 
 import (

@@ -1,5 +1,3 @@
-//go:build gui
-
 package ui
 
 import (
@@ -24,10 +22,83 @@ import (
 	"github.com/VictorLowther/mini/model"
 )
 
+// waitFor polls a condition until the deadline, so an assertion never races
+// the toolkit goroutine.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// turnWithActions is an assistant message whose only content is one command:
+// the shape a confirm-mode run hands the UI before executing anything.
+func turnWithActions(cmd string) model.Message {
+	return model.Message{
+		"role":    "assistant",
+		"content": "turn",
+		"extra":   map[string]any{"actions": []model.Action{{Command: cmd, ToolCallID: "c"}}, "cost": 1.0},
+	}
+}
+
+// normalizeTraj reduces a trajectory file to the bytes that must agree across
+// frontends.
+func normalizeTraj(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var traj map[string]any
+	if err := json.Unmarshal(data, &traj); err != nil {
+		t.Fatal(err)
+	}
+	stripVolatile(traj)
+	if info, ok := traj["info"].(map[string]any); ok {
+		if cfg, ok := info["config"].(map[string]any); ok {
+			delete(cfg, "agent")
+			delete(cfg, "environment")
+		}
+	}
+	out, _ := json.Marshal(traj)
+	return string(out)
+}
+
+// stripVolatile removes the fields that legitimately differ between runs.
+func stripVolatile(v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		for _, k := range []string{"timestamp", "elapsed_seconds", "outputs", "response", "cwd", "base_url", "model", "output_path", "tcr_path"} {
+			delete(t, k)
+		}
+		for _, child := range t {
+			stripVolatile(child)
+		}
+	case []any:
+		for _, child := range t {
+			stripVolatile(child)
+		}
+	}
+}
+
 // guiPane is a test handle on the GUI. The headless driver executes fyne.Do
-// work inline, so the pane serialises deliveries with one mutex, mirroring
-// TUI.loopMu: exactly one "update goroutine" at a time. mu is a pointer so
-// copying the handle keeps every delivery and assertion on the same lock.
+// work inline, so the handle serialises deliveries with one mutex: exactly
+// one "update goroutine" at a time. mu is a pointer so copying the handle
+// keeps every delivery and assertion on the same lock.
 type guiPane struct {
 	*GUI
 	v  *guiView
@@ -62,7 +133,7 @@ func newGUIForTest(t *testing.T, c *agent.Config, l *agent.Loop) *guiPane {
 }
 
 // transcriptText renders the whole transcript (committed areas plus the live
-// pair) as plain text, the GUI's counterpart to the pane's scrollback.
+// pair) as plain text: the scrollback, give or take the pixels.
 func transcriptText(o fyne.CanvasObject) string {
 	switch t := o.(type) {
 	case *area:
@@ -414,7 +485,7 @@ func TestGUILimitsDialogAsksTwice(t *testing.T) {
 }
 
 // TestGUILimitsEscKeepsTheQuestion: esc hides the prompt, but there is no
-// give-up answer; the next submit reopens it, exactly like the pane.
+// give-up answer; the next submit reopens it.
 func TestGUILimitsEscKeepsTheQuestion(t *testing.T) {
 	c := newConfig("yolo")
 	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
@@ -487,8 +558,7 @@ func TestGUIMultilineIsAKeystroke(t *testing.T) {
 	}
 
 	// /m no longer switches modes; it points at the keystroke. (At a question
-	// it is an answer, exactly as in the pane; the affordance lives in the
-	// idle input path.)
+	// it is an answer; the affordance lives in the idle input path.)
 	p.typeText("/m")
 	p.enter()
 	if !strings.Contains(p.transcript(), "shift+enter adds a newline") {
@@ -499,8 +569,8 @@ func TestGUIMultilineIsAKeystroke(t *testing.T) {
 	}
 }
 
-// TestGUICommandAtPromptDoesNotDeadlock is the GUI's copy of the pane's
-// regression test: every slash command must leave the loop alive.
+// TestGUICommandAtPromptDoesNotDeadlock guards the regression that every
+// slash command must leave the loop alive.
 func TestGUICommandAtPromptDoesNotDeadlock(t *testing.T) {
 	for _, cmd := range []string{"/y", "/c", "/u", "/h", "/t", "/m"} {
 		t.Run(cmd, func(t *testing.T) {
@@ -618,8 +688,8 @@ func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 	}
 }
 
-// TestGUIThinkingStateIsLegible mirrors the pane's test: hidden by default
-// with its size named, expanded by the toggle, always labelled.
+// TestGUIThinkingStateIsLegible: hidden by default with its size named,
+// expanded by the toggle, always labelled.
 func TestGUIThinkingStateIsLegible(t *testing.T) {
 	c := newConfig("yolo")
 	c.ConfirmExit = false
@@ -736,8 +806,8 @@ func TestGUITrajectoryMatchesPrintMode(t *testing.T) {
 	}
 }
 
-// TestGUITranscriptIsAShellSessionNotJSON: same rule as the pane - command
-// output renders as exit code plus text, never the model's JSON view.
+// TestGUITranscriptIsAShellSessionNotJSON: command output renders as exit
+// code plus text, never the model's JSON view.
 func TestGUITranscriptIsAShellSessionNotJSON(t *testing.T) {
 	dir := t.TempDir()
 	c := newConfig("yolo")

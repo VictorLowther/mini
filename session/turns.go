@@ -14,7 +14,7 @@ import (
 // RecordMessage appends one turn to the transcript and returns its seq, the
 // single write seam for the history. The seq is stamped into the message's own
 // extra map (read-without-creating: model.Extra would add an "extra" key to the
-// system and instance messages and make the TUI treat prompt plumbing as agent
+// system and instance messages and make the GUI treat prompt plumbing as agent
 // output), which is what lets OpenToolCall name the issuing turn.
 func (s *Session) RecordMessage(m model.Message) (int64, error) {
 	role, _ := m["role"].(string)
@@ -90,7 +90,7 @@ SELECT ?, coalesce(max(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM turns WHERE sessio
 	// title backfilled only while sessions.title is still empty. The
 	// task-carrying user message is exactly the rendered instance_template
 	// entry with no extra key — the only history line that holds the task in
-	// every flow, including a task the TUI asks for after Create.
+	// every flow, including a task the GUI asks for after Create.
 	sets := []string{"updated_at = ?"}
 	args := []any{now}
 	if role == "exit" {

@@ -5,10 +5,11 @@ import (
 	"testing"
 )
 
-// The pane mutes the logger while it is up, so the terminal is only ever written
-// by the renderer. Forgetting to restore is the failure that would leave the user
-// with no log output for the rest of the session (print mode included, since the
-// writer is shared), and a lost write is the one that silences a real warning.
+// The GUI mutes the logger while it is up, so the launching terminal is only
+// ever written by the CLI itself. Forgetting to restore is the failure that
+// would leave the user with no log output for the rest of the session (print
+// mode included, since the writer is shared), and a lost write is the one that
+// silences a real warning.
 func TestLogTargetMuteRestores(t *testing.T) {
 	var buf bytes.Buffer
 	target := NewLogTarget(&buf)
@@ -29,7 +30,7 @@ func TestLogTargetMuteRestores(t *testing.T) {
 	if got := buf.String(); got != "before\nafter\n" {
 		t.Fatalf("writes after unmuting: %q", got)
 	}
-	// A nil target is what a TUI built without a log writer has; muting it must
+	// A nil target is what a GUI built without a log writer has; muting it must
 	// be a no-op rather than a panic.
 	var none *LogTarget
 	none.Mute()()

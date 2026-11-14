@@ -164,7 +164,7 @@ func TestQueryHappyPath(t *testing.T) {
 	}
 	req := (*requests)[0]
 	if !req.Stream {
-		t.Error("stream must be on so the TUI can show thinking")
+		t.Error("stream must be on so the GUI can show thinking")
 	}
 	if req.StreamOptions["include_usage"] != true {
 		t.Error("stream_options.include_usage must be set")

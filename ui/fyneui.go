@@ -1,5 +1,3 @@
-//go:build gui
-
 package ui
 
 import (
@@ -16,30 +14,28 @@ import (
 	"github.com/VictorLowther/mini/model"
 )
 
-// GUIOptions wires the desktop UI to a configured loop, exactly like
-// TUIOptions. App is the injection point for the headless test app; nil means
-// the real one.
+// GUIOptions wires the desktop UI to a configured loop. App is the injection
+// point for the headless test app; nil means the real one.
 type GUIOptions struct {
 	Cfg        *agent.Config
 	Loop       *agent.Loop
 	Model      *model.Sushi
 	ConfigName string
-	// LogWriter is muted for the duration of Run, as the pane mutes it while
-	// it owns the terminal.
+	// LogWriter is muted for the duration of Run: the window owns the screen,
+	// and a stray log write to the launching terminal is noise nobody reads.
 	LogWriter *LogTarget
 	App       fyne.App
 }
 
-// GUI is the Fyne desktop front end. Like TUI it is both the UI the agent
-// talks to and the owner of the event loop: the agent runs in a goroutine and
-// every callback reaches the screen through fyne.Do (the post field), so all
-// widget access happens on the toolkit goroutine. State shared with the agent
-// goroutine is guarded by one mutex, mirroring TUI.
+// GUI is the Fyne desktop front end, the interactive face of mini. It is both
+// the UI the agent talks to and the owner of the event loop: the agent runs in
+// a goroutine and every callback reaches the screen through fyne.Do (the post
+// field), so all widget access happens on the toolkit goroutine. State shared
+// with the agent goroutine is guarded by one mutex.
 //
-// The behavior contract is ui/tuimodel.go: same blocks, same questions, same
-// answer semantics, same notes. Every string the pane shows reappears here
-// verbatim; only the key names in the "how to leave" notes adapt to desktop
-// affordances (esc for ctrl-c).
+// The transcript model is ui/blocks.go: same blocks, same questions, same
+// answer semantics, same notes. Only the key names in the "how to leave" notes
+// speak desktop (esc for ctrl-c).
 type GUI struct {
 	cfg        *agent.Config
 	loop       *agent.Loop
@@ -53,8 +49,8 @@ type GUI struct {
 	v         *guiView
 
 	// post delivers a closure to the toolkit goroutine. Production is
-	// fyne.Do; tests replace it with a serialized direct call, mirroring
-	// TUI.fallback's role for the pane.
+	// fyne.Do; tests replace it with a serialized direct call so deliveries
+	// land in order.
 	post func(fn func())
 
 	mu       sync.Mutex
@@ -66,8 +62,7 @@ type GUI struct {
 	runDone  chan struct{}
 	// cancelRun stops the run (quit).
 	cancelRun context.CancelFunc
-	// reasoningVisible is toggled with ctrl+t / /t; hidden by default, like
-	// the pane.
+	// reasoningVisible is toggled with ctrl+t / /t; hidden by default.
 	reasoningVisible bool
 	// task is the run's task text, shown on one line in place of the rendered
 	// instance template.
@@ -80,8 +75,8 @@ type GUI struct {
 }
 
 // NewGUI builds the window and installs the GUI as the loop's streaming
-// handler, like NewTUI. Cfg and Model fields may be zero on the startup-error
-// path; the GUI must still be able to show a message.
+// handler. Cfg and Model fields may be zero on the startup-error path; the
+// GUI must still be able to show a message.
 func NewGUI(o GUIOptions) *GUI {
 	cfg := o.Cfg
 	if cfg == nil {
@@ -110,8 +105,8 @@ func NewGUI(o GUIOptions) *GUI {
 	w.SetContent(g.v.root())
 	w.SetMainMenu(g.menus())
 	w.Resize(fyne.NewSize(960, 720))
-	// Closing the window is the desktop form of leaving the pane: same path
-	// as /quit, cancelling the run if one is in flight.
+	// Closing the window is the deliberate way out: same path as /quit,
+	// cancelling the run if one is in flight.
 	w.SetOnClosed(g.quit)
 	if o.Loop != nil {
 		o.Loop.Handler = &model.Handler{Content: g.Content, Reasoning: g.Reasoning}
@@ -201,7 +196,7 @@ func (g *GUI) tickStatus(stop <-chan struct{}) {
 	}
 }
 
-// drive asks for a task when needed, then runs the loop. Copy of TUI.drive.
+// drive asks for a task when needed, then runs the loop.
 func (g *GUI) drive(ctx context.Context, task string) {
 	defer close(g.runDone)
 	if task == "" {
@@ -227,7 +222,7 @@ func (g *GUI) finish(info map[string]any, err error) {
 }
 
 // quit ends the app: the window closes and Run returns. A running loop is
-// cancelled first, like the pane's quit.
+// cancelled first, so leaving never orphans a command mid-execution.
 func (g *GUI) quit() {
 	g.mu.Lock()
 	cancel := g.cancelRun
@@ -268,9 +263,8 @@ func (g *GUI) Message(m model.Message) {
 	b, ok, taskNote := g.blockFor(m)
 	if taskNote {
 		// The task was typed into the input box, so it reads as a user entry:
-		// the right-justified area of the full task text. (The pane shows a
-		// one-line note instead; both stand in for the rendered template,
-		// which is prompt plumbing and never displays.)
+		// the right-justified area of the full task text, standing in for the
+		// rendered template, which is prompt plumbing and never displays.
 		g.mu.Lock()
 		task := g.task
 		g.mu.Unlock()
@@ -293,8 +287,8 @@ func (g *GUI) Message(m model.Message) {
 	g.post(func() { g.v.commitBlock(b) })
 }
 
-// blockFor maps one message through the shared messageBlock, exactly like
-// TUI.blockFor: live and resumed turns take one path.
+// blockFor maps one message through the shared messageBlock: live and resumed
+// turns take one path.
 func (g *GUI) blockFor(m model.Message) (block, bool, bool) {
 	g.mu.Lock()
 	task := g.task
@@ -315,8 +309,7 @@ func (g *GUI) Resume(msgs []model.Message, note string) { g.resume, g.resumeNote
 // to. Call before Run.
 func (g *GUI) SetSessionID(id string) { g.sessionID = id }
 
-// note appends UI-generated lines (help text, mode changes, errors), like
-// TUI.note.
+// note appends UI-generated lines (help text, mode changes, errors).
 func (g *GUI) note(text string) {
 	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
 		if line != "" {
@@ -351,8 +344,7 @@ func (g *GUI) Write(p []byte) (int, error) {
 
 // ---------------------------------------------------------------- the ask loop ---
 
-// Ask shows a question and blocks until the keyboard answers it. Copy of
-// TUI.Ask.
+// Ask shows a question and blocks until the keyboard answers it.
 func (g *GUI) Ask(ctx context.Context, q Question) (Answer, error) {
 	reply := make(chan Answer, 1)
 	g.mu.Lock()
@@ -426,14 +418,14 @@ func (g *GUI) result() (map[string]any, error) {
 	return g.runInfo, g.runError
 }
 
-// AssistantHeader is the title an assistant block carries, identical to the
-// pane's. The streaming preview uses it too.
+// AssistantHeader is the title an assistant block carries. The streaming
+// preview uses it too.
 func (g *GUI) AssistantHeader() string {
 	snap := g.snapshot()
 	return assistantHeader(snap.Calls, snap.Cost)
 }
 
-// RunStats renders the footer, identical text to the pane's.
+// RunStats renders the footer.
 func (g *GUI) RunStats() string {
 	return runStatsText(g.snapshot(), g.cfg.Mode, g.showReasoning())
 }

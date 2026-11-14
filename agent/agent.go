@@ -172,7 +172,7 @@ func (l *Loop) scratchToolCall(action model.Action) (model.ToolCall, error) {
 func (l *Loop) Resume(msgs []model.Message) { l.resumed = msgs }
 
 // QueueMessage appends a user message to the history before the next model
-// call. This is the TUI's steering input: the user can always type, even while
+// call. This is the GUI's steering input: the user can always type, even while
 // a command is running, and nothing races with the agent goroutine.
 func (l *Loop) QueueMessage(m model.Message) {
 	l.mu.Lock()
@@ -217,7 +217,7 @@ func (l *Loop) Snapshot() Snapshot {
 	return l.snap
 }
 
-// Running reports whether a Run is in progress. The TUI uses it to decide
+// Running reports whether a Run is in progress. The GUI uses it to decide
 // whether esc cancels the turn or closes a dialog.
 func (l *Loop) Running() bool {
 	l.mu.Lock()
@@ -539,7 +539,7 @@ func (l *Loop) checkLimits() error {
 	return nil
 }
 
-// progressOf lifts the numbers a UI wants out of a model reply, so the pane
+// progressOf lifts the numbers a UI wants out of a model reply, so the GUI
 // never has to touch the message maps from another goroutine.
 func progressOf(calls int, cost float64, msg model.Message) Snapshot {
 	snap := Snapshot{Calls: calls, Cost: cost}

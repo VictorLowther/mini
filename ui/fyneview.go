@@ -1,5 +1,3 @@
-//go:build gui
-
 package ui
 
 import (
@@ -70,16 +68,15 @@ type guiView struct {
 	wasRunning bool
 	lastTitle  string
 
-	// streaming coalescing (the pane's 80 ms repaintInterval in GUI form):
-	// sushi emits a chunk every few milliseconds; re-wrapping every live
-	// surface per chunk is a repaint storm that pegs a core.
+	// streaming coalescing: sushi emits a chunk every few milliseconds;
+	// re-wrapping every live surface per chunk is a repaint storm that pegs
+	// a core.
 	paintGap     time.Duration
 	lastFlush    time.Time
 	flushPending bool
 
-	// dialog is the prompt above the input: "" or "limits", the desktop form
-	// of the pane's dialog state. Leaving the app is never a dialog: /quit or
-	// the native quit hotkey only.
+	// dialog is the prompt above the input: "" or "limits". Leaving the app
+	// is never a dialog: /quit or the native quit hotkey only.
 	dialog    string
 	limitsIdx int
 	limits    [2]float64
@@ -118,7 +115,7 @@ func (v *guiView) root() fyne.CanvasObject {
 }
 
 // start shows the window and puts the focus on the input - input must always
-// work, the rule the pane enforces by re-focusing even on Blur.
+// work, the rule chatInput.FocusLost enforces by re-focusing even on Blur.
 func (v *guiView) start() {
 	v.win.Show()
 	v.focusEditor()
@@ -199,8 +196,8 @@ func (v *guiView) appendBlock(b block) {
 
 // commitBlock places a finished block in the transcript, replacing the
 // in-flight turn's live area when it is the committed form of that same turn -
-// the GUI's copy of the pane's live-block rule, so a turn is rendered once and
-// already carries its header while streaming.
+// the live-block rule, so a turn is rendered once and already carries its
+// header while streaming.
 func (v *guiView) commitBlock(b block) {
 	if v.live != nil {
 		if b.kind != "assistant" {
@@ -603,8 +600,8 @@ func alignRT(rt *widget.RichText, align fyne.TextAlign) {
 // transcriptGrid renders command lines as a fixed-width block: the columns of
 // `$ cmd` / `in <cwd>` / `exit N` are the point, so it scrolls sideways
 // instead of reflowing. The rows stay in the normal foreground: they sit on
-// the coloured tool-call bubble, where the pane's dim transcript styling
-// would be illegible.
+// the coloured tool-call bubble, where dim transcript styling would be
+// illegible.
 func transcriptGrid(lines []string) fyne.CanvasObject {
 	tg := widget.NewTextGrid()
 	tg.Append(strings.Join(lines, "\n"))
@@ -637,7 +634,7 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		var cards []fyne.CanvasObject
 		if b.reasoning != "" {
 			// Inside a coloured bubble, foreground text only: the dim styling
-			// the pane uses on the plain background is illegible on the tint.
+			// that reads well on the plain background is illegible on the tint.
 			body := plainRT(collapseSpaces(b.reasoning))
 			if !showThinking {
 				body = plainRT(hiddenThinkingMarker(b.reasoning))
@@ -792,8 +789,8 @@ func (v *guiView) showQuestion(q Question) {
 		v.openDialog("limits")
 		return
 	default: // new-task, human, interruption, task
-		// The shared prompt names ctrl-c (the pane's quit chord); the window
-		// leaves with the native hotkey instead, so say the true key.
+		// The shared prompt names ctrl-c; the window leaves with the native
+		// hotkey instead, so say the true key.
 		v.setPanel(plainRT(strings.ReplaceAll(q.Title, "ctrl-c", quitKeyName())))
 	}
 	v.refreshStatus()
@@ -833,8 +830,7 @@ func (v *guiView) openDialog(name string) {
 
 // closeDialog dismisses the prompt. A pending question stays pending (there is
 // no give-up answer; giving up means ending the run), so the limits banner
-// hides with its input row and the next submit reopens it, exactly like the
-// pane.
+// hides with its input row and the next submit reopens it.
 func (v *guiView) closeDialog() {
 	v.dialog = ""
 	q := v.gui.PendingQuestion()
@@ -1046,13 +1042,13 @@ func (c *chatInput) KeyUp(key *fyne.KeyEvent) {
 	}
 }
 
-// FocusLost reclaims the caret, the way the pane re-focuses its editor even
-// on Blur: tapping a non-focusable object (a bubble, the scroll bar, blank
-// space) makes Fyne clear canvas focus, and an entry that never gets focus
-// back is the "input box stopped accepting input" bug. Nothing else in this
-// window is focusable, so the input always wins. The reclaim is deferred:
-// FocusLost fires *before* the focus manager records the loss, so an inline
-// Focus(c) would early-return against the still-registered focus.
+// FocusLost reclaims the caret: tapping a non-focusable object (a bubble, the
+// scroll bar, blank space) makes Fyne clear canvas focus, and an entry that
+// never gets focus back is the "input box stopped accepting input" bug.
+// Nothing else in this window is focusable, so the input always wins. The
+// reclaim is deferred: FocusLost fires *before* the focus manager records the
+// loss, so an inline Focus(c) would early-return against the still-registered
+// focus.
 func (c *chatInput) FocusLost() {
 	c.Entry.FocusLost()
 	time.AfterFunc(0, func() {
@@ -1104,8 +1100,8 @@ func (c *chatInput) TypedRune(r rune) {
 		return
 	}
 	if r == 'y' && c.Text == "" && v.gui.HasQuestion() && v.gui.PendingQuestion().Kind == AskConfirm {
-		// A bare y confirms an empty editor (TUI parity); anything typed is
-		// the rejection comment.
+		// A bare y confirms an empty editor; anything typed is the rejection
+		// comment.
 		v.gui.resolve(Answer{Text: ""})
 		return
 	}

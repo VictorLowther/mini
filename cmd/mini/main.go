@@ -19,6 +19,9 @@ import (
 	"time"
 	"uuid"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
@@ -34,6 +37,9 @@ const helpText = `mini - a local bash agent
 
 Usage:
   mini [flags]
+
+With no -p, mini opens its desktop window; -p (or a stdout that is not a
+terminal) runs headless on plain stdout with prompts on stdin.
 
 Flags:
 `
@@ -153,8 +159,8 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.output, "o", "", "trajectory file")
 	fs.StringVar(&o.output, "output", "", "trajectory file")
 	fs.BoolVar(&o.exitImmediately, "exit-immediately", false, "don't prompt when the agent wants to finish")
-	fs.BoolVar(&o.printMode, "p", false, "no TUI: plain stdout plus stdin prompts")
-	fs.BoolVar(&o.printMode, "print", false, "no TUI: plain stdout plus stdin prompts")
+	fs.BoolVar(&o.printMode, "p", false, "headless: plain stdout plus stdin prompts, no GUI window")
+	fs.BoolVar(&o.printMode, "print", false, "headless: plain stdout plus stdin prompts, no GUI window")
 	fs.StringVar(&o.logFile, "log-file", "", "also write DEBUG logs here")
 	fs.BoolVar(&o.showVersion, "version", false, "print the version and exit")
 	fs.Var(&o.resume, "r", "resume a session for this repo (optionally: -r <uuid prefix>)")
@@ -184,9 +190,6 @@ func main() {
 		}
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == "gui" {
-		os.Exit(runGUI(os.Args[2:]))
-	}
 	if len(os.Args) > 1 && os.Args[1] == "sessions" {
 		if err := runSessionsCommand(os.Args[2:], os.Stdout); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
@@ -215,45 +218,54 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// The logger writes through an indirection the TUI can mute: raw writes to
-	// the pane's terminal scroll the screen out from under the renderer.
+	// A stdout that is not a terminal (or an explicit -p) means the headless
+	// front end; a terminal means the desktop window is the UI the user chose.
+	if !o.printMode && !isTerminal(stdout) {
+		o.printMode = true
+	}
+
+	// The logger writes through an indirection the GUI can mute: raw writes
+	// to the launching terminal are noise nobody reads while the window owns
+	// the screen.
 	logTarget := ui.NewLogTarget(stderr)
 	closeLog := setupLogging(o.logFile, logTarget)
 	defer closeLog()
 
+	// The fyne app exists before setup so a startup failure still has a
+	// surface: once the window is the chosen front end, errors go there,
+	// not to a stderr the user may not be watching.
+	var a fyne.App
+	if !o.printMode {
+		a = app.New()
+	}
+
 	r, err := buildRun(o, stdin, stdout, logTarget)
 	if err != nil {
-		fmt.Fprintln(stderr, "mini: "+err.Error())
-		return 1
+		if o.printMode {
+			fmt.Fprintln(stderr, "mini: "+err.Error())
+			return 1
+		}
+		// Show the failure in the window instead of quitting one the user
+		// never got to see.
+		return ui.NewGUI(ui.GUIOptions{App: a, LogWriter: logTarget}).ShowError(err)
 	}
 	defer r.closeStore()
 
-	if !o.printMode && !isTerminal(stdout) {
-		o.printMode = true
-	}
 	printBanner(stdout, o.printMode, r.ConfigName, r.Model)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	l := r.Loop
-	agentCfg := r.AgentCfg
-	m := r.Model
-	configName := r.ConfigName
-	sess := r.Sess
-	resumeMsgs := r.ResumeMsgs
-	resumeNote := r.ResumeNote
-
 	if o.printMode {
-		p := ui.NewPrint(stdout, stdin, agentCfg)
-		p.Loop = l
-		h, err := ui.New(p, agentCfg, l)
+		p := ui.NewPrint(stdout, stdin, r.AgentCfg)
+		p.Loop = r.Loop
+		h, err := ui.New(p, r.AgentCfg, r.Loop)
 		if err != nil {
 			fmt.Fprintln(stderr, "mini:", err)
 			return 1
 		}
-		l.Hooks = h
-		p.Resume(resumeMsgs, resumeNote)
+		r.Loop.Hooks = h
+		p.Resume(r.ResumeMsgs, r.ResumeNote)
 		if o.task == "" {
 			if !p.Interactive() {
 				fmt.Fprintln(stderr, "mini: no task given and no terminal to ask for one")
@@ -266,39 +278,37 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 			}
 			o.task = ans.Text
 		}
-		info, err := l.Run(ctx, o.task)
-		reportRun(l, info, err)
-		fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", agentCfg.OutputPath)
-		fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", sess.ID, sess.ID)
+		info, err := r.Loop.Run(ctx, o.task)
+		reportRun(r.Loop, info, err)
+		fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", r.AgentCfg.OutputPath)
+		fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", r.Sess.ID, r.Sess.ID)
 		return exitCode(info, err)
 	}
 
-	t, err := ui.NewTUI(ui.TUIOptions{Cfg: agentCfg, Loop: l, Model: m, ConfigName: configName, LogWriter: logTarget})
-	if err == nil {
-		// A stalled pane with no explanation is indistinguishable from a crash,
-		// so the retry schedule goes into the scrollback.
-		m.OnRetry = func(attempt, max int, err error, wait time.Duration) {
-			t.RetryNotice(attempt, max, err, wait)
-		}
+	g := ui.NewGUI(ui.GUIOptions{
+		Cfg: r.AgentCfg, Loop: r.Loop, Model: r.Model,
+		ConfigName: r.ConfigName, LogWriter: logTarget, App: a,
+	})
+	// A stalled window with no explanation is indistinguishable from a crash,
+	// so the retry schedule goes into the transcript.
+	r.Model.OnRetry = func(attempt, max int, err error, wait time.Duration) {
+		g.RetryNotice(attempt, max, err, wait)
 	}
+	// The window is the UI, not the confirmation logic: without the same
+	// Interactive adapter --print gets, the loop never calls OnMessage and
+	// the transcript never commits a turn.
+	h, err := ui.New(g, r.AgentCfg, r.Loop)
 	if err != nil {
-		fmt.Fprintln(stderr, "mini: could not start the TUI:", err)
-		return 1
+		return g.ShowError(err)
 	}
-	// The TUI needs the same interactive hooks as --print: it is the UI, not
-	// the confirmation logic.
-	h, err := ui.New(t, agentCfg, l)
-	if err != nil {
-		fmt.Fprintln(stderr, "mini:", err)
-		return 1
-	}
-	l.Hooks = h
-	t.SetSessionID(sess.ID.String())
-	t.Resume(resumeMsgs, resumeNote)
-	info, err := t.Run(ctx, o.task)
-	reportRun(l, info, err)
-	fmt.Fprintf(stderr, "Saved trajectory to '%s'\n", agentCfg.OutputPath)
-	fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", sess.ID, sess.ID)
+	r.Loop.Hooks = h
+	g.SetSessionID(r.Sess.ID.String())
+	g.Resume(r.ResumeMsgs, r.ResumeNote)
+
+	info, err := g.Run(ctx, o.task)
+	reportRun(r.Loop, info, err)
+	fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", r.AgentCfg.OutputPath)
+	fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", r.Sess.ID, r.Sess.ID)
 	return exitCode(info, err)
 }
 
@@ -381,7 +391,7 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	l := &agent.Loop{Cfg: agentCfg, Model: m, Env: e, Logger: slog.Default()}
 
 	// Fresh runs get a row (Title backfilled by the store when the task
-	// message lands, which is what titles the TUI's ask-for-a-task flow
+	// message lands, which is what titles the GUI's ask-for-a-task flow
 	// too); -r runs load the stored transcript and continue it.
 	var (
 		sess       *session.Session
@@ -626,8 +636,8 @@ func printBanner(w io.Writer, printMode bool, configName string, m *model.Sushi)
 		return
 	}
 	out := io.Discard
-	// The banner goes to stderr so --print output stays pipeable; the TUI owns
-	// the screen entirely.
+	// The banner goes to stderr so --print output stays pipeable; the window
+	// owns the screen entirely and gets its header in the transcript.
 	if !printMode {
 		out = w
 	}

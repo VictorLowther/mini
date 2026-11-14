@@ -13,7 +13,7 @@ import (
 	"github.com/VictorLowther/mini/model"
 )
 
-// Print is the non-TUI front end used by --print and whenever stdout is not a
+// Print is the headless front end used by --print and whenever stdout is not a
 // terminal. It streams the model's text to stdout and prompts on stdin,
 // including the /y /c /u /h /m slash commands, so the interactive state machine
 // is testable without a terminal.
