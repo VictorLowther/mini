@@ -302,6 +302,33 @@ func TestPlainResponseIsTheSubmission(t *testing.T) {
 	}
 }
 
+// A resumed history carries exit rows - how earlier runs ended. They are
+// transcript bookkeeping, not model context: role "exit" is not a valid
+// chat-completions role, and the wire copy must drop it.
+func TestRequestBodyDropsExitRows(t *testing.T) {
+	srv, requests, _ := newServer(t, "toolcall.sse")
+	s := newSushi(t, srv.URL)
+	_, err := s.Query(context.Background(), []Message{
+		{"role": "system", "content": "s"},
+		{"role": "user", "content": "task"},
+		{"role": "assistant", "content": "done"},
+		{"role": "exit", "content": "done", "extra": map[string]any{"exit_status": "Submitted", "submission": "done"}},
+		{"role": "user", "content": "The user added a new task: again"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := (*requests)[0].Messages
+	for _, m := range msgs {
+		if m["role"] == "exit" {
+			t.Fatalf("an exit row reached the wire: %v", msgs)
+		}
+	}
+	if len(msgs) != 4 {
+		t.Errorf("%d messages on the wire, want 4 (the four non-exit rows):\n%v", len(msgs), msgs)
+	}
+}
+
 func TestExactErrorStrings(t *testing.T) {
 	srv, _, _ := newServer(t, "no_finish_reason.sse")
 	s := newSushi(t, srv.URL)

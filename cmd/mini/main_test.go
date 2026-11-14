@@ -15,6 +15,14 @@ import (
 
 func fixtureServer(t *testing.T, names ...string) *httptest.Server {
 	t.Helper()
+	return serveFixtures(t, nil, names...)
+}
+
+// serveFixtures is fixtureServer with an optional recorder: when roles is
+// non-nil, every request's message roles are appended to it, so a test can
+// assert what history a resumed run actually put on the wire.
+func serveFixtures(t *testing.T, roles *[][]string, names ...string) *httptest.Server {
+	t.Helper()
 	var bodies [][]byte
 	for _, n := range names {
 		b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "sushi", n))
@@ -28,6 +36,19 @@ func fixtureServer(t *testing.T, names ...string) *httptest.Server {
 		if r.URL.Path != "/v1/chat/completions" {
 			http.NotFound(w, r)
 			return
+		}
+		if roles != nil {
+			var req struct {
+				Messages []struct {
+					Role string `json:"role"`
+				} `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			got := make([]string, 0, len(req.Messages))
+			for _, m := range req.Messages {
+				got = append(got, m.Role)
+			}
+			*roles = append(*roles, got)
 		}
 		body := bodies[len(bodies)-1]
 		if i < len(bodies) {

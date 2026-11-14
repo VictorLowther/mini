@@ -175,6 +175,13 @@ func (s *Sushi) Query(ctx context.Context, msgs []Message, h *Handler) (Message,
 func (s *Sushi) requestBody(msgs []Message) map[string]any {
 	prepared := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
+		// Exit rows are transcript bookkeeping - how a run ended, kept for
+		// the UI and the trajectory - not model context. A live run never
+		// queries past one, but a resumed run carries them inside the seeded
+		// history, and no OpenAI-compatible server accepts role "exit".
+		if role, _ := m["role"].(string); role == "exit" {
+			continue
+		}
 		c := make(Message, len(m))
 		for k, v := range m {
 			if k != "extra" {

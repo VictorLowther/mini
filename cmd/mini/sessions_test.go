@@ -248,7 +248,8 @@ func TestResumeContinuesSession(t *testing.T) {
 	stateDir, traj := cliEnv(t, "")
 	srv := fixtureServer(t, "toolcall.sse", "submit.sse")
 	defer srv.Close()
-	srv2 := fixtureServer(t, "toolcall.sse", "submit.sse")
+	var wire [][]string
+	srv2 := serveFixtures(t, &wire, "toolcall.sse", "submit.sse")
 	defer srv2.Close()
 	repoDir(t)
 
@@ -257,6 +258,29 @@ func TestResumeContinuesSession(t *testing.T) {
 	sessID := mustSessionID(t, stateDir)
 
 	runCLI(t, srv2.URL, "second task then submit", traj, "-r", sessID[:8])
+
+	// The resumed run rebuilt the conversation: its first request carried the
+	// first run's turns plus the new task, and none of the transcript's exit
+	// rows - role "exit" is bookkeeping, not model context, and an
+	// OpenAI-compatible server would reject it.
+	if len(wire) == 0 {
+		t.Fatal("the resumed run never queried the model")
+	}
+	first := wire[0]
+	for _, r := range first {
+		if r == "exit" {
+			t.Fatalf("resumed request carried an exit row on the wire: %v", first)
+		}
+	}
+	want := []string{"system", "user", "assistant", "tool", "assistant", "user"}
+	if len(first) != len(want) {
+		t.Fatalf("resumed request roles = %v, want %v", first, want)
+	}
+	for i, w := range want {
+		if first[i] != w {
+			t.Fatalf("resumed request roles = %v, want %v", first, want)
+		}
+	}
 
 	store, err := session.Open(filepath.Join(stateDir, "sessions.db"), filepath.Join(stateDir, "tcr"))
 	if err != nil {
