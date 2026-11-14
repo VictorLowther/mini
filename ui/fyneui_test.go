@@ -1,9 +1,12 @@
 package ui
 
 import (
+	"fyne.io/fyne/v2/container"
+
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -152,6 +155,8 @@ func transcriptText(o fyne.CanvasObject) string {
 		return t.Text
 	case *widget.TextGrid:
 		return t.Text()
+	case *container.Scroll:
+		return transcriptText(t.Content)
 	case *fyne.Container:
 		parts := make([]string, 0, len(t.Objects))
 		for _, c := range t.Objects {
@@ -689,6 +694,95 @@ func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 	}
 	if strings.Contains(after, "listing of the current directory") {
 		t.Errorf("the live thinking area survived the commit:\n%s", after)
+	}
+}
+
+// TestGUITranscriptVirtualizesToTheViewport is the idle-burn regression:
+// Fyne walks the live object tree every repaint frame and the driver
+// repaints at frame rate regardless, so a long replayed session must not
+// materialize its whole history as widgets. Only blocks near the viewport
+// may exist; scrolling moves the window and releases what it leaves, while
+// the scrollbar still describes the whole session.
+func TestGUITranscriptVirtualizesToTheViewport(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{Timeout: 10 * time.Second}}
+	p := newGUIForTest(t, c, l)
+
+	p.do(func() {
+		for i := 0; i < 40; i++ {
+			lines := make([]string, 8)
+			for j := range lines {
+				lines[j] = fmt.Sprintf("row %d.%d", i, j)
+			}
+			p.v.appendBlock(block{kind: "tool", text: fmt.Sprintf("block %d", i), transcript: lines})
+		}
+		if len(p.v.committed) != 40 {
+			t.Fatalf("committed = %d", len(p.v.committed))
+		}
+		if rows := len(p.v.body.Objects) - 2; rows >= 40 {
+			t.Errorf("%d rows materialized for 40 blocks: the tree never shrinks below the archive", rows)
+		}
+		if p.v.winFirst == 0 {
+			t.Errorf("window starts at the top while pinned to the tail (first=%d last=%d)", p.v.winFirst, p.v.winLast)
+		}
+		if got := p.v.body.MinSize().Height; got <= p.v.scroll.Size().Height {
+			t.Errorf("virtual content height %v does not exceed the viewport %v: no session to scroll", got, p.v.scroll.Size().Height)
+		}
+	})
+	view := p.transcript()
+	if strings.Contains(view, "row 0.0") {
+		t.Error("the top of a long history is still materialized while viewing the tail")
+	}
+	if !strings.Contains(view, "row 39.") {
+		t.Errorf("the newest block is missing from the pinned view:\n%s", view)
+	}
+
+	// Scrolling to the top moves the window and releases the tail. Use the
+	// wheel path, not ScrollToTop: fyne's ScrollToOffset assigns Offset
+	// directly and never fires OnScrolled (ScrollToBottom and real input do).
+	p.do(func() { p.v.scroll.Scrolled(&fyne.ScrollEvent{Scrolled: fyne.NewDelta(0, 100000)}) })
+	p.do(func() {
+		if p.v.winFirst != 0 {
+			t.Errorf("after ScrollToTop, window first = %d, want 0", p.v.winFirst)
+		}
+		if p.v.winLast >= 40 {
+			t.Errorf("the tail never left the window (last=%d)", p.v.winLast)
+		}
+	})
+	view = p.transcript()
+	if !strings.Contains(view, "row 0.") {
+		t.Errorf("top blocks missing after scrolling up:\n%s", view)
+	}
+	if strings.Contains(view, "row 39.") {
+		t.Error("bottom blocks still in view after scrolling to the top")
+	}
+
+	// Scrolling moves the window; it does not rebuild it. Back near the
+	// bottom, then a bounded scroll-up: the rows that stay in view must be
+	// the same widget objects - wholesale re-materialization is exactly the
+	// churn that turned the first virtualizer's memory profile into 725MB.
+	p.do(func() { p.v.scroll.ScrollToBottom() })
+	var tail fyne.CanvasObject
+	p.do(func() {
+		last := p.v.winRows[len(p.v.winRows)-1]
+		if last.idx != 39 {
+			t.Fatalf("window tail = %d after ScrollToBottom, want 39", last.idx)
+		}
+		tail = last.c
+	})
+	p.do(func() { p.v.scroll.Scrolled(&fyne.ScrollEvent{Scrolled: fyne.NewDelta(0, 300)}) })
+	p.do(func() {
+		last := p.v.winRows[len(p.v.winRows)-1]
+		if last.c != tail {
+			t.Error("a 300px scroll rebuilt the rows still in view: the window must move at its edges")
+		}
+	})
+
+	// And back down: the archive re-materializes on demand, intact.
+	p.do(func() { p.v.scroll.ScrollToBottom() })
+	if view := p.transcript(); !strings.Contains(view, "row 39.") {
+		t.Errorf("the tail did not return on scroll-down:\n%s", view)
 	}
 }
 

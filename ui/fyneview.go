@@ -53,7 +53,7 @@ type guiView struct {
 	gui *GUI
 	win fyne.Window
 
-	body   *fyne.Container // VBox of committed bubbles, inside the transcript scroll
+	body   *fyne.Container // virtualized transcript: spacers plus the rows in view (see virtualLayout)
 	dock   *fyne.Container // live streaming content, inside dockScroll (see centerLayout)
 	center *fyne.Container // middle column: transcript, question card, live dock
 	rootC  *fyne.Container // top border: refresh after dock changes
@@ -97,11 +97,37 @@ type guiView struct {
 	// the last content change, so new output keeps the view at the bottom and
 	// scrolled-back history stays put.
 	pinned bool
+
+	// Virtualization state. Fyne walks the whole object tree every repaint
+	// frame (EnsureMinSize + paint), and the driver repaints at frame rate no
+	// matter what changed - so the live tree must stay proportional to the
+	// viewport, not to the session. Only blocks inside the window
+	// [winFirst, winLast) exist as widgets; blockH carries each block's
+	// height - estimated until the row is measured, then actual - and two
+	// spacer rectangles stand in for everything above and below the window.
+	blockH   []float32
+	winFirst int
+	winLast  int
+	// winRows holds the materialized rows, ascending by block index and
+	// always exactly the window - rows enter and leave one at a time at the
+	// edges, never rebuilt wholesale, so scrolling costs one widget tree per
+	// exposed row and nothing for what stays in view. Fyne's per-object
+	// caches expire a beat after detach (cache.canvasInfo), which is fine
+	// for edge churn and fatal for rebuild storms.
+	winRows []transcriptRow
+	topPad  *canvas.Rectangle
+	botPad  *canvas.Rectangle
+	lastVP  fyne.Size
+
+	inRecompute   bool
+	recalcPending bool
 }
 
 func newGUIView(g *GUI, w fyne.Window) *guiView {
 	v := &guiView{gui: g, win: w}
-	v.body = container.NewVBox()
+	v.topPad = canvas.NewRectangle(color.Transparent)
+	v.botPad = canvas.NewRectangle(color.Transparent)
+	v.body = container.New(virtualLayout{v}, v.topPad, v.botPad)
 	v.scroll = container.NewVScroll(v.body)
 	v.dock = container.NewVBox()
 	v.dockScroll = container.NewVScroll(v.dock)
@@ -122,7 +148,223 @@ func (v *guiView) root() fyne.CanvasObject {
 	v.center = container.New(centerLayout{v}, v.scroll, v.card, v.dockScroll)
 	fixed := container.NewVBox(v.status, v.editor)
 	v.rootC = container.NewBorder(nil, fixed, nil, nil, v.center)
+	// Every scroll movement may cross a window boundary; the window is the
+	// tree, so the tree follows the thumb. Caveat from the scroller: a
+	// programmatic ScrollToOffset assigns the offset without calling back -
+	// everything mini does programmatically goes through ScrollToBottom
+	// (scrollBy) instead, and so does all real input.
+	v.scroll.OnScrolled = func(fyne.Position) {
+		v.recomputeWindow()
+		v.repaint(v.scroll)
+	}
 	return v.rootC
+}
+
+// virtualLayout lays the transcript window out between its spacers: the
+// content's total height is always sum(blockH), so the scroll bars describe
+// the whole session while only the rows in view exist as widgets. Heights are
+// re-measured through the rows' own MinSize each pass - wrapping changes
+// them, and the estimates only steer until the first real measurement.
+type virtualLayout struct{ v *guiView }
+
+func (l virtualLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
+	v := l.v
+	y := v.cumHeight(v.winFirst)
+	v.topPad.Resize(fyne.NewSize(s.Width, y))
+	v.topPad.Move(fyne.Position{})
+	for _, ref := range v.winRows {
+		h := ref.c.MinSize().Height
+		if ref.idx < len(v.blockH) {
+			v.blockH[ref.idx] = h
+		}
+		ref.c.Resize(fyne.NewSize(s.Width, h))
+		ref.c.Move(fyne.NewPos(0, y))
+		y += h
+	}
+	// Below the window: whatever history is not materialized, plus any
+	// slack when the whole session is shorter than the viewport.
+	below := max(v.totalHeight()-y, 0)
+	v.botPad.Resize(fyne.NewSize(s.Width, max(below, s.Height-y)))
+	v.botPad.Move(fyne.NewPos(0, y))
+	// A viewport change (window drag) moves the window's edges without
+	// touching the scroll offset: defer a recompute to after this layout.
+	if vs := v.scroll.Size(); vs != v.lastVP {
+		v.lastVP = vs
+		v.scheduleRecompute()
+	}
+}
+
+func (l virtualLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
+	return fyne.NewSize(0, l.v.totalHeight())
+}
+
+// cumHeight is the transcript offset where block i begins; totalHeight is
+// where the virtual content ends. O(blocks) float adds per call - blocks are
+// hundreds, and this replaces walking tens of thousands of widgets.
+// transcriptRow binds a materialized row to its block index: the body's
+// object slice is ordered by creation, not by position, so the window's own
+// ordering is this slice's invariant.
+type transcriptRow struct {
+	idx int
+	c   *fyne.Container
+}
+
+func (v *guiView) cumHeight(i int) float32 {
+	if i > len(v.blockH) {
+		i = len(v.blockH)
+	}
+	var h float32
+	for _, b := range v.blockH[:i] {
+		h += b
+	}
+	return h
+}
+
+func (v *guiView) totalHeight() float32 { return v.cumHeight(len(v.blockH)) }
+
+// estimateBlockHeight is the scrollbar's placeholder opinion about a block
+// it has not rendered: line counts against the theme's text metrics. The
+// first real layout replaces it with the measured height.
+func estimateBlockHeight(b block) float32 {
+	lines := float32(len(b.transcript))
+	if lines == 0 {
+		text := strings.TrimRight(b.text, "\n")
+		lines = float32(strings.Count(text, "\n") + 1)
+	}
+	cards := float32(1)
+	if b.kind == "assistant" && b.reasoning != "" {
+		cards = 2
+	}
+	pad := theme.Padding()
+	return lines*theme.TextSize()*1.5 + cards*4*pad + 2*pad
+}
+
+// newRow materializes one block exactly as appendBlock used to do eagerly:
+// its cards and the inter-block spacer, wrapped so the window has one object
+// per block.
+func (v *guiView) newRow(i int) *fyne.Container {
+	cards := blockCards(v.committed[i], v.gui.showReasoning())
+	return container.NewVBox(append(cards, blockSpacer())...)
+}
+
+// recomputeWindow rescans the cumulative heights against the viewport
+// (+/- one viewport of margin) and rebuilds the materialized row set when
+// the window moves. Scrolling back re-materializes rows from the block data
+// - the store and committed remain the truth; widgets are disposable.
+func (v *guiView) recomputeWindow() {
+	if v.inRecompute {
+		return
+	}
+	v.inRecompute = true
+	defer func() { v.inRecompute = false }()
+
+	n := len(v.committed)
+	if n == 0 {
+		v.setWindow(0, 0)
+		return
+	}
+	vp := v.scroll.Size().Height
+	off := v.scroll.Offset.Y
+	if vp <= 0 {
+		// Pre-show: the transcript opens pinned to the newest turn, so aim a
+		// generous stand-in viewport at the tail; start() recomputes once the
+		// real geometry exists.
+		vp = 640
+		off = max(v.totalHeight()-vp, 0)
+	}
+	top := max(off-vp, 0)
+	bottom := off + 2*vp
+
+	first, last, started := 0, 0, false
+	cum := float32(0)
+	for i, h := range v.blockH {
+		if !started && cum+h > top {
+			first = i
+			started = true
+		}
+		if cum < bottom {
+			last = i + 1
+		}
+		cum += h
+	}
+	if !started {
+		first, last = n-1, n
+	}
+	if last < first {
+		last = first
+	}
+	v.setWindow(first, last)
+}
+
+// setWindow moves the materialized window incrementally: rows still in
+// range keep their widgets (and their measured heights, textures, rasterized
+// glyphs), rows past either edge leave through Container.Remove, and only
+// newly exposed blocks get newRow. A no-op when the window did not move.
+func (v *guiView) setWindow(first, last int) {
+	if first == v.winFirst && last == v.winLast {
+		return
+	}
+	v.winFirst, v.winLast = first, last
+
+	// Evict from the head and tail; the window is contiguous, so leaving
+	// rows are always at the ends of winRows.
+	for len(v.winRows) > 0 && v.winRows[0].idx < first {
+		v.body.Remove(v.winRows[0].c)
+		v.winRows = v.winRows[1:]
+	}
+	for len(v.winRows) > 0 && v.winRows[len(v.winRows)-1].idx >= last {
+		v.body.Remove(v.winRows[len(v.winRows)-1].c)
+		v.winRows = v.winRows[:len(v.winRows)-1]
+	}
+	// Fill any holes below/above what survives (a jump - rebuild, resize,
+	// or a fast drag - degrades to a full materialize of the new window).
+	var built []transcriptRow
+	if len(v.winRows) == 0 {
+		for i := first; i < last; i++ {
+			built = append(built, v.buildRow(i))
+		}
+	} else {
+		// After edge eviction, the survivors are exactly winRows[0].idx ...
+		// winRows[last].idx, all inside [first, last); head/tail loops fill
+		// whatever the new window gained beyond them.
+		lo := v.winRows[0].idx
+		hi := v.winRows[len(v.winRows)-1].idx + 1
+		for i := first; i < lo; i++ {
+			built = append(built, v.buildRow(i))
+		}
+		built = append(built, v.winRows...)
+		for i := hi; i < last; i++ {
+			built = append(built, v.buildRow(i))
+		}
+	}
+	v.winRows = built
+	// Rows were appended to body.Objects (creation order); our layout
+	// positions from winRows, so slice order only affects paint order - and
+	// the window never overlaps itself.
+	v.body.Layout.Layout(v.body.Objects, v.body.Size())
+}
+
+func (v *guiView) buildRow(i int) transcriptRow {
+	row := v.newRow(i)
+	v.body.Add(row)
+	return transcriptRow{idx: i, c: row}
+}
+
+// scheduleRecompute defers a window update out of a layout pass (a viewport
+// resize mid-paint must not rebuild the tree it is measuring); one flight
+// at a time.
+func (v *guiView) scheduleRecompute() {
+	if v.recalcPending {
+		return
+	}
+	v.recalcPending = true
+	time.AfterFunc(0, func() {
+		v.gui.post(func() {
+			v.recalcPending = false
+			v.recomputeWindow()
+			v.repaint(v.scroll)
+		})
+	})
 }
 
 // The middle column is where content grows, and growth must stop at the
@@ -262,6 +504,7 @@ func (v *guiView) updatePinned() {
 // the repaint storm the profile caught (textRenderer.Refresh + setCellRune +
 // wrapWordLines dominating, hundreds of MB/s on a long transcript).
 func (v *guiView) afterContentChange() {
+	v.recomputeWindow()
 	if vs := v.scroll.Size(); vs.Height > 0 {
 		min := v.body.MinSize()
 		v.body.Resize(fyne.NewSize(max(min.Width, vs.Width), max(min.Height, vs.Height)))
@@ -286,10 +529,7 @@ func (v *guiView) repaint(o fyne.CanvasObject) {
 func (v *guiView) appendBlock(b block) {
 	v.committed = append(v.committed, b)
 	v.updatePinned()
-	for _, o := range blockCards(b, v.gui.showReasoning()) {
-		v.body.Add(o)
-	}
-	v.body.Add(blockSpacer())
+	v.blockH = append(v.blockH, estimateBlockHeight(b))
 	v.afterContentChange()
 }
 
@@ -390,19 +630,24 @@ func (v *guiView) layoutCenter() {
 }
 
 // rebuildAll re-renders every block (the thinking toggle changes how past
-// turns look) and replaces the transcript, mirroring renderAll.
+// turns look): heights return to estimates - visibility was exactly what
+// changed them - and the window rebuilds its rows from the new state.
 func (v *guiView) rebuildAll() {
-	show := v.gui.showReasoning()
-	var objs []fyne.CanvasObject
-	for _, b := range v.committed {
-		objs = append(objs, blockCards(b, show)...)
-		objs = append(objs, blockSpacer())
+	for i := range v.committed {
+		v.blockH[i] = estimateBlockHeight(v.committed[i])
 	}
 	v.live = nil
 	v.dock.Objects = nil
-	v.body.Objects = objs
-	v.body.Layout.Layout(v.body.Objects, v.body.Size()) // layout, not Refresh: new children lay out from
-	v.layoutCenter()                                    // MinSize; nothing needs a repaint cascade
+	// Every materialized row is stale now (visibility changed what it
+	// renders): evict all of them and let the window rebuild from the new
+	// state.
+	for _, ref := range v.winRows {
+		v.body.Remove(ref.c)
+	}
+	v.winRows = nil
+	v.winFirst, v.winLast = -1, -1 // defeat setWindow's no-change shortcut
+	v.recomputeWindow()
+	v.layoutCenter()
 	v.repaint(v.scroll)
 	// Re-stream the turn in flight from its buffers, if any.
 	v.streamChunk()
@@ -704,15 +949,31 @@ func alignRT(rt *widget.RichText, align fyne.TextAlign) {
 	}
 }
 
-// transcriptGrid renders command lines as a fixed-width block: the columns of
-// `$ cmd` / `in <cwd>` / `exit N` are the point, so it scrolls sideways
-// instead of reflowing. The rows stay in the normal foreground: they sit on
-// the coloured tool-call bubble, where dim transcript styling would be
-// illegible.
+// monoBlock renders fixed-width lines as one monospace RichText that scrolls
+// sideways instead of reflowing: the columns of `$ cmd` / `in <cwd>` /
+// `exit N` are the point. The block is deliberately a single widget -
+// widget.TextGrid materializes a canvas.Text and a rectangle per *cell*, and
+// Fyne walks every object in the tree on every repaint frame (EnsureMinSize
+// + paint), so a screenful of output rendered as a grid measured at roughly
+// a fifth of a core sitting idle. Wrapping off means MinSize reports the
+// widest real line; the horizontal scroller owns the overflow, so long
+// output never pushes the transcript (or the window) wider than it is.
+func monoBlock(lines []string) fyne.CanvasObject {
+	rt := widget.NewRichText(&widget.TextSegment{
+		Text: strings.Join(lines, "\n"),
+		Style: widget.RichTextStyle{
+			TextStyle: fyne.TextStyle{Monospace: true},
+			Alignment: fyne.TextAlignLeading,
+		},
+	})
+	rt.Wrapping = fyne.TextWrapOff
+	return container.NewHScroll(rt)
+}
+
+// transcriptGrid renders a tool block's lines as fixed-width text: see
+// monoBlock for the widget choice.
 func transcriptGrid(lines []string) fyne.CanvasObject {
-	tg := widget.NewTextGrid()
-	tg.Append(strings.Join(lines, "\n"))
-	return container.New(transcriptWidthLayout{}, tg)
+	return monoBlock(lines)
 }
 
 func exitRT(b block) *widget.RichText {
@@ -762,28 +1023,6 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 	default: // notes: UI feedback, the session header, command results
 		return []fyne.CanvasObject{dimRT(b.text)}
 	}
-}
-
-// transcriptWidthLayout gives a TextGrid the transcript's width and its own
-// height: command output keeps its columns (the grid's own horizontal bar
-// scrolls when they run past the window) instead of pushing the whole
-// transcript wider than the window.
-type transcriptWidthLayout struct{}
-
-func (transcriptWidthLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
-	for _, c := range o {
-		c.Resize(fyne.NewSize(s.Width, c.MinSize().Height))
-	}
-}
-
-func (transcriptWidthLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
-	h := float32(0)
-	for _, c := range o {
-		if m := c.MinSize().Height; m > h {
-			h = m
-		}
-	}
-	return fyne.NewSize(0, h)
 }
 
 // blockSpacer is the blank row between transcript blocks, the GUI's form of
@@ -892,9 +1131,7 @@ func (v *guiView) showQuestion(q Question) {
 	v.dialog = ""
 	switch q.Kind {
 	case AskConfirm:
-		tg := widget.NewTextGrid()
-		tg.Append(strings.Join(panelActionLines(q.Actions), "\n"))
-		v.setPanel(plainRT(q.Title), container.New(transcriptWidthLayout{}, tg), dimRT(panelConfirmHint))
+		v.setPanel(plainRT(q.Title), monoBlock(panelActionLines(q.Actions)), dimRT(panelConfirmHint))
 	case AskLimits:
 		v.openDialog("limits")
 		return
