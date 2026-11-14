@@ -146,8 +146,11 @@ func transcriptText(o fyne.CanvasObject) string {
 	case *widget.RichText:
 		var b strings.Builder
 		for _, s := range t.Segments {
-			if ts, ok := s.(*widget.TextSegment); ok {
-				b.WriteString(ts.Text)
+			switch seg := s.(type) {
+			case *widget.TextSegment:
+				b.WriteString(seg.Text)
+			case *widget.CodeBlockSegment:
+				b.WriteString(seg.Text)
 			}
 		}
 		return b.String()
@@ -157,6 +160,12 @@ func transcriptText(o fyne.CanvasObject) string {
 		return t.Text()
 	case *container.Scroll:
 		return transcriptText(t.Content)
+	case *widget.Accordion:
+		parts := make([]string, 0, len(t.Items)*2)
+		for _, it := range t.Items {
+			parts = append(parts, "["+it.Title+"]", transcriptText(it.Detail))
+		}
+		return strings.Join(parts, "\n")
 	case *fyne.Container:
 		parts := make([]string, 0, len(t.Objects))
 		for _, c := range t.Objects {
@@ -834,6 +843,44 @@ func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
 	})
 	if got := p.v.rootC.Size(); got != open {
 		t.Errorf("the window's content resized to %v from %v without the user touching it", got, open)
+	}
+}
+
+// TestGUILiveMarkdownRendersAsItStreams: the whole point of the incremental
+// parse - a streamed reply shows rendered markdown, not raw syntax. Headings
+// and emphasis never show their markers, and an unterminated fence previews
+// as code until it closes into a folded card.
+func TestGUILiveMarkdownRendersAsItStreams(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{Timeout: 10 * time.Second}}
+	p := newGUIForTest(t, c, l)
+
+	l.Handler.Content("## Plan\n\nIntro **bold** text\n\n```go\nfmt.Println(1)\n")
+	mid := p.transcript()
+	for _, raw := range []string{"## ", "**", "```"} {
+		if strings.Contains(mid, raw) {
+			t.Errorf("raw markdown %q visible mid-stream:\n%s", raw, mid)
+		}
+	}
+	for _, want := range []string{"Plan", "bold", "fmt.Println(1)"} {
+		if !strings.Contains(mid, want) {
+			t.Errorf("live render missing %q:\n%s", want, mid)
+		}
+	}
+
+	// Closing the fence turns the preview into the folded card; opening and
+	// closing do not double-render.
+	l.Handler.Content("```\n\nAll done.")
+	after := p.transcript()
+	if !strings.Contains(after, "[go · 1 line]") {
+		t.Errorf("closed fence did not become a code card:\n%s", after)
+	}
+	if !strings.Contains(after, "All done.") || strings.Contains(after, "```") {
+		t.Errorf("tail after fence close wrong:\n%s", after)
+	}
+	if n := strings.Count(after, "fmt.Println(1)"); n != 1 {
+		t.Errorf("code line rendered %d times, want 1:\n%s", n, after)
 	}
 }
 

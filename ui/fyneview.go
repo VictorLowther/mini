@@ -903,6 +903,8 @@ func areaCard(label string, m metrics, body fyne.CanvasObject, align fyne.TextAl
 	header.Wrapping = fyne.TextWrapWord
 	if rt, ok := body.(*widget.RichText); ok {
 		alignRT(rt, align)
+	} else if align != fyne.TextAlignLeading {
+		alignTree(body, align)
 	}
 	b := newBubble(label, mine)
 	pad := theme.Size(theme.SizeNamePadding)
@@ -1023,7 +1025,7 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		if len(b.transcript) > 0 {
 			return []fyne.CanvasObject{areaCard(label, b.stats, transcriptGrid(b.transcript), align)}
 		}
-		return []fyne.CanvasObject{areaCard(label, b.stats, markdownRT(b.text), align)}
+		return []fyne.CanvasObject{areaCard(label, b.stats, mdBody(b.text), align)}
 	}
 	switch b.kind {
 	case "assistant":
@@ -1031,7 +1033,7 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		if b.reasoning != "" {
 			// Inside a coloured bubble, foreground text only: the dim styling
 			// that reads well on the plain background is illegible on the tint.
-			body := plainRT(collapseSpaces(b.reasoning))
+			body := mdBody(b.reasoning)
 			if !showThinking {
 				body = plainRT(hiddenThinkingMarker(b.reasoning))
 			}
@@ -1041,7 +1043,7 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		// no LLM output bubble rather than an empty violet box. The turn's
 		// real output is the tool call result that follows.
 		if b.text != "" {
-			cards = append(cards, areaCard("LLM output", b.stats, markdownRT(b.text), fyne.TextAlignLeading))
+			cards = append(cards, areaCard("LLM output", b.stats, mdBody(b.text), fyne.TextAlignLeading))
 		}
 		return cards
 	case "exit":
@@ -1053,6 +1055,18 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 	}
 }
 
+// mdBody packs mdBlocks into the single object an areaCard wants.
+func mdBody(src string) fyne.CanvasObject {
+	blocks := mdBlocks(src)
+	if len(blocks) == 0 {
+		return markdownRT("")
+	}
+	if len(blocks) == 1 {
+		return blocks[0]
+	}
+	return container.NewVBox(blocks...)
+}
+
 // blockSpacer is the blank row between transcript blocks, the GUI's form of
 // the separating row blockRows appends.
 func blockSpacer() fyne.CanvasObject {
@@ -1062,56 +1076,123 @@ func blockSpacer() fyne.CanvasObject {
 }
 
 // liveArea is the streaming turn: a bordered area per kind ("thinking" and
-// "LLM output"), each one mutable segment so a chunk costs a re-wrap and
-// nothing else. Markdown is parsed once, on commit - AppendMarkdown documents
-// that one document must not be parsed piecewise. The areas appear as their
-// kinds start streaming; the header gains its metrics when the message lands.
+// "LLM output"), each rendering its markdown incrementally the way
+// scanBlocks describes - a block that has closed is parsed exactly once and
+// its widget kept; only the open tail is re-parsed per flush, with an
+// unterminated fence closed for the preview so raw fence syntax never shows.
+// The areas appear as their kinds start streaming; the header gains its
+// metrics when the message lands.
 type liveArea struct {
 	box      *fyne.Container
-	thinking *widget.RichText
-	thinkSeg *widget.TextSegment
-	content  *widget.RichText
-	contSeg  *widget.TextSegment
+	thinking *liveStream
+	content  *liveStream
+}
+
+// liveStream is one section's incremental state: the closed block widgets,
+// the re-rendered tail holder, and the scanner cursor over the source.
+type liveStream struct {
+	src     string
+	sec     *fyne.Container // closed blocks, then tail
+	tail    *fyne.Container // slot holding the open tail's render
+	cur     int             // scan cursor: bytes of complete lines seen
+	open    int             // start of the block still open: the tail's text
+	inFence bool
+	fence   string
+	hidden  bool
 }
 
 func newLiveArea() *liveArea {
 	return &liveArea{box: container.NewVBox()}
 }
 
-// setText keeps the mutable segments current (string copies only); the
-// re-wrap happens in refresh, driven by the streamChunk throttle.
+// setText keeps both sections current; the string copies here are cheap, the
+// parsing happens inside update, throttled by the streamChunk paint gap.
 func (l *liveArea) setText(reasoning, content string, show bool) {
-	if reasoning != "" && l.thinking == nil {
-		l.thinkSeg = &widget.TextSegment{}
-		l.thinking = widget.NewRichText(l.thinkSeg)
-		l.thinking.Wrapping = fyne.TextWrapWord
-		l.box.Add(areaCard("thinking", metrics{}, l.thinking, fyne.TextAlignLeading))
+	if reasoning != "" {
+		l.ensure(&l.thinking, "thinking")
+		l.thinking.set(show, reasoning)
 	}
-	if content != "" && l.content == nil {
-		l.contSeg = &widget.TextSegment{}
-		l.content = widget.NewRichText(l.contSeg)
-		l.content.Wrapping = fyne.TextWrapWord
-		l.box.Add(areaCard("LLM output", metrics{}, l.content, fyne.TextAlignLeading))
-	}
-	if l.thinking != nil {
-		if show {
-			l.thinkSeg.Text = collapseSpaces(reasoning)
-		} else {
-			l.thinkSeg.Text = hiddenThinkingMarker(reasoning)
-		}
-	}
-	if l.content != nil {
-		l.contSeg.Text = content
+	if content != "" {
+		l.ensure(&l.content, "LLM output")
+		l.content.set(true, content)
 	}
 }
 
-// refresh repaints the live surfaces (the O(length) word-wrap pass).
-func (l *liveArea) refresh() {
-	if l.thinking != nil {
-		l.thinking.Refresh()
+func (l *liveArea) ensure(stream **liveStream, label string) {
+	if *stream != nil {
+		return
 	}
-	if l.content != nil {
-		l.content.Refresh()
+	s := &liveStream{}
+	s.tail = container.NewVBox(markdownRT(""))
+	s.sec = container.NewVBox(s.tail)
+	*stream = s
+	l.box.Add(areaCard(label, metrics{}, s.sec, fyne.TextAlignLeading))
+}
+
+// set renders one section: thinking hidden behind the toggle collapses to
+// the marker (its blocks discarded, rescanned if shown again); visible text
+// advances the incremental parse.
+func (s *liveStream) set(show bool, src string) {
+	s.src = src
+	if !show {
+		if !s.hidden {
+			s.sec.Objects = []fyne.CanvasObject{s.tail}
+			s.cur, s.open, s.inFence, s.fence = 0, 0, false, ""
+			s.hidden = true
+		}
+		s.tail.Objects = []fyne.CanvasObject{plainRT(hiddenThinkingMarker(src))}
+		s.tail.Refresh()
+		return
+	}
+	if s.hidden {
+		s.sec.Objects = []fyne.CanvasObject{s.tail}
+		s.cur, s.open, s.inFence, s.fence = 0, 0, false, ""
+		s.hidden = false
+	}
+	s.update()
+}
+
+func (s *liveStream) update() {
+	added := false
+	cur, open, inFence, fence := scanBlocks(s.src, s.cur, s.open, s.inFence, s.fence, false, func(raw string, isFence bool, info string, lines []string) {
+		var w fyne.CanvasObject = markdownRT(raw)
+		if isFence {
+			w = codeCard(info, lines)
+		}
+		// Closed blocks enter above the tail holder: order is history.
+		n := len(s.sec.Objects)
+		objs := make([]fyne.CanvasObject, 0, n+1)
+		objs = append(objs, s.sec.Objects[:n-1]...)
+		s.sec.Objects = append(append(objs, w), s.tail)
+		added = true
+	})
+	s.cur, s.open, s.inFence, s.fence = cur, open, inFence, fence
+	tail := s.src[s.open:]
+	if s.inFence {
+		// The open fence, closed for the preview: the reader sees code, not
+		// the syntax of a block that is not finished yet.
+		tail += "\n" + s.fence + "\n"
+	}
+	s.tail.Objects = []fyne.CanvasObject{markdownRT(tail)}
+	s.tail.Refresh()
+	if added {
+		s.sec.Refresh() // layout for the new blocks; tail-only updates skip it
+	}
+}
+
+// refresh re-wraps the live surfaces (the O(length) passes) after a flush or
+// a width change. Closed blocks pay only a re-wrap; their markdown is never
+// re-parsed.
+func (l *liveArea) refresh() {
+	for _, s := range []*liveStream{l.thinking, l.content} {
+		if s == nil {
+			continue
+		}
+		for _, o := range s.sec.Objects {
+			if r, ok := o.(interface{ Refresh() }); ok {
+				r.Refresh()
+			}
+		}
 	}
 }
 
