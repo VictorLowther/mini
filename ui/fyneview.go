@@ -970,10 +970,38 @@ func monoBlock(lines []string) fyne.CanvasObject {
 	return container.NewHScroll(rt)
 }
 
-// transcriptGrid renders a tool block's lines as fixed-width text: see
-// monoBlock for the widget choice.
+// transcriptGrid renders a tool block's lines as fixed-width text inside a
+// scrollable card: monoBlock for the widget choice, and a hard growth cap
+// here. A card shows about ten lines and no more - taller output scrolls
+// inside the card instead of pushing the transcript (and the model's
+// attention) around it. The viewport height is min(content, cap): short
+// results stay exactly their size, long ones stop at ten measured lines and
+// grow vertical scrollbars, which is what Scroll.SetMinSize expresses - a
+// floor the layout may not squeeze below, and no taller.
 func transcriptGrid(lines []string) fyne.CanvasObject {
-	return monoBlock(lines)
+	rt := monoRT(lines)
+	sc := container.NewScroll(rt)
+	line := fyne.MeasureText("M", theme.TextSize(), fyne.TextStyle{Monospace: true}).Height
+	capH := 10 * line
+	if h := rt.MinSize().Height; h < capH {
+		capH = h
+	}
+	sc.SetMinSize(fyne.NewSize(0, capH))
+	return sc
+}
+
+// monoRT is the single monospace RichText behind monoBlock and the capped
+// transcript grid: one shaped widget, not a cell grid.
+func monoRT(lines []string) *widget.RichText {
+	rt := widget.NewRichText(&widget.TextSegment{
+		Text: strings.Join(lines, "\n"),
+		Style: widget.RichTextStyle{
+			TextStyle: fyne.TextStyle{Monospace: true},
+			Alignment: fyne.TextAlignLeading,
+		},
+	})
+	rt.Wrapping = fyne.TextWrapOff
+	return rt
 }
 
 func exitRT(b block) *widget.RichText {

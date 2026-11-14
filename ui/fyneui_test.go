@@ -983,6 +983,35 @@ func TestGUITranscriptIsAShellSessionNotJSON(t *testing.T) {
 	}
 }
 
+// TestGUIToolCardScrollsPastTenLines: a tool card grows to about ten lines
+// and no more - a taller result scrolls inside its card instead of pushing
+// the transcript around it. A short result is exactly its content.
+func TestGUIToolCardScrollsPastTenLines(t *testing.T) {
+	lineH := float32(0)
+	{
+		one := transcriptGrid([]string{"a"}).(*container.Scroll).Content.(*widget.RichText)
+		lineH = one.MinSize().Height
+	}
+	short := transcriptGrid([]string{"1", "2", "3"}).(*container.Scroll)
+	if got := short.MinSize().Height; got > 3*lineH+1 {
+		t.Errorf("3-line card min height = %v, want ~%v: short results must not pad to the cap", got, 3*lineH)
+	}
+
+	long := transcriptGrid(make([]string, 40)).(*container.Scroll)
+	if got, capH := long.MinSize().Height, 10*lineH; got > capH+1 {
+		t.Errorf("40-line card min height = %v, want the 10-line cap %v", got, capH)
+	}
+	if content := long.Content.(*widget.RichText).MinSize().Height; content <= long.MinSize().Height {
+		t.Errorf("40-line content height %v is not above its %v viewport: nothing would scroll",
+			content, long.MinSize().Height)
+	}
+	// The single-widget promise behind the cap: the body is one RichText, so
+	// capping is one MinSize, not a walk over materialized rows.
+	if _, ok := long.Content.(*widget.RichText); !ok {
+		t.Errorf("card content = %T, want a single RichText", long.Content)
+	}
+}
+
 // setTask mirrors drive()'s publication of the task before loop.Run, which is
 // what messageBlock's task note reads.
 func (p *guiPane) setTask(task string) {
