@@ -206,6 +206,7 @@ func (s *Sushi) requestBody(msgs []Message) map[string]any {
 }
 
 func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (Message, error) {
+	started := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.BaseURL+"/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -233,6 +234,9 @@ func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (Messag
 	extra["response"] = stream.response
 	extra["cost"] = cost
 	extra["timestamp"] = float64(time.Now().UnixMilli()) / 1000
+	// Generation time for the successful attempt: the UIs' per-message header
+	// (retry waits are deliberately excluded - they are announced separately).
+	extra["elapsed_seconds"] = time.Since(started).Seconds()
 	if u, ok := stream.response["usage"]; ok {
 		extra["model_stats"] = u
 	}

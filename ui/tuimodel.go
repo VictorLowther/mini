@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/VictorLowther/mini/agent"
+	"github.com/VictorLowther/mini/model"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
@@ -517,12 +518,18 @@ func (m *tuiModel) finishRun() (quit bool) {
 // sessionHeader is the line a shell prints before its first prompt: session info
 // once, into the transcript, where it can scroll away with the history.
 func (m *tuiModel) sessionHeader() {
+	m.noteLocal(tuiStyler.dim.Render(sessionHeaderLine(m.t.modelName, m.t.baseURL, m.t.configName, m.t.sessionID)))
+}
+
+// sessionHeaderLine is the transcript's first line, worded identically by
+// every frontend.
+func sessionHeaderLine(modelName, baseURL, configName, sessionID string) string {
 	suffix := ""
-	if m.t.sessionID != "" {
-		suffix = " · session " + m.t.sessionID
+	if sessionID != "" {
+		suffix = " · session " + sessionID
 	}
-	m.noteLocal(tuiStyler.dim.Render(fmt.Sprintf("mini-go %s · %s @ %s · config %s%s",
-		agent.Version, m.t.modelName, m.t.baseURL, m.t.configName, suffix)))
+	return fmt.Sprintf("mini-go %s · %s @ %s · config %s%s",
+		agent.Version, modelName, baseURL, configName, suffix)
 }
 
 func (m *tuiModel) noteLocal(text string) {
@@ -910,6 +917,25 @@ func (m *tuiModel) frame(transcript string) string {
 // action panel, which is BeforeExecute blocking on the answer channel.
 const panelMaxActions = 4
 
+// panelConfirmHint is the confirm panel's key legend, shared by every frontend.
+const panelConfirmHint = "enter to confirm · type a comment and enter to reject · /y to go yolo · /h for commands"
+
+// panelActionLines is the confirm panel's content, free of styling and width
+// handling: the first panelMaxActions actions (each truncated to 6 lines, which
+// may make one entry span lines) plus an elision marker when actions are hidden.
+func panelActionLines(actions []model.Action) []string {
+	var lines []string
+	shown := actions
+	if len(shown) > panelMaxActions {
+		lines = append(lines, fmt.Sprintf("+%d more commands", len(shown)-panelMaxActions))
+		shown = shown[:panelMaxActions]
+	}
+	for _, a := range shown {
+		lines = append(lines, truncateVisible(a.Command, 6))
+	}
+	return lines
+}
+
 func (m *tuiModel) pendingPanel() string {
 	if !m.t.HasQuestion() {
 		return ""
@@ -920,17 +946,11 @@ func (m *tuiModel) pendingPanel() string {
 	}
 	var sb strings.Builder
 	sb.WriteString(tuiStyler.badge.Render("commands") + "\n")
-	shown := q.Actions
-	if len(shown) > panelMaxActions {
-		sb.WriteString(fmt.Sprintf("  +%d more commands\n", len(shown)-panelMaxActions))
-		shown = shown[:panelMaxActions]
-	}
-	for _, a := range shown {
+	for _, entry := range panelActionLines(q.Actions) {
 		// A command can be many lines and arbitrarily wide; the panel's box is
 		// measured like any other row, so it has to fit before it is drawn.
-		cmd := strings.Join(fitLines(strings.Split(truncateVisible(a.Command, 6), "\n"), m.width-6), "\n")
-		sb.WriteString("  " + cmd + "\n")
+		sb.WriteString("  " + strings.Join(fitLines(strings.Split(entry, "\n"), m.width-6), "\n") + "\n")
 	}
-	sb.WriteString(tuiStyler.dim.Render("enter to confirm · type a comment and enter to reject · /y to go yolo · /h for commands"))
+	sb.WriteString(tuiStyler.dim.Render(panelConfirmHint))
 	return tuiStyler.panel.MaxWidth(m.width).Render(sb.String())
 }

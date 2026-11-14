@@ -184,6 +184,9 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "gui" {
+		os.Exit(runGUI(os.Args[2:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "sessions" {
 		if err := runSessionsCommand(os.Args[2:], os.Stdout); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
@@ -218,107 +221,28 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	closeLog := setupLogging(o.logFile, logTarget)
 	defer closeLog()
 
-	loadGlobalEnv()
-	if err := maybeRunFirstTimeSetup(stdin, stdout, o); err != nil {
-		fmt.Fprintln(stderr, "mini:", err)
-		return 1
-	}
-
-	merged, configName, err := buildConfig(o)
+	r, err := buildRun(o, stdin, stdout, logTarget)
 	if err != nil {
-		fmt.Fprintln(stderr, "mini:", err)
+		fmt.Fprintln(stderr, "mini: "+err.Error())
 		return 1
 	}
-
-	agentCfg := agent.ConfigFromMap(config.Sub(merged, "agent"))
-	modelCfg := config.Sub(merged, "model")
-	envCfg := config.Sub(merged, "environment")
-
-	if agentCfg.OutputPath == "" {
-		agentCfg.OutputPath = defaultOutputPath()
-	}
-	if agentCfg.SystemTemplate == "" || agentCfg.InstanceTemplate == "" {
-		fmt.Fprintln(stderr, "mini: the agent config needs system_template and instance_template")
-		return 1
-	}
-
-	m := model.NewSushi(modelCfg)
-	if m.Model == "" {
-		fmt.Fprintln(stderr, "mini: no model set. Pass -m NAME or run `mini config setup`.")
-		return 1
-	}
-	e := newEnvironment(envCfg)
-
-	// A store that cannot be opened is fatal: a transcript source of truth
-	// that silently stopped recording is worse than a run that refuses to
-	// start.
-	if _, err := config.EnsureStateDir(); err != nil {
-		fmt.Fprintln(stderr, "mini: session store:", err)
-		return 1
-	}
-	store, err := session.Open(config.SessionDB(), config.ToolCallResultsDir())
-	if err != nil {
-		fmt.Fprintln(stderr, "mini: session store:", err)
-		return 1
-	}
-	defer store.Close()
-
-	// Project identity: the git toplevel, else the canonical working
-	// directory, so `mini sessions` and `mini -r` find the runs started in
-	// this checkout from anywhere inside it.
-	startDir := e.CWD
-	if startDir == "" {
-		startDir, _ = os.Getwd()
-	}
-	workdir, project := projectOf(startDir)
+	defer r.closeStore()
 
 	if !o.printMode && !isTerminal(stdout) {
 		o.printMode = true
 	}
-	printBanner(stdout, o.printMode, configName, m)
+	printBanner(stdout, o.printMode, r.ConfigName, r.Model)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	l := &agent.Loop{Cfg: agentCfg, Model: m, Env: e, Logger: slog.Default()}
-
-	// Fresh runs get a row (Title backfilled by the store when the task
-	// message lands, which is what titles the TUI's ask-for-a-task flow
-	// too); -r runs load the stored transcript and continue it.
-	var (
-		sess       *session.Session
-		resumeMsgs []model.Message
-		resumeNote string
-	)
-	if o.resume.present {
-		found, err := findResumable(store, project, o.resume.value)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				fmt.Fprintln(stderr, "mini: no session for this directory")
-			} else {
-				fmt.Fprintln(stderr, "mini: session store:", err)
-			}
-			return 1
-		}
-		msgs, err := found.Transcript()
-		if err != nil {
-			fmt.Fprintln(stderr, "mini: session store:", err)
-			return 1
-		}
-		sess = found
-		resumeMsgs = msgs
-		resumeNote = fmt.Sprintf("resumed session %s (%d turns)", sess.ID, len(msgs))
-		l.Cost, l.NCalls = sess.Cost, sess.NCalls
-		l.Resume(msgs)
-	} else {
-		created, err := store.Create(session.Row{ID: uuid.NewV7(), Workdir: workdir, Project: project, ModelName: m.Model})
-		if err != nil {
-			fmt.Fprintln(stderr, "mini: session store:", err)
-			return 1
-		}
-		sess = created
-	}
-	l.Recorder = sess
+	l := r.Loop
+	agentCfg := r.AgentCfg
+	m := r.Model
+	configName := r.ConfigName
+	sess := r.Sess
+	resumeMsgs := r.ResumeMsgs
+	resumeNote := r.ResumeNote
 
 	if o.printMode {
 		p := ui.NewPrint(stdout, stdin, agentCfg)
@@ -376,6 +300,126 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stderr, "Saved trajectory to '%s'\n", agentCfg.OutputPath)
 	fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", sess.ID, sess.ID)
 	return exitCode(info, err)
+}
+
+// miniRun is a fully configured run, ready for whichever frontend owns it:
+// everything `mini` does before it opens a UI (config, model, environment,
+// loop, session, resume) and no terminal interaction beyond the first-time
+// setup the shared call sequence already performs.
+type miniRun struct {
+	O          *options
+	AgentCfg   *agent.Config
+	Model      *model.Sushi
+	Env        *env.Local
+	Loop       *agent.Loop
+	Sess       *session.Session
+	ResumeMsgs []model.Message
+	ResumeNote string
+	ConfigName string
+	LogTarget  *ui.LogTarget
+	closeStore func()
+}
+
+// buildRun prepares a run exactly as mini always has, in the same order,
+// printing nothing: every failure comes back unprefixed so the frontend that
+// owns the terminal prints "mini: "+err like before.
+func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTarget) (r *miniRun, err error) {
+	loadGlobalEnv()
+	if err := maybeRunFirstTimeSetup(stdin, stdout, o); err != nil {
+		return nil, err
+	}
+
+	merged, configName, err := buildConfig(o)
+	if err != nil {
+		return nil, err
+	}
+
+	agentCfg := agent.ConfigFromMap(config.Sub(merged, "agent"))
+	modelCfg := config.Sub(merged, "model")
+	envCfg := config.Sub(merged, "environment")
+
+	if agentCfg.OutputPath == "" {
+		agentCfg.OutputPath = defaultOutputPath()
+	}
+	if agentCfg.SystemTemplate == "" || agentCfg.InstanceTemplate == "" {
+		return nil, errors.New("the agent config needs system_template and instance_template")
+	}
+
+	m := model.NewSushi(modelCfg)
+	if m.Model == "" {
+		return nil, errors.New("no model set. Pass -m NAME or run `mini config setup`.")
+	}
+	e := newEnvironment(envCfg)
+
+	// A store that cannot be opened is fatal: a transcript source of truth
+	// that silently stopped recording is worse than a run that refuses to
+	// start.
+	if _, err := config.EnsureStateDir(); err != nil {
+		return nil, fmt.Errorf("session store: %w", err)
+	}
+	store, err := session.Open(config.SessionDB(), config.ToolCallResultsDir())
+	if err != nil {
+		return nil, fmt.Errorf("session store: %w", err)
+	}
+	// A failed setup must not leave the database locked for the next attempt
+	// in this process; a successful one hands the handle to the caller.
+	defer func() {
+		if err != nil {
+			_ = store.Close()
+		}
+	}()
+
+	// Project identity: the git toplevel, else the canonical working
+	// directory, so `mini sessions` and `mini -r` find the runs started in
+	// this checkout from anywhere inside it.
+	startDir := e.CWD
+	if startDir == "" {
+		startDir, _ = os.Getwd()
+	}
+	workdir, project := projectOf(startDir)
+
+	l := &agent.Loop{Cfg: agentCfg, Model: m, Env: e, Logger: slog.Default()}
+
+	// Fresh runs get a row (Title backfilled by the store when the task
+	// message lands, which is what titles the TUI's ask-for-a-task flow
+	// too); -r runs load the stored transcript and continue it.
+	var (
+		sess       *session.Session
+		resumeMsgs []model.Message
+		resumeNote string
+	)
+	if o.resume.present {
+		found, err := findResumable(store, project, o.resume.value)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, errors.New("no session for this directory")
+			}
+			return nil, fmt.Errorf("session store: %w", err)
+		}
+		msgs, err := found.Transcript()
+		if err != nil {
+			return nil, fmt.Errorf("session store: %w", err)
+		}
+		sess = found
+		resumeMsgs = msgs
+		resumeNote = fmt.Sprintf("resumed session %s (%d turns)", sess.ID, len(msgs))
+		l.Cost, l.NCalls = sess.Cost, sess.NCalls
+		l.Resume(msgs)
+	} else {
+		created, err := store.Create(session.Row{ID: uuid.NewV7(), Workdir: workdir, Project: project, ModelName: m.Model})
+		if err != nil {
+			return nil, fmt.Errorf("session store: %w", err)
+		}
+		sess = created
+	}
+	l.Recorder = sess
+
+	return &miniRun{
+		O: o, AgentCfg: agentCfg, Model: m, Env: e, Loop: l, Sess: sess,
+		ResumeMsgs: resumeMsgs, ResumeNote: resumeNote,
+		ConfigName: configName, LogTarget: logTarget,
+		closeStore: func() { _ = store.Close() },
+	}, nil
 }
 
 func reportRun(l *agent.Loop, info map[string]any, err error) {

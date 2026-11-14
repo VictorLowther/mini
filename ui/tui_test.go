@@ -473,7 +473,7 @@ func normalizeTraj(t *testing.T, path string) string {
 func stripVolatile(v any) {
 	switch t := v.(type) {
 	case map[string]any:
-		for _, k := range []string{"timestamp", "outputs", "response", "cwd", "base_url", "model", "output_path", "tcr_path"} {
+		for _, k := range []string{"timestamp", "elapsed_seconds", "outputs", "response", "cwd", "base_url", "model", "output_path", "tcr_path"} {
 			delete(t, k)
 		}
 		for _, child := range t {

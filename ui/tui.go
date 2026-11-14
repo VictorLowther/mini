@@ -138,6 +138,15 @@ type streamState struct {
 	content   strings.Builder
 }
 
+// metrics names the generation facts of one message that a frontend header
+// may show: generated tokens, wall seconds of the model call, and its cost.
+// Zero means "not recorded", and frontends omit those parts.
+type metrics struct {
+	Tokens  int
+	Elapsed float64
+	Cost    float64
+}
+
 // block is one entry in the transcript. kind is a message role, or one of
 // "note" / "error" for UI-generated lines. Blocks keep their source text so the
 // pane can be re-rendered when the thinking toggle flips.
@@ -150,6 +159,13 @@ type block struct {
 	reasoning string
 	// transcript holds the rendered shell lines of an executed command.
 	transcript []string
+	// stats are the message's generation metrics (assistant turns).
+	stats metrics
+	// subtype is the message's interrupt_type for user-role rows: frontends
+	// use it to tell entries the human typed (steering, human commands) from
+	// feedback the harness authored (rejections, interruption records,
+	// format-error prompts, new-task wrappers).
+	subtype string
 }
 
 // NewTUI builds the UI and installs itself as the loop's streaming handler.
@@ -316,30 +332,53 @@ func (t *TUI) Message(m model.Message) {
 // message is prompt plumbing that never reaches the pane. TUI.Message and the
 // resume replay share it, so a resumed pane cannot drift from a live one.
 func (t *TUI) blockFor(m model.Message) (block, bool) {
-	role, _ := m["role"].(string)
-	content, _ := m["content"].(string)
-	if _, built := m["extra"]; !built {
-		if role == "user" {
-			t.mu.Lock()
-			task := t.task
-			t.mu.Unlock()
-			t.note("task: " + firstLine(task))
-		}
-		return block{}, false
-	}
-	b := block{kind: role, text: content}
-	if r, ok := m["reasoning_content"].(string); ok {
-		b.reasoning = r
-	}
-	switch role {
-	case "assistant":
-		b.title = t.AssistantHeader()
+	t.mu.Lock()
+	task := t.task
+	t.mu.Unlock()
+	b, show, taskNote := messageBlock(m, t.AssistantHeader(), task, func() {
 		// The live block held the streamed text; this message supersedes it, so
 		// the buffer starts fresh for the next turn instead of repeating.
 		t.mu.Lock()
 		t.stream = streamState{}
 		t.mu.Unlock()
+	})
+	if taskNote {
+		t.note("task: " + firstLine(task))
+	}
+	return b, show
+}
+
+// messageBlock is the message→block mapping every frontend shares (TUI live,
+// TUI resume, GUI): prompt plumbing never shows, the user row without a built
+// instance is the task note, assistant rows carry the per-turn header, and tool
+// results render from the stored observation. The caller supplies the header
+// (it is per-frontend state), reads task for the note, and owns the stream
+// reset that committing an assistant turn performs.
+func messageBlock(m model.Message, header, task string, clearStream func()) (b block, show, taskNote bool) {
+	role, _ := m["role"].(string)
+	content, _ := m["content"].(string)
+	if _, built := m["extra"]; !built {
+		return block{}, false, role == "user"
+	}
+	b = block{kind: role, text: content}
+	if r, ok := m["reasoning_content"].(string); ok {
+		b.reasoning = r
+	}
+	switch role {
+	case "assistant":
+		b.title = header
+		if extra, ok := m["extra"].(map[string]any); ok {
+			b.stats.Cost, _ = extra["cost"].(float64)
+			b.stats.Elapsed, _ = extra["elapsed_seconds"].(float64)
+			if u, ok := extra["model_stats"].(map[string]any); ok {
+				b.stats.Tokens = asIntDefault(u["completion_tokens"])
+			}
+		}
+		clearStream()
 	case "tool", "user":
+		if extra, ok := m["extra"].(map[string]any); ok {
+			b.subtype, _ = extra["interrupt_type"].(string)
+		}
 		if obs, ok := observationOf(m); ok {
 			b.transcript = obs.lines()
 		}
@@ -348,7 +387,7 @@ func (t *TUI) blockFor(m model.Message) (block, bool) {
 		status, _ := extra["exit_status"].(string)
 		b.title = status
 	}
-	return b, true
+	return b, true, false
 }
 
 // Resume queues a stored transcript for replay into the pane, with a note
@@ -391,7 +430,7 @@ func (t *TUI) queueSteering(text string) {
 
 // RetryNotice tells the pane that a model call is being retried.
 func (t *TUI) RetryNotice(attempt, max int, err error, wait time.Duration) {
-	t.note(fmt.Sprintf("model call failed (attempt %d/%d), retrying in %s: %v", attempt, max, wait.Round(time.Second), err))
+	t.note(retryNotice(attempt, max, err, wait))
 }
 
 // Write lets ui.slash() print into the transcript.
@@ -469,7 +508,17 @@ func (t *TUI) result() (map[string]any, error) {
 // does not gain a header when it commits.
 func (t *TUI) AssistantHeader() string {
 	snap := t.snapshot()
-	return fmt.Sprintf("mini-swe-agent (step %d, $%.2f)", snap.Calls, snap.Cost)
+	return assistantHeader(snap.Calls, snap.Cost)
+}
+
+// assistantHeader and runStatsText are the shared string shapes every
+// frontend renders identically; retryNotice is the shared stalled-call note.
+func assistantHeader(calls int, cost float64) string {
+	return fmt.Sprintf("mini-swe-agent (step %d, $%.2f)", calls, cost)
+}
+
+func retryNotice(attempt, max int, err error, wait time.Duration) string {
+	return fmt.Sprintf("model call failed (attempt %d/%d), retrying in %s: %v", attempt, max, wait.Round(time.Second), err)
 }
 
 // CancelCurrentTurn interrupts the command in flight (esc).
@@ -477,10 +526,12 @@ func (t *TUI) CancelCurrentTurn() { t.loop.CancelTurn() }
 
 // RunStats renders the footer: step, cost, tokens, throughput, mode.
 func (t *TUI) RunStats() string {
-	snap := t.snapshot()
-	step, cost := snap.Calls, snap.Cost
-	parts := []string{fmt.Sprintf("step %d", step), fmt.Sprintf("$%.2f", cost), t.cfg.Mode,
-		map[bool]string{true: "thinking: on", false: "thinking: off"}[t.showReasoning()]}
+	return runStatsText(t.snapshot(), t.cfg.Mode, t.showReasoning())
+}
+
+func runStatsText(snap agent.Snapshot, mode string, thinking bool) string {
+	parts := []string{fmt.Sprintf("step %d", snap.Calls), fmt.Sprintf("$%.2f", snap.Cost), mode,
+		map[bool]string{true: "thinking: on", false: "thinking: off"}[thinking]}
 	if snap.ModelTokens > 0 {
 		parts = append(parts, fmt.Sprintf("%d tok", snap.ModelTokens))
 	}

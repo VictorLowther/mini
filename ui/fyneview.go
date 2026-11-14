@@ -1,0 +1,1140 @@
+//go:build gui
+
+package ui
+
+import (
+	"fmt"
+	"image/color"
+	"runtime"
+	"strings"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+// isMacOS picks the platform-conventional modifier for the GUI's chords
+// (Fyne's KeyModifierShortcutDefault already is ⌘ on macOS and Ctrl
+// elsewhere; the copy-shortcut quirk below is the driver's own routing).
+const isMacOS = runtime.GOOS == "darwin"
+
+// thinkingMods is the thinking-toggle modifier chord per platform: Ctrl on
+// its own everywhere except macOS, where plain ⌘T stays free for future tabs
+// and the Control-Command form is used (Option chords would also insert their
+// characters into the entry).
+func thinkingMods() fyne.KeyModifier {
+	if isMacOS {
+		return fyne.KeyModifierShortcutDefault | fyne.KeyModifierControl
+	}
+	return fyne.KeyModifierShortcutDefault
+}
+
+// thinkingKeyName names the thinking-toggle chord the way the platform's
+// conventions do, so the hidden-thinking marker always names the real key.
+func thinkingKeyName() string {
+	if isMacOS {
+		return "⌃⌘T"
+	}
+	return "ctrl+t"
+}
+
+func hiddenThinkingMarker(reasoning string) string {
+	return fmt.Sprintf("[thinking hidden: %d chars · %s]", len(reasoning), thinkingKeyName())
+}
+
+// guiView owns every widget. Its methods are called on the toolkit goroutine
+// only: cross-goroutine work posts through GUI.post, and Fyne-originated
+// callbacks (keys, menu actions) already run there. Never fyne.Do from
+// inside a view method.
+type guiView struct {
+	gui *GUI
+	win fyne.Window
+
+	body   *fyne.Container // VBox of committed bubbles, inside the scroll
+	dock   *fyne.Container // live streaming area, outside the scroll (see flushLive)
+	rootC  *fyne.Container // top border: refresh after dock changes
+	scroll *container.Scroll
+	panel  *fyne.Container // question panel content, swapped per prompt
+	card   *widget.Card    // the bordered box holding the panel
+	status *widget.Label
+	editor *chatInput
+
+	limitsLabel *widget.Label
+
+	cancelItem *fyne.MenuItem
+	wasRunning bool
+	lastTitle  string
+
+	// streaming coalescing (the pane's 80 ms repaintInterval in GUI form):
+	// sushi emits a chunk every few milliseconds; re-wrapping every live
+	// surface per chunk is a repaint storm that pegs a core.
+	paintGap     time.Duration
+	lastFlush    time.Time
+	flushPending bool
+
+	// dialog is the prompt above the input: "" or "limits", the desktop form
+	// of the pane's dialog state. Leaving the app is never a dialog: /quit or
+	// the native quit hotkey only.
+	dialog    string
+	limitsIdx int
+	limits    [2]float64
+
+	// committed is the transcript source of truth the widgets are rendered
+	// from; the thinking toggle rebuilds every block from it.
+	committed []block
+	live      *liveArea
+	// pinned tracks whether the transcript was scrolled to the bottom before
+	// the last content change, so new output keeps the view at the bottom and
+	// scrolled-back history stays put.
+	pinned bool
+}
+
+func newGUIView(g *GUI, w fyne.Window) *guiView {
+	v := &guiView{gui: g, win: w}
+	v.body = container.NewVBox()
+	v.scroll = container.NewVScroll(v.body)
+	v.dock = container.NewVBox()
+	v.editor = newChatInput(v)
+	v.limitsLabel = widget.NewLabel(limitLabelSteps)
+	v.panel = container.NewVBox()
+	v.card = widget.NewCard("", "", v.panel)
+	v.card.Hide()
+	v.status = widget.NewLabel("")
+	v.status.Importance = widget.LowImportance
+	v.pinned = true // new output follows the tail until the user scrolls up
+	v.paintGap = 80 * time.Millisecond
+	return v
+}
+
+func (v *guiView) root() fyne.CanvasObject {
+	bottom := container.NewVBox(v.card, v.dock, v.status, v.editor)
+	v.rootC = container.NewBorder(nil, bottom, nil, nil, v.scroll)
+	return v.rootC
+}
+
+// start shows the window and puts the focus on the input - input must always
+// work, the rule the pane enforces by re-focusing even on Blur.
+func (v *guiView) start() {
+	v.win.Show()
+	v.focusEditor()
+	// The transcript was built before the scroll had a height, so it is
+	// stacked above the fold; land on the newest turn.
+	v.pinned = true
+	v.scroll.ScrollToBottom()
+	v.refreshStatus()
+}
+
+func (v *guiView) focusEditor() {
+	v.win.Canvas().Focus(v.editor)
+}
+
+// ------------------------------------------------------------ the transcript --
+
+func (v *guiView) noteLocal(text string) {
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		if line != "" {
+			v.appendBlock(block{kind: "note", text: line})
+		}
+	}
+}
+
+// updatePinned records whether the view sat at the bottom before the next
+// content change. A scroll that has not been laid out yet (zero height, e.g.
+// during the pre-Show transcript build) must not count as "scrolled up" - the
+// transcript starts pinned so it follows new turns, which is the whole point.
+func (v *guiView) updatePinned() {
+	view := v.scroll.Size().Height
+	if view <= 0 {
+		v.pinned = true
+		return
+	}
+	bottom := v.body.MinSize().Height - view
+	v.pinned = v.scroll.Offset.Y >= bottom-4
+}
+
+// afterContentChange absorbs a structural change (a block committed): grow
+// the scroll content to its new minimum by resizing it - existing children
+// early-return from Resize (same size), so only the new widgets lay out -
+// then follow the tail (which also refreshes the scroll bars via the
+// renderer). Deliberately NOT scroll.Refresh(): that Refresh()es every
+// committed bubble - re-wrapping all prose and re-parsing every TextGrid -
+// the repaint storm the profile caught (textRenderer.Refresh + setCellRune +
+// wrapWordLines dominating, hundreds of MB/s on a long transcript).
+func (v *guiView) afterContentChange() {
+	if vs := v.scroll.Size(); vs.Height > 0 {
+		min := v.body.MinSize()
+		v.body.Resize(fyne.NewSize(max(min.Width, vs.Width), max(min.Height, vs.Height)))
+	}
+	if v.pinned {
+		v.scroll.ScrollToBottom()
+	}
+	v.repaint(v.scroll)
+	v.refreshStatus()
+}
+
+// repaint asks the canvas to redraw one object's region. After layout-only
+// updates nothing has marked the new widgets dirty, and this is the cheap
+// replacement for the Refresh() cascade: it re-rasterises the pixels without
+// re-wrapping or re-celling a single widget.
+func (v *guiView) repaint(o fyne.CanvasObject) {
+	if c := fyne.CurrentApp().Driver().CanvasForObject(v.scroll); c != nil {
+		c.Refresh(o)
+	}
+}
+
+func (v *guiView) appendBlock(b block) {
+	v.committed = append(v.committed, b)
+	v.updatePinned()
+	for _, o := range blockCards(b, v.gui.showReasoning()) {
+		v.body.Add(o)
+	}
+	v.body.Add(blockSpacer())
+	v.afterContentChange()
+}
+
+// commitBlock places a finished block in the transcript, replacing the
+// in-flight turn's live area when it is the committed form of that same turn -
+// the GUI's copy of the pane's live-block rule, so a turn is rendered once and
+// already carries its header while streaming.
+func (v *guiView) commitBlock(b block) {
+	if v.live != nil {
+		if b.kind != "assistant" {
+			// Something else ended the turn: keep what streamed as its own
+			// entry rather than letting a later commit replace it.
+			lb := v.finalizeLive()
+			v.removeLive()
+			v.appendBlock(lb)
+		} else {
+			v.removeLive()
+		}
+	}
+	v.appendBlock(b)
+}
+
+func (v *guiView) removeLive() {
+	v.dock.Remove(v.live.box)
+	v.live = nil
+	if v.rootC != nil {
+		v.rootC.Layout.Layout(v.rootC.Objects, v.rootC.Size()) // see flushLive: layout-only, no Refresh cascade
+	}
+}
+
+func (v *guiView) finalizeLive() block {
+	reasoning, content := v.gui.StreamText()
+	return block{kind: "assistant", text: content, reasoning: reasoning}
+}
+
+// streamChunk updates the live surfaces from the stream buffers cheaply (one
+// string copy per segment) and coalesces the expensive repaint - full re-wrap
+// plus the scroll relayout cascade - to at most one per paintGap, leading
+// edge first so the first chunk of a turn paints immediately.
+func (v *guiView) streamChunk() {
+	g := v.gui
+	reasoning, content := g.StreamText()
+	if reasoning == "" && content == "" {
+		return
+	}
+	if v.live == nil {
+		v.live = newLiveArea()
+		v.updatePinned()
+		v.dock.Add(v.live.box)
+	}
+	v.live.setText(reasoning, content, g.showReasoning())
+	if v.paintGap <= 0 || time.Since(v.lastFlush) >= v.paintGap {
+		v.flushLive()
+		return
+	}
+	if v.flushPending {
+		return
+	}
+	v.flushPending = true
+	wait := v.paintGap - time.Since(v.lastFlush)
+	time.AfterFunc(wait, func() { g.post(func() { v.flushLive() }) })
+}
+
+// flushLive repaints the streaming turn only: the live surfaces re-wrap, the
+// bottom section (dock) grows, and the scroll's committed content stays
+// untouched. rootC.Refresh re-runs the border layout; every committed child
+// early-returns from Resize because its size did not change - that is what
+// keeps a flush O(live) instead of O(transcript).
+func (v *guiView) flushLive() {
+	v.flushPending = false
+	v.lastFlush = time.Now()
+	if v.live != nil {
+		v.live.refresh()
+	}
+	if v.rootC != nil {
+		// Layout, never Refresh: Container.Refresh cascades Refresh() into
+		// every committed bubble (full re-wrap + TextGrid re-cell). Re-laying
+		// the border recomputes the grown dock from child MinSizes, and size
+		// changes propagate down through Resize (whose children that did not
+		// change size early-return) - live-only work, O(transcript) avoided.
+		v.rootC.Layout.Layout(v.rootC.Objects, v.rootC.Size())
+	}
+	if v.pinned {
+		v.scroll.ScrollToBottom() // viewport shrank under the dock: keep the tail visible
+	}
+	v.repaint(v.scroll)
+	v.refreshStatus()
+}
+
+// rebuildAll re-renders every block (the thinking toggle changes how past
+// turns look) and replaces the transcript, mirroring renderAll.
+func (v *guiView) rebuildAll() {
+	show := v.gui.showReasoning()
+	var objs []fyne.CanvasObject
+	for _, b := range v.committed {
+		objs = append(objs, blockCards(b, show)...)
+		objs = append(objs, blockSpacer())
+	}
+	v.live = nil
+	v.dock.Objects = nil
+	v.body.Objects = objs
+	v.body.Layout.Layout(v.body.Objects, v.body.Size()) // layout, not Refresh: new children lay out from
+	if v.rootC != nil {                                 // MinSize; nothing needs a repaint cascade
+		v.rootC.Layout.Layout(v.rootC.Objects, v.rootC.Size())
+	}
+	v.repaint(v.scroll)
+	// Re-stream the turn in flight from its buffers, if any.
+	v.streamChunk()
+	if v.pinned {
+		v.scroll.ScrollToBottom()
+	}
+}
+
+func (v *guiView) toggleThinking() {
+	if v.dialog != "" {
+		return
+	}
+	on := v.gui.ToggleReasoning()
+	v.rebuildAll()
+	v.noteLocal(map[bool]string{true: "thinking shown", false: "thinking hidden"}[on])
+}
+
+// ------------------------------------------------------------------ the view --
+
+func dimStyle() widget.RichTextStyle {
+	return widget.RichTextStyle{ColorName: theme.ColorNameDisabled}
+}
+
+func plainRT(text string) *widget.RichText {
+	rt := widget.NewRichText(&widget.TextSegment{Text: text})
+	rt.Wrapping = fyne.TextWrapWord
+	return rt
+}
+
+func dimRT(text string) *widget.RichText {
+	rt := widget.NewRichText(&widget.TextSegment{Text: text, Style: dimStyle()})
+	rt.Wrapping = fyne.TextWrapWord
+	return rt
+}
+
+func errorRT(text string) *widget.RichText {
+	rt := widget.NewRichText(&widget.TextSegment{Text: text, Style: widget.RichTextStyle{ColorName: theme.ColorNameError}})
+	rt.Wrapping = fyne.TextWrapWord
+	return rt
+}
+
+func markdownRT(text string) *widget.RichText {
+	rt := widget.NewRichTextFromMarkdown(text)
+	rt.Wrapping = fyne.TextWrapWord
+	return rt
+}
+
+// messageKindLabel names a message block's area and picks its side: text the
+// human typed (task, steering, human commands) sits right-justified like a
+// sent chat bubble; harness-authored feedback (rejections, interruption
+// records, format-error prompts, new-task wrappers) and everything else stay
+// on the left.
+func messageKindLabel(b block) (label string, align fyne.TextAlign) {
+	switch {
+	case len(b.transcript) > 0:
+		return "tool call", fyne.TextAlignLeading
+	case b.kind == "assistant":
+		return "LLM output", fyne.TextAlignLeading
+	case b.kind == "user":
+		if b.subtype == "" || b.subtype == "UserSteering" {
+			return "user", fyne.TextAlignTrailing
+		}
+		return "harness", fyne.TextAlignLeading
+	default:
+		return b.kind, fyne.TextAlignLeading
+	}
+}
+
+// quitKeyName names the native quit hotkey the notes point at.
+func quitKeyName() string {
+	if isMacOS {
+		return "⌘Q"
+	}
+	return "Ctrl+Q"
+}
+
+// ------------------------------------------------------------------ bubbles --
+//
+// The transcript's message areas are speech bubbles in the style of
+// apptrix.org/components/widget/chat (the Fyne add-ons gallery chat widget
+// that defines this UI's reference look): an opaque rounded body with a tail
+// flaring to a point on the sender's side. The fills here are theme-derived
+// instead of hardcoded so light and dark variants both read. Opaque matters
+// as much as the widget: the first cut used low-alpha fills on a raw canvas
+// rectangle and rendered effectively invisible.
+
+// bubbleFill is an opaque, clearly-distinct surface per message kind. It
+// blends a fixed accent hue onto the theme background rather than using
+// theme colour names directly: ColorNamePrimary (user) and
+// ColorNameHyperlink (LLM output) are both blue in the default theme and the
+// faint foreground tints of thinking/tool blended into the background until
+// they read as "no bubble at all". These hues are far apart (blue, violet,
+// green, amber, slate) so the five kinds are tellable at a glance on both
+// light and dark variants, and blended at an alpha that reads as a raised
+// surface, not wallpaper.
+var bubbleAccent = map[string]color.NRGBA{
+	"user":       {R: 0x3b, G: 0x82, B: 0xf6}, // blue
+	"harness":    {R: 0xe0, G: 0x8a, B: 0x14}, // amber
+	"thinking":   {R: 0x8a, G: 0x93, B: 0xa6}, // slate
+	"tool call":  {R: 0x2f, G: 0xa9, B: 0x5c}, // green
+	"LLM output": {R: 0x8b, G: 0x5c, B: 0xf6}, // violet
+}
+
+// bubbleFill's blend weights: the response surface is the most common, so it
+// stays a touch subtler; the coloured kinds get a bit more presence.
+func bubbleFill(label string) color.Color {
+	bg := theme.Color(theme.ColorNameBackground)
+	accent, ok := bubbleAccent[label]
+	if !ok {
+		return blendOnto(bg, color.NRGBA{R: 0x6b, G: 0x72, B: 0x80}, 0x18)
+	}
+	alpha := uint8(0x33)
+	if label == "LLM output" {
+		alpha = 0x2a
+	}
+	return blendOnto(bg, accent, alpha)
+}
+
+// blendOnto composites accent over base at alpha (0-255) and returns an
+// opaque colour.
+func blendOnto(base, accent color.Color, alpha uint8) color.NRGBA {
+	b := color.NRGBAModel.Convert(base).(color.NRGBA)
+	a := color.NRGBAModel.Convert(accent).(color.NRGBA)
+	mix := func(x, y uint8) uint8 {
+		return uint8((uint32(x)*(255-uint32(alpha)) + uint32(y)*uint32(alpha)) / 255)
+	}
+	return color.NRGBA{R: mix(b.R, a.R), G: mix(b.G, a.G), B: mix(b.B, a.B), A: 255}
+}
+
+// bubbleTailDrop/tailBase: how far the tail hangs below the body and how much
+// of the bottom edge it flares from; content must stay clear of the drop.
+func bubbleTailDrop(w fyne.Widget) float32 {
+	return theme.SizeForWidget(theme.SizeNamePadding, w) * 1.5
+}
+
+func bubbleTailBase(w fyne.Widget) float32 {
+	return theme.SizeForWidget(theme.SizeNamePadding, w) * 2
+}
+
+// bubble is the speech-bubble background: a rounded body with a tail to a
+// point on the sender's side, filled with an opaque colour. It is a real
+// widget (not a raw canvas shape) so the container renderers treat it like
+// any other object.
+type bubble struct {
+	widget.BaseWidget
+	label string
+	mine  bool
+	shape *canvas.ArbitraryPolygon
+}
+
+func newBubble(label string, mine bool) *bubble {
+	b := &bubble{label: label, mine: mine, shape: canvas.NewArbitraryPolygon(nil, bubbleFill(label))}
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *bubble) points(s fyne.Size) ([]fyne.Position, []float32) {
+	w, h := s.Width, s.Height
+	drop := min(bubbleTailDrop(b), h)
+	base := min(bubbleTailBase(b), w)
+	body := h - drop
+	radius := theme.SizeForWidget(theme.SizeNamePadding, b)
+	// The tip is barely softened; rounding it would blunt the tail.
+	tip := min(radius/4, 1)
+	if b.mine {
+		return []fyne.Position{
+			{X: 0, Y: 0},
+			{X: w, Y: 0},
+			{X: w, Y: h},           // the point, below the body, on our side
+			{X: w - base, Y: body}, // the tail flares from here
+			{X: 0, Y: body},
+		}, []float32{radius, radius, tip, 0, radius}
+	}
+	return []fyne.Position{
+		{X: 0, Y: 0},
+		{X: w, Y: 0},
+		{X: w, Y: body},
+		{X: base, Y: body}, // the tail flares from here
+		{X: 0, Y: h},       // the point, below the body, on the sender's side
+	}, []float32{radius, radius, radius, 0, tip}
+}
+
+func (b *bubble) CreateRenderer() fyne.WidgetRenderer {
+	return &bubbleRenderer{b: b}
+}
+
+type bubbleRenderer struct {
+	b    *bubble
+	laid fyne.Size
+}
+
+func (r *bubbleRenderer) Layout(s fyne.Size) {
+	// Parents re-run Layout on every container refresh (each streaming flush
+	// relayouts the whole transcript); re-rasterising an unchanged polygon is
+	// pure CPU burn, so only repaint when the size actually moved.
+	if s == r.laid {
+		return
+	}
+	r.laid = s
+	r.b.shape.FillColor = bubbleFill(r.b.label)
+	r.b.shape.Points, r.b.shape.CornerRadii = r.b.points(s)
+	r.b.shape.Resize(s)
+	canvas.Refresh(r.b.shape)
+}
+
+func (r *bubbleRenderer) MinSize() fyne.Size { return fyne.Size{} }
+
+func (r *bubbleRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.b.shape} }
+
+func (r *bubbleRenderer) Refresh() {
+	r.laid = fyne.Size{}
+	r.Layout(r.b.Size())
+}
+
+func (r *bubbleRenderer) Destroy() {}
+
+// area is one message's text area: the bubble behind, the header/metrics line
+// and the body in front, inset so nothing sits over the tail. It is a real
+// widget, not a bare container wrapper: the GL painter's type-switch handles
+// fyne.Widget and *fyne.Container, and a struct that merely embeds a container
+// matches neither, so it draws nothing on screen while the forgiving software
+// test painter makes it look fine headless.
+type area struct {
+	widget.BaseWidget
+	label  string
+	header *widget.RichText
+	body   fyne.CanvasObject
+	bubble *bubble
+	stack  *fyne.Container
+}
+
+func (a *area) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(a.stack)
+}
+
+// areaColor is each kind's header colour. Headers use the bright theme
+// foreground rather than the bubble's own hue: a tinted fill under
+// same-hue text (blue on blue, amber on amber, disabled-grey on slate) was
+// near-unreadable, and the reference look keeps the header legible above the
+// body while the fill carries the colour. Foreground reads on every tint and
+// is one step brighter than the dimmed body text.
+func areaColor(string) fyne.ThemeColorName { return theme.ColorNameForeground }
+
+// areaCard builds one transcript text area for a message kind: an opaque
+// speech bubble under a header line that names the kind and the message's
+// tokens, generation time and cost, in the body's own font and a kind colour.
+func areaCard(label string, m metrics, body fyne.CanvasObject, align fyne.TextAlign) *area {
+	mine := align == fyne.TextAlignTrailing
+	header := widget.NewRichText(&widget.TextSegment{
+		Text:  cardHeaderText(label, m),
+		Style: widget.RichTextStyle{ColorName: areaColor(label), Alignment: align},
+	})
+	header.Wrapping = fyne.TextWrapWord
+	if rt, ok := body.(*widget.RichText); ok {
+		alignRT(rt, align)
+	}
+	b := newBubble(label, mine)
+	pad := theme.Size(theme.SizeNamePadding)
+	content := container.New(layout.NewCustomPaddedLayout(pad, bubbleTailDrop(b)+pad, pad, pad),
+		container.NewVBox(header, body))
+	a := &area{
+		label:  label,
+		header: header,
+		body:   body,
+		bubble: b,
+		stack:  container.NewStack(b, content),
+	}
+	a.ExtendBaseWidget(a)
+	return a
+}
+
+// cardHeaderText is an area's header: the message kind, then its generated
+// token count, generation time and cost; zero parts are omitted.
+func cardHeaderText(label string, m metrics) string {
+	parts := []string{label}
+	if m.Tokens > 0 {
+		parts = append(parts, fmt.Sprintf("%d tok", m.Tokens))
+	}
+	if m.Elapsed > 0 {
+		parts = append(parts, fmt.Sprintf("%.1fs", m.Elapsed))
+	}
+	if m.Cost > 0 {
+		parts = append(parts, fmt.Sprintf("$%.2f", m.Cost))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// alignRT sets the row alignment of every text segment (user entries trail).
+func alignRT(rt *widget.RichText, align fyne.TextAlign) {
+	if align == fyne.TextAlignLeading {
+		return
+	}
+	for _, s := range rt.Segments {
+		if ts, ok := s.(*widget.TextSegment); ok {
+			st := ts.Style
+			st.Alignment = align
+			ts.Style = st
+		}
+	}
+}
+
+// transcriptGrid renders command lines as a fixed-width block: the columns of
+// `$ cmd` / `in <cwd>` / `exit N` are the point, so it scrolls sideways
+// instead of reflowing. The rows stay in the normal foreground: they sit on
+// the coloured tool-call bubble, where the pane's dim transcript styling
+// would be illegible.
+func transcriptGrid(lines []string) fyne.CanvasObject {
+	tg := widget.NewTextGrid()
+	tg.Append(strings.Join(lines, "\n"))
+	return container.New(transcriptWidthLayout{}, tg)
+}
+
+func exitRT(b block) *widget.RichText {
+	rt := widget.NewRichText(
+		&widget.TextSegment{Text: "✓ " + b.title + "\n", Style: widget.RichTextStyle{ColorName: theme.ColorNameSuccess}},
+		&widget.TextSegment{Text: b.text, Style: dimStyle()})
+	rt.Wrapping = fyne.TextWrapWord
+	return rt
+}
+
+// blockCards renders one transcript entry as the bordered text areas it
+// contains: an assistant turn becomes a "thinking" area and an "LLM output"
+// area, a tool result is a "tool call" grid, and input-box entries are
+// right-justified "user" areas. Notes, errors and the exit marker stay plain
+// rows: they are UI feedback, not message text.
+func blockCards(b block, showThinking bool) []fyne.CanvasObject {
+	if len(b.transcript) > 0 || b.kind == "user" || b.kind == "system" {
+		label, align := messageKindLabel(b)
+		if len(b.transcript) > 0 {
+			return []fyne.CanvasObject{areaCard(label, b.stats, transcriptGrid(b.transcript), align)}
+		}
+		return []fyne.CanvasObject{areaCard(label, b.stats, markdownRT(b.text), align)}
+	}
+	switch b.kind {
+	case "assistant":
+		var cards []fyne.CanvasObject
+		if b.reasoning != "" {
+			// Inside a coloured bubble, foreground text only: the dim styling
+			// the pane uses on the plain background is illegible on the tint.
+			body := plainRT(collapseSpaces(b.reasoning))
+			if !showThinking {
+				body = plainRT(hiddenThinkingMarker(b.reasoning))
+			}
+			cards = append(cards, areaCard("thinking", b.stats, body, fyne.TextAlignLeading))
+		}
+		// A tool-call-only turn has empty content: no prose to show, so emit
+		// no LLM output bubble rather than an empty violet box. The turn's
+		// real output is the tool call result that follows.
+		if b.text != "" {
+			cards = append(cards, areaCard("LLM output", b.stats, markdownRT(b.text), fyne.TextAlignLeading))
+		}
+		return cards
+	case "exit":
+		return []fyne.CanvasObject{exitRT(b)}
+	case "error":
+		return []fyne.CanvasObject{errorRT(b.text)}
+	default: // notes: UI feedback, the session header, command results
+		return []fyne.CanvasObject{dimRT(b.text)}
+	}
+}
+
+// transcriptWidthLayout gives a TextGrid the transcript's width and its own
+// height: command output keeps its columns (the grid's own horizontal bar
+// scrolls when they run past the window) instead of pushing the whole
+// transcript wider than the window.
+type transcriptWidthLayout struct{}
+
+func (transcriptWidthLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
+	for _, c := range o {
+		c.Resize(fyne.NewSize(s.Width, c.MinSize().Height))
+	}
+}
+
+func (transcriptWidthLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
+	h := float32(0)
+	for _, c := range o {
+		if m := c.MinSize().Height; m > h {
+			h = m
+		}
+	}
+	return fyne.NewSize(0, h)
+}
+
+// blockSpacer is the blank row between transcript blocks, the GUI's form of
+// the separating row blockRows appends.
+func blockSpacer() fyne.CanvasObject {
+	s := widget.NewLabel(" ")
+	s.Importance = widget.LowImportance
+	return s
+}
+
+// liveArea is the streaming turn: a bordered area per kind ("thinking" and
+// "LLM output"), each one mutable segment so a chunk costs a re-wrap and
+// nothing else. Markdown is parsed once, on commit - AppendMarkdown documents
+// that one document must not be parsed piecewise. The areas appear as their
+// kinds start streaming; the header gains its metrics when the message lands.
+type liveArea struct {
+	box      *fyne.Container
+	thinking *widget.RichText
+	thinkSeg *widget.TextSegment
+	content  *widget.RichText
+	contSeg  *widget.TextSegment
+}
+
+func newLiveArea() *liveArea {
+	return &liveArea{box: container.NewVBox()}
+}
+
+// setText keeps the mutable segments current (string copies only); the
+// re-wrap happens in refresh, driven by the streamChunk throttle.
+func (l *liveArea) setText(reasoning, content string, show bool) {
+	if reasoning != "" && l.thinking == nil {
+		l.thinkSeg = &widget.TextSegment{}
+		l.thinking = widget.NewRichText(l.thinkSeg)
+		l.thinking.Wrapping = fyne.TextWrapWord
+		l.box.Add(areaCard("thinking", metrics{}, l.thinking, fyne.TextAlignLeading))
+	}
+	if content != "" && l.content == nil {
+		l.contSeg = &widget.TextSegment{}
+		l.content = widget.NewRichText(l.contSeg)
+		l.content.Wrapping = fyne.TextWrapWord
+		l.box.Add(areaCard("LLM output", metrics{}, l.content, fyne.TextAlignLeading))
+	}
+	if l.thinking != nil {
+		if show {
+			l.thinkSeg.Text = collapseSpaces(reasoning)
+		} else {
+			l.thinkSeg.Text = hiddenThinkingMarker(reasoning)
+		}
+	}
+	if l.content != nil {
+		l.contSeg.Text = content
+	}
+}
+
+// refresh repaints the live surfaces (the O(length) word-wrap pass).
+func (l *liveArea) refresh() {
+	if l.thinking != nil {
+		l.thinking.Refresh()
+	}
+	if l.content != nil {
+		l.content.Refresh()
+	}
+}
+
+// -------------------------------------------------------------------- status --
+
+func (v *guiView) refreshStatus() {
+	g := v.gui
+	// Only push strings that actually changed: this runs on every content
+	// change (including the streaming flush), and SetText/SetTitle repaint
+	// the label and the whole window frame.
+	if text := g.RunStats(); text != v.status.Text {
+		v.status.SetText(text)
+	}
+	if title := "mini · " + g.cfg.Mode; title != v.lastTitle {
+		v.lastTitle = title
+		v.win.SetTitle(title)
+	}
+	if running := g.loopRunning(); running != v.wasRunning {
+		v.wasRunning = running
+		// The menu bar draws its dropdowns when opened, so the field alone
+		// carries the state; there is nothing to invalidate.
+		if v.cancelItem != nil {
+			v.cancelItem.Disabled = !running
+		}
+	}
+}
+
+// ---------------------------------------------------------------- questions ---
+
+func (v *guiView) setPanel(objs ...fyne.CanvasObject) {
+	v.panel.Objects = objs
+	if len(objs) == 0 {
+		v.card.Hide()
+	} else {
+		v.card.Show()
+	}
+	v.panel.Refresh()
+	v.card.Refresh()
+}
+
+func (v *guiView) showQuestion(q Question) {
+	v.dialog = ""
+	switch q.Kind {
+	case AskConfirm:
+		tg := widget.NewTextGrid()
+		tg.Append(strings.Join(panelActionLines(q.Actions), "\n"))
+		v.setPanel(plainRT(q.Title), container.New(transcriptWidthLayout{}, tg), dimRT(panelConfirmHint))
+	case AskLimits:
+		v.openDialog("limits")
+		return
+	default: // new-task, human, interruption, task
+		// The shared prompt names ctrl-c (the pane's quit chord); the window
+		// leaves with the native hotkey instead, so say the true key.
+		v.setPanel(plainRT(strings.ReplaceAll(q.Title, "ctrl-c", quitKeyName())))
+	}
+	v.refreshStatus()
+}
+
+// questionResolved hides the panel: the answer came from this goroutine, so
+// there is no message pump that would notice HasQuestion going false.
+func (v *guiView) questionResolved() {
+	v.dialog = ""
+	v.setPanel()
+}
+
+func (v *guiView) hideQuestion() {
+	if v.gui.HasQuestion() {
+		return
+	}
+	v.questionResolved()
+}
+
+const (
+	limitLabelSteps = "New step limit: "
+	limitLabelCost  = "New cost limit: "
+)
+
+func (v *guiView) openDialog(name string) {
+	v.dialog = name
+	v.limitsIdx = 0
+	v.limits = [2]float64{}
+	v.editor.SetText("")
+	switch name {
+	case "limits":
+		v.limitsLabel.SetText(limitLabelSteps)
+		v.setPanel(plainRT(v.gui.PendingQuestion().Title), v.limitsLabel)
+	}
+	v.focusEditor()
+}
+
+// closeDialog dismisses the prompt. A pending question stays pending (there is
+// no give-up answer; giving up means ending the run), so the limits banner
+// hides with its input row and the next submit reopens it, exactly like the
+// pane.
+func (v *guiView) closeDialog() {
+	v.dialog = ""
+	q := v.gui.PendingQuestion()
+	switch {
+	case !v.gui.HasQuestion():
+		v.setPanel()
+	case q.Kind == AskLimits:
+		v.setPanel()
+	default:
+		v.showQuestion(q)
+	}
+	v.focusEditor()
+}
+
+func (v *guiView) submitLimits(value string) {
+	v.limits[v.limitsIdx] = ParseLimitLine(value)
+	if v.limitsIdx == 0 {
+		v.limitsIdx = 1
+		v.limitsLabel.SetText(limitLabelCost)
+		return
+	}
+	v.dialog = ""
+	v.gui.resolve(Answer{NewLimits: true, Steps: int(v.limits[0]), Cost: v.limits[1]})
+}
+
+func (v *guiView) showRunDone() {
+	info, err := v.gui.result()
+	status, _ := info["exit_status"].(string)
+	switch {
+	case err != nil && status == "":
+		v.appendBlock(block{kind: "error", text: "run ended: " + err.Error()})
+		v.appendBlock(block{kind: "note", text: "type /quit or press " + quitKeyName() + " to leave"})
+	default:
+		if status == "" {
+			status = "stopped"
+		}
+		v.appendBlock(block{kind: "note", text: "run finished: " + status})
+		v.gui.app.Quit()
+	}
+	v.refreshStatus()
+}
+
+// esc is the cancel key: it interrupts the command in flight while the agent
+// works and dismisses the limits prompt; at idle it does nothing, because
+// leaving is deliberate - /quit, the native quit hotkey, or closing the
+// window.
+func (v *guiView) esc() {
+	if v.dialog == "limits" {
+		v.closeDialog()
+		return
+	}
+	if v.gui.loopRunning() {
+		v.gui.CancelCurrentTurn()
+		v.noteLocal("cancelling this turn…")
+	}
+}
+
+// ------------------------------------------------------------------ the loop --
+
+// handleInput routes a submitted line to the pending question, or to a new
+// turn. Mirror of tuiModel.handleInput; the answer semantics (RePrompt, mode
+// switches) belong to Interactive, never to the view.
+func (v *guiView) handleInput(text string) {
+	g := v.gui
+	q := g.PendingQuestion()
+	if !g.HasQuestion() {
+		// Input is never dropped: slash commands apply at once (they change
+		// the mode the next prompt will use) and prose is queued as steering,
+		// which lands in the history before the model's next call.
+		if text == quitCommand {
+			g.quit()
+			return
+		}
+		if text == "" {
+			if !g.loopRunning() {
+				v.noteLocal("nothing is waiting for input")
+			}
+			return
+		}
+		if v.commandOrSteer(text) {
+			return
+		}
+		if !g.loopRunning() {
+			v.noteLocal("the run has ended: /quit or " + quitKeyName() + " to leave")
+			return
+		}
+		g.queueSteering(text)
+		v.appendBlock(block{kind: "user", text: text})
+		v.noteLocal("(queued for the model's next turn)")
+		return
+	}
+	switch q.Kind {
+	case AskTask:
+		if text == "" {
+			v.noteLocal("please describe the task")
+			return
+		}
+		g.resolve(Answer{Text: text})
+	case AskLimits:
+		v.openDialog("limits")
+	case AskConfirm:
+		// Empty input confirms; anything else rejects, after slash handling.
+		resolved, reprompt := v.slash(text)
+		if reprompt {
+			return
+		}
+		// Python's match: "" and "/y" both confirm the batch.
+		if resolved == "" || resolved == "/y" {
+			g.resolve(Answer{})
+			return
+		}
+		g.resolve(Answer{Reject: true, Text: resolved})
+	case AskInterrup:
+		g.resolve(Answer{Text: text})
+	default: // new-task, human, interruption
+		if v.commandOrSteer(text) {
+			return
+		}
+		resolved, reprompt := v.slash(text)
+		if reprompt {
+			return
+		}
+		if resolved == "/m" {
+			v.noteLocal(guiMultilineHint)
+			return
+		}
+		g.resolve(Answer{Text: resolved})
+	}
+}
+
+// guiMultilineHint is the GUI's answer to /m: multi-line input is not a mode
+// here, it is a keystroke.
+const guiMultilineHint = "multi-line input is not a mode here: shift+enter adds a newline, enter sends"
+
+// slash applies the /y /c /u /h commands, printing their feedback into the
+// transcript.
+func (v *guiView) slash(text string) (string, bool) {
+	return slash(v.gui.cfg, text, viewWriter{v}, func() string {
+		return text
+	})
+}
+
+type viewWriter struct{ v *guiView }
+
+func (w viewWriter) Write(p []byte) (int, error) {
+	w.v.noteLocal(string(p))
+	return len(p), nil
+}
+
+// commandOrSteer handles the input affordances that work whether or not a
+// prompt is pending: /y /c /u /h /t and /m.
+func (v *guiView) commandOrSteer(text string) bool {
+	switch text {
+	case "/t":
+		v.toggleThinking()
+		return true
+	case "/m":
+		v.noteLocal(guiMultilineHint)
+		return true
+	}
+	if _, isMode := modeCommands[text]; !isMode && text != "/h" {
+		return false
+	}
+	_, reprompt := v.slash(text)
+	_ = reprompt
+	return true
+}
+
+// ---------------------------------------------------------------- chatInput --
+
+// chatInput is the message entry. The input focus never leaves it: dialogs
+// read from here rather than moving focus, so an answer is always typeable.
+type chatInput struct {
+	*widget.Entry
+	v *guiView
+
+	// Modifier state: fyne.KeyEvent carries no modifiers, but KeyDown/KeyUp
+	// report the chord's modifier before TypedKey arrives.
+	shift  bool
+	option bool
+}
+
+func newChatInput(v *guiView) *chatInput {
+	e := widget.NewMultiLineEntry()
+	e.Wrapping = fyne.TextWrapWord
+	e.PlaceHolder = "message · enter sends · shift+enter adds a newline · /h commands"
+	c := &chatInput{Entry: e, v: v}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *chatInput) KeyDown(key *fyne.KeyEvent) {
+	c.Entry.KeyDown(key)
+	switch key.Name {
+	case desktop.KeyShiftLeft, desktop.KeyShiftRight:
+		c.shift = true
+	case desktop.KeyAltLeft, desktop.KeyAltRight: // the macOS Option key
+		c.option = true
+	}
+}
+
+func (c *chatInput) KeyUp(key *fyne.KeyEvent) {
+	c.Entry.KeyUp(key)
+	switch key.Name {
+	case desktop.KeyShiftLeft, desktop.KeyShiftRight:
+		c.shift = false
+	case desktop.KeyAltLeft, desktop.KeyAltRight:
+		c.option = false
+	}
+}
+
+// FocusLost reclaims the caret, the way the pane re-focuses its editor even
+// on Blur: tapping a non-focusable object (a bubble, the scroll bar, blank
+// space) makes Fyne clear canvas focus, and an entry that never gets focus
+// back is the "input box stopped accepting input" bug. Nothing else in this
+// window is focusable, so the input always wins. The reclaim is deferred:
+// FocusLost fires *before* the focus manager records the loss, so an inline
+// Focus(c) would early-return against the still-registered focus.
+func (c *chatInput) FocusLost() {
+	c.Entry.FocusLost()
+	time.AfterFunc(0, func() {
+		c.v.gui.post(func() {
+			if c.v.win.Canvas().Focused() == nil {
+				c.v.win.Canvas().Focus(c)
+			}
+		})
+	})
+}
+
+func (c *chatInput) TypedKey(key *fyne.KeyEvent) {
+	v := c.v
+	if v.dialog == "limits" {
+		switch key.Name {
+		case fyne.KeyReturn, fyne.KeyEnter:
+			value := c.Text
+			c.Entry.SetText("")
+			v.submitLimits(value)
+		case fyne.KeyEscape:
+			v.closeDialog()
+		default:
+			c.Entry.TypedKey(key)
+		}
+		return
+	}
+	switch key.Name {
+	case fyne.KeyEscape:
+		// Never forward: the entry ignores Escape, and it is the run's
+		// always-available cancel.
+		v.esc()
+		return
+	case fyne.KeyReturn, fyne.KeyEnter:
+		// Shift (+ ⌥ on macOS) gives the native newline; enter sends.
+		if c.shift || (isMacOS && c.option) {
+			c.Entry.TypedKey(key)
+		} else {
+			c.submit()
+		}
+		return
+	}
+	c.Entry.TypedKey(key)
+}
+
+func (c *chatInput) TypedRune(r rune) {
+	v := c.v
+	if v.dialog == "limits" {
+		c.Entry.TypedRune(r)
+		return
+	}
+	if r == 'y' && c.Text == "" && v.gui.HasQuestion() && v.gui.PendingQuestion().Kind == AskConfirm {
+		// A bare y confirms an empty editor (TUI parity); anything typed is
+		// the rejection comment.
+		v.gui.resolve(Answer{Text: ""})
+		return
+	}
+	c.Entry.TypedRune(r)
+}
+
+// TypedShortcut intercepts the platform-modifier chords the driver builds
+// before the entry's editing bindings see them. Everything else must go
+// through so copy, paste, undo and word movement keep working.
+func (c *chatInput) TypedShortcut(s fyne.Shortcut) {
+	v := c.v
+	if cs, ok := s.(*desktop.CustomShortcut); ok {
+		switch {
+		case cs.KeyName == fyne.KeyT && cs.Modifier == thinkingMods():
+			v.toggleThinking()
+			return
+		case (cs.KeyName == fyne.KeyReturn || cs.KeyName == fyne.KeyEnter) && cs.Modifier == fyne.KeyModifierShortcutDefault:
+			c.Entry.TypedKey(&fyne.KeyEvent{Name: fyne.KeyReturn}) // native newline
+			return
+		}
+	}
+	c.Entry.TypedShortcut(s)
+}
+
+// submit sends the text. Enter always submits and Shift+Enter (or ⌥Enter on
+// macOS) always inserts a newline at the cursor: multi-line input is a
+// keystroke here, never a mode the user can get stuck in.
+func (c *chatInput) submit() {
+	value := c.Text
+	c.Entry.SetText("")
+	c.v.handleInput(strings.TrimSpace(value))
+}
