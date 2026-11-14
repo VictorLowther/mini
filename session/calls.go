@@ -1,6 +1,7 @@
 package session
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -26,45 +27,62 @@ func turnOf(msg model.Message) (int64, error) {
 	return 0, errors.New("session store: issuing turn not recorded")
 }
 
-// OpenToolCall inserts one call row before the command runs and hands back its
-// open result file, so parallel calls get distinct numbers and a process that
-// dies mid-command leaves an honest status='started' row plus whatever the
-// command had already written.
+// OpenToolCall hands back the call's row and its result file, open for
+// writing. Normally the row already exists: recording the issuing assistant
+// turn allocated the ledger row and its transcript slot together, so the
+// file's whole life - open, partial writes, death - happens inside a
+// transcript that was legal before the command started. A row that is missing
+// is a call no assistant turn issued (a human-mode command): those take the
+// old on-demand path, inserting now and answering in a fresh appended turn,
+// because no slot was pre-allocated for them.
 func (s *Session) OpenToolCall(msg model.Message, idx int, action model.Action) (model.ToolCall, error) {
 	turn, err := turnOf(msg)
 	if err != nil {
 		return model.ToolCall{}, err
 	}
-	// One statement allocates the per-session number, so concurrent
-	// processes cannot collide; next_tcno counts issued calls, hence the
-	// first call is 1 and the files are 1.log, 2.log, …
-	var tcno int
 	now := time.Now().UnixMilli()
-	err = s.store.db.QueryRow(`UPDATE sessions SET next_tcno = next_tcno + 1, updated_at = ? WHERE id = ? RETURNING next_tcno`,
-		now, s.ID.String()).Scan(&tcno)
-	if err != nil {
-		return model.ToolCall{}, fmt.Errorf("session store: allocate tool call: %w", err)
-	}
-	if _, err := s.store.db.Exec(`INSERT INTO tool_calls (session_id, turn, idx, tcno, id, name, command, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		// name is "bash" today, the only tool parseToolCallActions accepts
-		// (model/actions.go:31-35); the column exists so a second tool needs
-		// no migration. id is "" for a human-mode command, which has no
-		// provider tool_call_id.
-		s.ID.String(), turn, idx, tcno, action.ToolCallID, "bash", action.Command, now); err != nil {
-		return model.ToolCall{}, fmt.Errorf("session store: open tool call %d: %w", tcno, err)
+	var tcno int
+	onDemand := false
+	err = s.store.db.QueryRow(`SELECT tcno FROM tool_calls WHERE session_id = ? AND turn = ? AND idx = ?`,
+		s.ID.String(), turn, idx).Scan(&tcno)
+	if errors.Is(err, sql.ErrNoRows) {
+		onDemand = true
+		// One statement allocates the per-session number, so concurrent
+		// processes cannot collide; next_tcno counts issued calls, hence the
+		// first call is 1 and the files are 1.log, 2.log, …
+		if err := s.store.db.QueryRow(`UPDATE sessions SET next_tcno = next_tcno + 1, updated_at = ? WHERE id = ? RETURNING next_tcno`,
+			now, s.ID.String()).Scan(&tcno); err != nil {
+			return model.ToolCall{}, fmt.Errorf("session store: allocate tool call: %w", err)
+		}
+		if _, err := s.store.db.Exec(`INSERT INTO tool_calls (session_id, turn, idx, tcno, id, name, command, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			// name is "bash" today, the only tool parseToolCallActions accepts
+			// (model/actions.go:31-35); the column exists so a second tool needs
+			// no migration. id is "" for a human-mode command, which has no
+			// provider tool_call_id.
+			s.ID.String(), turn, idx, tcno, action.ToolCallID, "bash", action.Command, now); err != nil {
+			return model.ToolCall{}, fmt.Errorf("session store: open tool call %d: %w", tcno, err)
+		}
+	} else if err != nil {
+		return model.ToolCall{}, fmt.Errorf("session store: find tool call: %w", err)
 	}
 	// The file comes after the row, in this order so a failure never leaves
-	// a row pointing at nothing. next_tcno is NOT rolled back: a skipped
-	// number is harmless.
+	// a row pointing at nothing. An on-demand row is deleted again; a slot's
+	// row is not: its transcript placeholder is already committed, and the
+	// ledger is the slot's story whether or not the file ever opens.
+	// next_tcno is NOT rolled back: a skipped number is harmless.
 	path := s.tcrPath(tcno)
 	if err := os.MkdirAll(s.tcrDir(), 0o700); err != nil {
-		s.deleteCallRow(tcno)
+		if onDemand {
+			s.deleteCallRow(tcno)
+		}
 		return model.ToolCall{}, fmt.Errorf("session store: create %s: %w", s.tcrDir(), err)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		s.deleteCallRow(tcno)
+		if onDemand {
+			s.deleteCallRow(tcno)
+		}
 		return model.ToolCall{}, fmt.Errorf("session store: open %s: %w", path, err)
 	}
 	return model.ToolCall{Number: tcno, Path: path, File: f, Action: action}, nil

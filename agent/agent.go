@@ -109,8 +109,9 @@ type Recorder interface {
 	// RecordMessage appends one turn and returns its number.
 	RecordMessage(m model.Message) (turn int64, err error)
 	RecordProgress(cost float64, nCalls int) error
-	// OpenToolCall records that action idx of msg is about to run and returns
-	// the call with its result file open for writing.
+	// OpenToolCall acquires action idx of msg - whose row and transcript slot
+	// the recording of the issuing turn already allocated - and returns the
+	// call with its result file open for writing.
 	OpenToolCall(msg model.Message, idx int, action model.Action) (model.ToolCall, error)
 	// CompleteToolCall closes the call's row with the outcome the loop
 	// measured on the closed file, including the byte offset of the model's
@@ -636,9 +637,10 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		}
 		if err != nil {
 			// Context cancellation: a user interruption, not an observation.
-			// The call row stays status='started' — the honest record that
-			// the command never finished — and gets no observation turn, so
-			// its unset view_offset is never read. Do not complete it.
+			// The call row keeps status='started' - the honest record that the
+			// command never finished - and its pre-allocated slot takes the
+			// padded "action was not executed" observation the addMessages call
+			// below produces, so the transcript stays legal either way.
 			if l.Hooks == nil {
 				return err
 			}

@@ -455,3 +455,159 @@ func TestFindAndList(t *testing.T) {
 		t.Errorf("List project = %+v, %v", rows, err)
 	}
 }
+
+// assertAdjacency enforces the rule a real OpenAI-compatible server enforces
+// with a 400: every tool call in an assistant turn is answered - exactly
+// once, immediately, and by nothing else - in the following block of tool
+// rows.
+func assertAdjacency(t *testing.T, msgs []model.Message) {
+	t.Helper()
+	for i, m := range msgs {
+		raw, _ := m["tool_calls"].([]any)
+		if m["role"] != "assistant" || len(raw) == 0 {
+			continue
+		}
+		want := map[string]int{}
+		for _, tc := range raw {
+			if id, _ := tc.(map[string]any)["id"].(string); id != "" {
+				want[id]++
+			}
+		}
+		j := i + 1
+		seen := map[string]int{}
+		for ; j < len(msgs) && msgs[j]["role"] == "tool"; j++ {
+			id, _ := msgs[j]["tool_call_id"].(string)
+			seen[id]++
+		}
+		if len(seen) != len(raw) {
+			for _, tc := range raw {
+				id, _ := tc.(map[string]any)["id"].(string)
+				if seen[id] != 1 {
+					t.Errorf("assistant %d: call %s answered %d times (block of %d tool rows)", i, id, seen[id], j-i-1)
+				}
+			}
+		}
+	}
+}
+
+// An assistant turn is recorded together with its answers: before the first
+// command has even started, the transcript is a legal chat-completions
+// history, because every call owns a slot that holds an honest aborted
+// observation until the real one arrives - and then holds the real one at the
+// same seq, so completion cannot reorder history.
+func TestSlotsMakeHistoryLegalAtEveryInstant(t *testing.T) {
+	st, _ := openStore(t)
+	sess := newSession(t, st)
+	record(t, sess, model.Message{"role": "system", "content": "sys"})
+	asst := model.Message{
+		"role":    "assistant",
+		"content": "",
+		"extra": map[string]any{"actions": []model.Action{
+			{Command: "one", ToolCallID: "call_1"},
+			{Command: "two", ToolCallID: "call_2"},
+		}},
+		"tool_calls": []map[string]any{
+			{"id": "call_1", "type": "function", "function": map[string]any{"name": "bash", "arguments": `{"command":"one"}`}},
+			{"id": "call_2", "type": "function", "function": map[string]any{"name": "bash", "arguments": `{"command":"two"}`}},
+		},
+	}
+	record(t, sess, asst)
+
+	// This is what a SIGKILL leaves behind, and it is already legal.
+	msgs, err := sess.Transcript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("transcript = %d rows, want the 2 turns plus 2 slots", len(msgs))
+	}
+	assertAdjacency(t, msgs)
+	for _, slot := range msgs[2:] {
+		ex := slot["extra"].(map[string]any)
+		if ex["aborted"] != true {
+			t.Errorf("unfilled slot lacks its marker: %v", ex)
+		}
+		if p, _ := ex["tcr_path"].(string); p != "" {
+			t.Errorf("unfilled slot names a result file that was never written: %q", p)
+		}
+	}
+
+	// Call 1 executes and completes; its observation fills its slot in place.
+	tc1, err := sess.OpenToolCall(asst, 0, model.Action{Command: "one", ToolCallID: "call_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc1.File.WriteString("1\n")
+	tc1.File.Sync()
+	tc1.File.Close()
+	if err := sess.CompleteToolCall(tc1, model.ToolOutcome{Bytes: 2, ReturnCode: 0, CWD: "/w"}); err != nil {
+		t.Fatal(err)
+	}
+	slotSeq := msgs[2]["extra"].(map[string]any)["turn"].(int64)
+	obsSeq := record(t, sess, model.Message{"role": "tool", "content": `{"returncode": 0}`,
+		"tool_call_id": "call_1",
+		"extra":        map[string]any{"command": "one", "returncode": 0, "tcno": tc1.Number}})
+	if obsSeq != slotSeq {
+		t.Errorf("observation took seq %d, want its slot %d: fills must not append", obsSeq, slotSeq)
+	}
+
+	// Call 2's batch was interrupted before it opened a file: its padded
+	// observation carries no tcno and fills by tool_call_id instead.
+	record(t, sess, model.Message{"role": "tool", "content": `{"returncode": -1}`,
+		"tool_call_id": "call_2",
+		"extra":        map[string]any{"command": "two", "returncode": -1, "exception_info": "action was not executed"}})
+
+	msgs, err = sess.Transcript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("transcript grew to %d rows under fills, want 4", len(msgs))
+	}
+	assertAdjacency(t, msgs)
+	for _, row := range msgs[2:] {
+		ex := row["extra"].(map[string]any)
+		if ex["aborted"] == true {
+			t.Errorf("filled slot kept its marker: %v", ex)
+		}
+	}
+	// The completed call's row still carries its execution facts and the
+	// joined view; the interrupted one stays 'started' with result_turn on
+	// its (now filled) slot.
+	var st1, st2 string
+	var rt2 int64
+	st.db.QueryRow(`SELECT status FROM tool_calls WHERE id = 'call_1'`).Scan(&st1)
+	st.db.QueryRow(`SELECT status, result_turn FROM tool_calls WHERE id = 'call_2'`).Scan(&st2, &rt2)
+	if st1 != "completed" {
+		t.Errorf("call_1 status = %q", st1)
+	}
+	if st2 != "started" || rt2 != slotSeq+1 {
+		t.Errorf("call_2 = (%q, result_turn %d), want (started, %d)", st2, rt2, slotSeq+1)
+	}
+}
+
+// A model that issues actions without a provider tool_calls array (the test
+// models' shape) gets the array materialized at record time, so replaying a
+// resumed transcript sends the same calls the slots answer.
+func TestActionsMaterializeTheirCallArray(t *testing.T) {
+	st, _ := openStore(t)
+	sess := newSession(t, st)
+	asst := model.Message{"role": "assistant", "content": "",
+		"extra": map[string]any{"actions": []model.Action{{Command: "echo hi", ToolCallID: "c1"}}}}
+	if _, err := sess.RecordMessage(asst); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := asst["tool_calls"]; !ok {
+		t.Fatal("the shared message map should have learned its wire array")
+	}
+	var blob string
+	st.db.QueryRow(`SELECT tool_calls FROM turns WHERE role = 'assistant'`).Scan(&blob)
+	if !strings.Contains(blob, `"id":"c1"`) || !strings.Contains(blob, "echo hi") {
+		t.Errorf("stored array = %s", blob)
+	}
+	msgs, err := sess.Transcript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAdjacency(t, msgs)
+}

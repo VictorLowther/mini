@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/ncruces/go-sqlite3/driver"
 
+	"github.com/VictorLowther/mini/model"
 	"github.com/VictorLowther/mini/session"
 )
 
@@ -321,6 +322,62 @@ func TestResumeContinuesSession(t *testing.T) {
 	}
 	if !found {
 		t.Error("resumed run did not record the new task message")
+	}
+}
+
+// A process killed mid-command leaves an assistant turn whose call never
+// completed. Because recording pre-allocated the call's slot, the transcript
+// is already a legal history - the slot answers with the aborted observation -
+// and -r rebuilds a conversation a strict server accepts. Before slots, the
+// dangling tool_calls poisoned the session: every resume 400'd and appended
+// its own exit row over the same hole.
+func TestResumeAfterMidCommandCrash(t *testing.T) {
+	stateDir, traj := cliEnv(t, "")
+	// The fixture server must be built before repoDir chdirs the test into
+	// the scratch repo: the scripts are read by relative path.
+	var wire [][]string
+	srv := serveFixtures(t, &wire, "toolcall.sse", "submit.sse")
+	defer srv.Close()
+	repo := repoDir(t)
+
+	st, err := session.Open(filepath.Join(stateDir, "sessions.db"), filepath.Join(stateDir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, proj := projectOf(repo)
+	sess, err := st.Create(session.Row{ID: uuid.NewV7(), Workdir: repo, Project: proj, ModelName: "test-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []model.Message{
+		{"role": "system", "content": "sys"},
+		{"role": "user", "content": "hang on"},
+		{"role": "assistant", "content": "", "tool_calls": []map[string]any{
+			{"id": "call_hang", "type": "function",
+				"function": map[string]any{"name": "bash", "arguments": `{"command":"sleep 99"}`}},
+		}, "extra": map[string]any{"actions": []model.Action{{Command: "sleep 99", ToolCallID: "call_hang"}}}},
+	} {
+		if _, err := sess.RecordMessage(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+
+	if code := runCLI(t, srv.URL, "second task", traj, "-r", sess.ID.String()[:8]); code != 0 {
+		t.Fatalf("resume after a crash exited %d", code)
+	}
+	if len(wire) == 0 {
+		t.Fatal("the resumed run never queried the model")
+	}
+	first := wire[0]
+	want := []string{"system", "user", "assistant", "tool", "user"}
+	if len(first) != len(want) {
+		t.Fatalf("resumed request roles = %v, want %v", first, want)
+	}
+	for i, w := range want {
+		if first[i] != w {
+			t.Fatalf("resumed request roles = %v, want %v", first, want)
+		}
 	}
 }
 
