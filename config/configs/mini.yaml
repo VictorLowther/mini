@@ -1,4 +1,15 @@
 agent:
+  # Compaction (docs/compaction-research.md §4): the live context is
+  # append-only; near the trigger the loop asks the model to checkpoint its
+  # own conversation in one cache-reading side-query, and the projected
+  # context restarts at [prompt plumbing + summary + compact_keep_tokens of
+  # verbatim tail]. context_window is what the server actually runs - set it
+  # to the YaRN-extended extent when you serve beyond native; 0 disables
+  # automatic compaction (manual /compact still works).
+  context_window: 262144
+  compact_threshold_ratio: 0.9
+  compact_keep_tokens: 40000
+  compact_summary_max_tokens: 16384
   system_template: |
     You are a helpful assistant that can interact with a computer.
 

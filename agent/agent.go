@@ -39,6 +39,19 @@ type Config struct {
 	Mode             string
 	WhitelistActions []string
 	ConfirmExit      bool
+
+	// Compaction (see docs/compaction-research.md §4 and agent/compaction.go):
+	// the live context is append-only; a summary event fires near the edge of
+	// the window, reads the warm prompt cache, and anchors the new projection.
+	// ContextWindow is what the server actually runs - native extent, or the
+	// YaRN-extended one; 0 disables automatic compaction (crush's rule for
+	// models whose window is unknown). 0 < CompactThresholdRatio <= 1 picks
+	// the trigger point; CompactKeepTokens is the verbatim tail budget.
+	ContextWindow           int
+	CompactEnabled          bool
+	CompactThresholdRatio   float64
+	CompactKeepTokens       int
+	CompactSummaryMaxTokens int
 }
 
 // ConfigFromMap builds the agent section, with the upstream defaults.
@@ -54,6 +67,11 @@ func ConfigFromMap(m map[string]any) *Config {
 		Mode:                       config.String(m, "mode", "confirm"),
 		WhitelistActions:           config.StringSlice(m, "whitelist_actions"),
 		ConfirmExit:                config.Bool(m, "confirm_exit", true),
+		ContextWindow:              config.Int(m, "context_window", 0),
+		CompactEnabled:             config.Bool(m, "compact_enabled", true),
+		CompactThresholdRatio:      config.Float(m, "compact_threshold_ratio", 0.9),
+		CompactKeepTokens:          config.Int(m, "compact_keep_tokens", 40000),
+		CompactSummaryMaxTokens:    config.Int(m, "compact_summary_max_tokens", 16384),
 	}
 }
 
@@ -74,6 +92,11 @@ func (c *Config) Dump() map[string]any {
 		"mode":                          c.Mode,
 		"whitelist_actions":             c.WhitelistActions,
 		"confirm_exit":                  c.ConfirmExit,
+		"context_window":                c.ContextWindow,
+		"compact_enabled":               c.CompactEnabled,
+		"compact_threshold_ratio":       c.CompactThresholdRatio,
+		"compact_keep_tokens":           c.CompactKeepTokens,
+		"compact_summary_max_tokens":    c.CompactSummaryMaxTokens,
 	}
 }
 
@@ -153,6 +176,15 @@ type Loop struct {
 	// turn is rendered, because the trajectory written after every step
 	// reads the result files back.
 	scratchDir string
+
+	// Compaction state (see compaction.go). Everything except manualCompact
+	// belongs to the agent goroutine; manualCompact is the UI's cross-goroutine
+	// request, guarded by mu.
+	manualCompact  bool
+	compactFails   int
+	autoCompactOff bool
+	overflowBudget int
+	lastCtxTokens  int
 }
 
 // scratchToolCall is the no-store fallback: an anonymous temp file in the
@@ -197,6 +229,9 @@ type Snapshot struct {
 	Cost           float64
 	ModelTokens    int
 	ModelTokPerSec float64
+	// CtxTokens estimates the projected context at the last model call, the
+	// number behind the footer's ctx% and the compaction trigger.
+	CtxTokens int
 }
 
 func (l *Loop) publish() {
@@ -323,6 +358,13 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	}
 	l.start = time.Now()
 	l.extraVars = map[string]any{"task": task}
+	// Compaction state is per run: the breaker and the reactive budget
+	// restart, and a stale /compact request from a previous run must not
+	// fire.
+	l.compactFails = 0
+	l.autoCompactOff = false
+	l.overflowBudget = maxOverflowCompactions
+	l.manualCompact = false
 	for _, kw := range kwargs {
 		for k, v := range kw {
 			l.extraVars[k] = v
@@ -516,15 +558,39 @@ func (l *Loop) Query(ctx context.Context) (model.Message, error) {
 		}
 	}
 	l.NCalls++
+	// Project (and compact first if the projection outgrew its trigger) right
+	// here: every step passes this point, which is what makes the trigger
+	// tool-loop-mid-run instead of only between user prompts.
+	proj, est := l.prepareContext(ctx)
 	// Publish before the call so a UI streaming this turn labels it with the
 	// step it belongs to, instead of the previous one.
+	l.pending.CtxTokens = est
 	l.publish()
-	msg, err := l.Model.Query(ctx, l.Messages, l.Handler)
+	msg, err := l.Model.Query(ctx, proj, l.Handler)
+	if err != nil && model.IsContextOverflow(err) && l.overflowBudget > 0 {
+		// The reactive path: the server itself said the prompt did not fit.
+		// Compact once (forced, breaker aside) and retry this call once; if it
+		// still does not fit, the error is the run's to report (pi's one-shot
+		// recovery, budgeted across the run because sushi does not evict the
+		// cache between attempts).
+		l.overflowBudget--
+		l.logger().Warn("server rejected the prompt as too large; forcing compaction", "err", err, "remaining_attempts", l.overflowBudget)
+		if l.compact(ctx, proj, est, true) {
+			proj = model.ProjectContext(l.Messages)
+			est, _ = model.ContextTokens(proj)
+			l.lastCtxTokens = est
+			l.pending.CtxTokens = est
+			msg, err = l.Model.Query(ctx, proj, l.Handler)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	l.Cost += config.Float(model.Extra(msg), "cost", 0)
 	l.pending = progressOf(l.NCalls, l.Cost, msg)
+	// progressOf built a fresh Snapshot; the estimate is not in a reply's
+	// usage until this call's is folded in next step.
+	l.pending.CtxTokens = est
 	l.publish()
 	l.addMessages(msg)
 	return msg, nil

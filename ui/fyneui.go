@@ -427,7 +427,7 @@ func (g *GUI) AssistantHeader() string {
 
 // RunStats renders the footer.
 func (g *GUI) RunStats() string {
-	return runStatsText(g.snapshot(), g.cfg.Mode, g.showReasoning())
+	return runStatsText(g.snapshot(), g.cfg.Mode, g.showReasoning(), g.cfg.ContextWindow)
 }
 
 func (g *GUI) snapshot() agent.Snapshot {
@@ -450,6 +450,13 @@ func (g *GUI) menus() *fyne.MainMenu {
 	})
 	g.v.cancelItem = cancel
 	run.Items = append(run.Items, cancel)
+	run.Items = append(run.Items, fyne.NewMenuItem("Compact now", func() {
+		if !g.loopRunning() {
+			return
+		}
+		g.loop.RequestCompaction()
+		g.v.noteLocal("compaction armed: runs before the model's next turn")
+	}))
 	run.Items = append(run.Items, fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Quit", g.quit))
 	quit := run.Items[len(run.Items)-1]

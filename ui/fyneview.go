@@ -1089,6 +1089,10 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		return cards
 	case "exit":
 		return []fyne.CanvasObject{exitRT(b)}
+	case "compaction":
+		// Its own card, in the transcript's flow: the session's story keeps
+		// one continuous scroll across the boundary.
+		return []fyne.CanvasObject{areaCard(b.title, metrics{}, mdBody(b.text), fyne.TextAlignLeading)}
 	case "error":
 		return []fyne.CanvasObject{errorRT(b.text)}
 	default: // notes: UI feedback, the session header, command results
@@ -1461,8 +1465,14 @@ func (v *guiView) handleInput(text string) {
 const guiMultilineHint = "multi-line input is not a mode here: shift+enter adds a newline, enter sends"
 
 // slash applies the /y /c /u /h commands, printing their feedback into the
-// transcript.
+// transcript. /compact is intercepted here too: at a pending prompt the
+// shared slash handling would otherwise feed it to the answer path (a
+// rejection comment at the confirm panel, a new task at the exit panel).
 func (v *guiView) slash(text string) (string, bool) {
+	if text == "/compact" {
+		v.requestCompaction()
+		return "", true
+	}
 	return slash(v.gui.cfg, text, viewWriter{v}, func() string {
 		return text
 	})
@@ -1476,7 +1486,7 @@ func (w viewWriter) Write(p []byte) (int, error) {
 }
 
 // commandOrSteer handles the input affordances that work whether or not a
-// prompt is pending: /y /c /u /h /t and /m.
+// prompt is pending: /y /c /u /h /t /compact and /m.
 func (v *guiView) commandOrSteer(text string) bool {
 	switch text {
 	case "/t":
@@ -1485,6 +1495,9 @@ func (v *guiView) commandOrSteer(text string) bool {
 	case "/m":
 		v.noteLocal(guiMultilineHint)
 		return true
+	case "/compact":
+		v.requestCompaction()
+		return true
 	}
 	if _, isMode := modeCommands[text]; !isMode && text != "/h" {
 		return false
@@ -1492,6 +1505,21 @@ func (v *guiView) commandOrSteer(text string) bool {
 	_, reprompt := v.slash(text)
 	_ = reprompt
 	return true
+}
+
+// requestCompaction arms the loop's manual compaction; the event itself runs
+// on the agent goroutine before the next model call, never from the toolkit
+// thread (compaction is an LLM call; the toolkit loop must not hold it).
+func (v *guiView) requestCompaction() {
+	if v.gui.loop == nil {
+		return
+	}
+	if !v.gui.loop.Running() {
+		v.noteLocal("the agent is not running: nothing to compact")
+		return
+	}
+	v.gui.loop.RequestCompaction()
+	v.noteLocal("compaction armed: the earlier context will be summarized into a card before the model's next turn")
 }
 
 // ---------------------------------------------------------------- chatInput --

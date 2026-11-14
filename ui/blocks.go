@@ -88,8 +88,29 @@ func messageBlock(m model.Message, header, task string, clearStream func()) (b b
 		extra, _ := m["extra"].(map[string]any)
 		status, _ := extra["exit_status"].(string)
 		b.title = status
+	case "compaction":
+		// The visual transcript never restarts (omp's divider lesson): the
+		// anchor shows as its own card carrying the summary, and the tokens it
+		// traded away ride in the title.
+		extra, _ := m["extra"].(map[string]any)
+		b.title = compactionTitle(extra)
 	}
 	return b, true, false
+}
+
+// compactionTitle is the compaction card's header: what it traded, and which
+// model wrote the summary.
+func compactionTitle(extra map[string]any) string {
+	before := asIntDefault(extra["tokens_before"])
+	after := asIntDefault(extra["tokens_after"])
+	title := "context compacted"
+	if before > 0 && after > 0 {
+		title = fmt.Sprintf("context compacted · %dk → %dk tok", before/1000, after/1000)
+	}
+	if via, _ := extra["compaction_model"].(string); via != "" {
+		title += " · " + via
+	}
+	return title
 }
 
 // assistantHeader and runStatsText are the shared string shapes every
@@ -102,7 +123,7 @@ func retryNotice(attempt, max int, err error, wait time.Duration) string {
 	return fmt.Sprintf("model call failed (attempt %d/%d), retrying in %s: %v", attempt, max, wait.Round(time.Second), err)
 }
 
-func runStatsText(snap agent.Snapshot, mode string, thinking bool) string {
+func runStatsText(snap agent.Snapshot, mode string, thinking bool, contextWindow int) string {
 	parts := []string{fmt.Sprintf("step %d", snap.Calls), fmt.Sprintf("$%.2f", snap.Cost), mode,
 		map[bool]string{true: "thinking: on", false: "thinking: off"}[thinking]}
 	if snap.ModelTokens > 0 {
@@ -110,6 +131,17 @@ func runStatsText(snap agent.Snapshot, mode string, thinking bool) string {
 	}
 	if snap.ModelTokPerSec > 0 {
 		parts = append(parts, fmt.Sprintf("%.1f tok/s", snap.ModelTokPerSec))
+	}
+	// The compaction trigger's number, shown before the model's own stats:
+	// this is the one that decides whether the next turn re-reads a warm
+	// prefix or walks toward a compaction.
+	if contextWindow > 0 && snap.CtxTokens > 0 {
+		pct := 100 * snap.CtxTokens / contextWindow
+		part := fmt.Sprintf("ctx %dk (%d%%)", snap.CtxTokens/1000, pct)
+		if pct >= 100 {
+			part = fmt.Sprintf("ctx %dk OVER", snap.CtxTokens/1000)
+		}
+		parts = append(parts, part)
 	}
 	return strings.Join(parts, "  ·  ")
 }

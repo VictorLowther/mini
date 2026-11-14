@@ -116,6 +116,20 @@ type Model interface {
 	Serialize() map[string]any
 }
 
+// Summarizer is what compaction asks of a model on top of Model: given the
+// exact projected context plus one directive turn, return the summary text.
+// Sushi implements it by riding the main request's prefix - the warmed prompt
+// cache reads the whole conversation, so the compaction event costs the
+// directive's prefill and the summary's decode, never a re-read of the
+// session. Models without it (tests, unusual backends) simply never
+// summarize: the loop logs and moves on.
+type Summarizer interface {
+	// Summarize returns the summary text. It is an error (not a truncated
+	// success) when the reply ran out of output budget or reached for a tool
+	// instead of writing prose.
+	Summarize(ctx context.Context, msgs []Message, directive string, maxTokens int) (string, error)
+}
+
 // Extra returns (creating if needed) a message's extra map.
 func Extra(m Message) map[string]any {
 	if e, ok := m["extra"].(map[string]any); ok {

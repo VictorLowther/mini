@@ -126,7 +126,7 @@ func (p *Print) Message(m model.Message) {
 		}
 		return
 	}
-	if role == "user" || role == "tool" || role == "exit" {
+	if role == "user" || role == "tool" || role == "exit" || role == "compaction" {
 		fmt.Fprintf(p.Out, "\n%s:\n", capitalize(role))
 		fmt.Fprintln(p.Out, content)
 	}

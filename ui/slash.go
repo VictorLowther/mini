@@ -24,6 +24,7 @@ const helpText = `/y to switch to yolo mode (execute LM commands without confirm
 /u to switch to human mode (execute commands issued by the user)
 /m to enter multiline comment
 /t to show or hide the model's thinking text
+/compact to summarize the earlier context into a card before the model's next turn
 /quit to leave when the agent is ready (empty enter re-asks, never quits)`
 
 // promptLine is the "> " input marker.

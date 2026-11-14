@@ -138,28 +138,117 @@ func abortOn(status int, errType string) bool {
 // with its parsed actions in extra. Control-flow conditions come back as
 // *Interrupt; transient failures are retried (rule 9) and then returned.
 func (s *Sushi) Query(ctx context.Context, msgs []Message, h *Handler) (Message, error) {
-	body := s.requestBody(msgs)
+	payload, err := s.payloadFor(s.requestBody(msgs))
+	if err != nil {
+		return nil, err
+	}
+	stream, elapsed, err := s.retryStream(ctx, payload, h, s.retryMax())
+	if err != nil {
+		return nil, err
+	}
+	cost := s.cost(stream.usage)
+	GLOBAL_STATS.Add(cost, stream.totalTokens())
+	msg := stream.assistant()
+	extra := Extra(msg)
+	extra["response"] = stream.response
+	extra["cost"] = cost
+	extra["timestamp"] = float64(time.Now().UnixMilli()) / 1000
+	// Generation time for the successful attempt: the UIs' per-message header
+	// (retry waits are deliberately excluded - they are announced separately).
+	extra["elapsed_seconds"] = elapsed.Seconds()
+	if u, ok := stream.response["usage"]; ok {
+		extra["model_stats"] = u
+	}
+	actions, err := parseToolCallActions(stream.toolCalls, s.ErrTemplate, map[string]any{
+		"finish_reason": stream.finishReason,
+	})
+	if err != nil {
+		// Rule 8: the FormatError message must carry the cost and the raw
+		// response, because the call was billed before parsing failed.
+		if ie, ok := err.(*Interrupt); ok && len(ie.Messages) > 0 {
+			e := Extra(ie.Messages[0])
+			e["cost"] = cost
+			e["response"] = stream.response
+		}
+		return nil, err
+	}
+	extra["actions"] = actions
+	return msg, nil
+}
+
+// Summarize is the compaction side-query: the SAME projected context the
+// next real turn will send, plus one directive user turn, so the request's
+// entire prefix hits the server's warmed prompt cache - at mini's scale that
+// is the difference between a compaction costing a full-session prefill and
+// costing the directive's few dozen tokens. The reply must be prose: a tool
+// call or an output-limited cut is a failure, never a half-summary.
+//
+// The retry budget is deliberately smaller than Query's: a summarize call
+// that keeps failing is compaction's problem to report, not the run's to
+// stall on.
+func (s *Sushi) Summarize(ctx context.Context, msgs []Message, directive string, maxTokens int) (string, error) {
+	all := make([]Message, 0, len(msgs)+1)
+	all = append(all, msgs...)
+	all = append(all, Message{"role": "user", "content": directive})
+	body := s.requestBody(all)
+	if maxTokens > 0 {
+		body["max_tokens"] = maxTokens
+	}
+	payload, err := s.payloadFor(body)
+	if err != nil {
+		return "", err
+	}
+	stream, _, err := s.retryStream(ctx, payload, nil, min(s.retryMax(), 3))
+	if err != nil {
+		return "", err
+	}
+	if len(stream.toolCalls) > 0 {
+		return "", &APIError{Message: "the summary request answered with a tool call instead of prose", Retryable: false}
+	}
+	if stream.finishReason == "length" {
+		// A cut-off summary is a trap: it reads complete and is not. qwen-code
+		// learned this the hard way; mini drops the whole attempt instead.
+		return "", &APIError{Message: "the summary hit its output token limit before finishing", Retryable: false}
+	}
+	text := strings.TrimSpace(stream.content.String())
+	if text == "" {
+		return "", &APIError{Message: "the summary request returned no text", Retryable: false}
+	}
+	return text, nil
+}
+
+func (s *Sushi) payloadFor(body map[string]any) ([]byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("encoding request: %w", err)
 	}
+	return payload, nil
+}
+
+// retryStream is the one POST-and-accumulate loop behind both Query and
+// Summarize: transient failures back off and retry up to maxAttempts,
+// litellm-style aborts and the caller's context cancellation end it, and a
+// nil Handler means "stream but show nobody". The duration returned is the
+// successful attempt's own generation time, retry waits excluded.
+func (s *Sushi) retryStream(ctx context.Context, payload []byte, h *Handler, maxAttempts int) (*stream, time.Duration, error) {
 	for attempt := 0; ; attempt++ {
-		msg, err := s.attempt(ctx, payload, h)
+		started := time.Now()
+		stream, err := s.attempt(ctx, payload, h)
 		var interrupt *Interrupt
 		if errors.As(err, &interrupt) || err == nil {
-			return msg, err
+			return stream, time.Since(started), err
 		}
-		if ctx.Err() != nil || attempt+1 >= s.retryMax() {
-			return nil, err
+		if ctx.Err() != nil || attempt+1 >= maxAttempts {
+			return nil, 0, err
 		}
 		var api *APIError
 		if errors.As(err, &api) && !api.Retryable {
-			return nil, err // litellm's abort_exceptions: retrying cannot fix this
+			return nil, 0, err // litellm's abort_exceptions: retrying cannot fix this
 		}
 		wait := s.wait(attempt)
-		slog.Warn("model query failed, retrying", "attempt", attempt+1, "max_attempts", s.retryMax(), "err", err, "wait", wait.String())
+		slog.Warn("model query failed, retrying", "attempt", attempt+1, "max_attempts", maxAttempts, "err", err, "wait", wait.String())
 		if s.OnRetry != nil {
-			s.OnRetry(attempt+1, s.retryMax(), err, wait)
+			s.OnRetry(attempt+1, maxAttempts, err, wait)
 		}
 		timer := time.NewTimer(wait)
 		select {
@@ -167,21 +256,17 @@ func (s *Sushi) Query(ctx context.Context, msgs []Message, h *Handler) (Message,
 			timer.Stop()
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
 	}
 }
 
 func (s *Sushi) requestBody(msgs []Message) map[string]any {
 	prepared := make([]Message, 0, len(msgs))
-	for _, m := range msgs {
-		// Exit rows are transcript bookkeeping - how a run ended, kept for
-		// the UI and the trajectory - not model context. A live run never
-		// queries past one, but a resumed run carries them inside the seeded
-		// history, and no OpenAI-compatible server accepts role "exit".
-		if role, _ := m["role"].(string); role == "exit" {
-			continue
-		}
+	for _, m := range ProjectContext(msgs) {
+		// ProjectContext has already dropped exit rows (transcript
+		// bookkeeping, no server accepts role "exit") and turned any
+		// compaction rows into their synthesized summaries.
 		c := make(Message, len(m))
 		for k, v := range m {
 			if k != "extra" {
@@ -212,8 +297,7 @@ func (s *Sushi) requestBody(msgs []Message) map[string]any {
 	return body
 }
 
-func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (Message, error) {
-	started := time.Now()
+func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (*stream, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.BaseURL+"/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -229,39 +313,7 @@ func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (Messag
 	if res.StatusCode != http.StatusOK {
 		return nil, readError(res)
 	}
-	stream, err := readStream(res.Body, h)
-	if err != nil {
-		return nil, err
-	}
-
-	cost := s.cost(stream.usage)
-	GLOBAL_STATS.Add(cost, stream.totalTokens())
-	msg := stream.assistant()
-	extra := Extra(msg)
-	extra["response"] = stream.response
-	extra["cost"] = cost
-	extra["timestamp"] = float64(time.Now().UnixMilli()) / 1000
-	// Generation time for the successful attempt: the UIs' per-message header
-	// (retry waits are deliberately excluded - they are announced separately).
-	extra["elapsed_seconds"] = time.Since(started).Seconds()
-	if u, ok := stream.response["usage"]; ok {
-		extra["model_stats"] = u
-	}
-	actions, err := parseToolCallActions(stream.toolCalls, s.ErrTemplate, map[string]any{
-		"finish_reason": stream.finishReason,
-	})
-	if err != nil {
-		// Rule 8: the FormatError message must carry the cost and the raw
-		// response, because the call was billed before parsing failed.
-		if ie, ok := err.(*Interrupt); ok && len(ie.Messages) > 0 {
-			e := Extra(ie.Messages[0])
-			e["cost"] = cost
-			e["response"] = stream.response
-		}
-		return nil, err
-	}
-	extra["actions"] = actions
-	return msg, nil
+	return readStream(res.Body, h)
 }
 
 func (s *Sushi) client() *http.Client {

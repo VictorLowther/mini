@@ -28,7 +28,21 @@ type Deterministic struct {
 	ObsTemplate string
 	ErrTemplate string
 
-	current int
+	// Summaries are the canned replies to the compaction side-query,
+	// consumed in order by Summarize; running out is an error the same way
+	// running out of Outputs is.
+	Summaries []string
+
+	// Queries records the message slice handed to each Query, and
+	// SummarizeQueries the slice handed to each Summarize, so tests can
+	// assert on the exact context the loop sent - including that a
+	// summarize request is the live prefix plus one directive turn.
+	Queries             [][]Message
+	SummarizeQueries    [][]Message
+	SummarizeDirectives []string
+
+	current        int
+	summaryCurrent int
 }
 
 // NewDeterministic builds a replay model from (content, commands) pairs, the
@@ -68,7 +82,8 @@ func mustJSONString(v any) string {
 }
 
 // Query returns the next canned message.
-func (d *Deterministic) Query(_ context.Context, _ []Message, _ *Handler) (Message, error) {
+func (d *Deterministic) Query(_ context.Context, msgs []Message, _ *Handler) (Message, error) {
+	d.Queries = append(d.Queries, msgs)
 	if d.current >= len(d.Outputs) {
 		return nil, fmt.Errorf("deterministic model ran out of outputs after %d calls", len(d.Outputs))
 	}
@@ -77,7 +92,7 @@ func (d *Deterministic) Query(_ context.Context, _ []Message, _ *Handler) (Messa
 	extra := Extra(out)
 	retry := processTestActions(ActionsOf(out))
 	if retry {
-		return d.Query(context.Background(), nil, nil)
+		return d.Query(context.Background(), msgs, nil)
 	}
 	if raise, ok := extra["raise"].(string); ok {
 		return nil, errors.New(raise)
@@ -136,6 +151,23 @@ func processTestActions(actions []Action) bool {
 		}
 	}
 	return false
+}
+
+// Summarize replays a canned summary, recording the exact context it was
+// given: the cache-reading property of the real side-query is asserted
+// against that recording in the compaction tests.
+func (d *Deterministic) Summarize(_ context.Context, msgs []Message, directive string, _ int) (string, error) {
+	d.SummarizeQueries = append(d.SummarizeQueries, msgs)
+	d.SummarizeDirectives = append(d.SummarizeDirectives, directive)
+	if d.summaryCurrent >= len(d.Summaries) {
+		return "", fmt.Errorf("deterministic model ran out of summaries after %d calls", len(d.Summaries))
+	}
+	out := d.Summaries[d.summaryCurrent]
+	d.summaryCurrent++
+	if out == "" {
+		return "", fmt.Errorf("deterministic summary was empty")
+	}
+	return out, nil
 }
 
 func (d *Deterministic) FormatObservations(msg Message, results []env.Result, tvars map[string]any) []Message {
