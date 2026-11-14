@@ -662,6 +662,55 @@ func TestGUISteeringLandsInTheHistory(t *testing.T) {
 	}
 }
 
+// TestGUICardsLeaveScrollbarGutter: cards stop short of the scroll
+// viewport's right edge. Fyne draws the transcript's vertical bar exactly
+// there, and every scrollable card (tool grids, code tails, the docked live
+// area) draws its own bar at its own right edge - without the inset they
+// stack into one pixel column and grabbing the transcript bar is a coin
+// flip on which scrollbar answers.
+func TestGUICardsLeaveScrollbarGutter(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{Timeout: 10 * time.Second}}
+	p := newGUIForTest(t, c, l)
+	g := scrollbarGutter()
+	if g <= 0 {
+		t.Fatal("theme reported no scrollbar size")
+	}
+
+	lines := make([]string, 12)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("output line %d", i)
+	}
+	p.do(func() { p.v.appendBlock(block{kind: "tool", text: "out", transcript: lines}) })
+	p.do(func() {
+		bodyW := p.v.body.Size().Width
+		if bodyW <= 0 {
+			t.Fatal("the transcript body was never laid out")
+		}
+		for _, ref := range p.v.winRows {
+			if w := ref.c.Size().Width; w > bodyW-g+0.5 {
+				t.Errorf("row %d is %v wide in a %v body: no %v gutter for the scrollbar",
+					ref.idx, w, bodyW, g)
+			}
+		}
+	})
+
+	// The docked live area keeps the same clear strip.
+	l.Handler.Content("streaming answer")
+	p.do(func() {
+		dw := p.v.dock.Size().Width
+		if dw <= 0 {
+			t.Fatal("the dock was never laid out")
+		}
+		for _, o := range p.v.dock.Objects {
+			if w := o.Size().Width; w > dw-g+0.5 {
+				t.Errorf("live card is %v wide in a %v dock: no gutter", w, dw)
+			}
+		}
+	})
+}
+
 // TestGUIStreamedTurnRendersLikeTheCommittedTurn: the live preview carries the
 // header from its first chunk and the commit replaces it exactly once.
 func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {

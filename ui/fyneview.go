@@ -129,7 +129,7 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 	v.botPad = canvas.NewRectangle(color.Transparent)
 	v.body = container.New(virtualLayout{v}, v.topPad, v.botPad)
 	v.scroll = container.NewVScroll(v.body)
-	v.dock = container.NewVBox()
+	v.dock = container.New(layout.NewCustomPaddedLayout(0, 0, 0, scrollbarGutter()))
 	v.dockScroll = container.NewVScroll(v.dock)
 	v.editor = newChatInput(v)
 	v.limitsLabel = widget.NewLabel(limitLabelSteps)
@@ -169,22 +169,25 @@ type virtualLayout struct{ v *guiView }
 
 func (l virtualLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
 	v := l.v
+	// Cards stop short of the viewport's right edge so the transcript's
+	// scrollbar stands in a clear strip (see scrollbarGutter).
+	rw := max(s.Width-scrollbarGutter(), 0)
 	y := v.cumHeight(v.winFirst)
-	v.topPad.Resize(fyne.NewSize(s.Width, y))
+	v.topPad.Resize(fyne.NewSize(rw, y))
 	v.topPad.Move(fyne.Position{})
 	for _, ref := range v.winRows {
 		h := ref.c.MinSize().Height
 		if ref.idx < len(v.blockH) {
 			v.blockH[ref.idx] = h
 		}
-		ref.c.Resize(fyne.NewSize(s.Width, h))
+		ref.c.Resize(fyne.NewSize(rw, h))
 		ref.c.Move(fyne.NewPos(0, y))
 		y += h
 	}
 	// Below the window: whatever history is not materialized, plus any
 	// slack when the whole session is shorter than the viewport.
 	below := max(v.totalHeight()-y, 0)
-	v.botPad.Resize(fyne.NewSize(s.Width, max(below, s.Height-y)))
+	v.botPad.Resize(fyne.NewSize(rw, max(below, s.Height-y)))
 	v.botPad.Move(fyne.NewPos(0, y))
 	// A viewport change (window drag) moves the window's edges without
 	// touching the scroll offset: defer a recompute to after this layout.
@@ -221,6 +224,14 @@ func (v *guiView) cumHeight(i int) float32 {
 }
 
 func (v *guiView) totalHeight() float32 { return v.cumHeight(len(v.blockH)) }
+
+// scrollbarGutter is the clear strip kept between a card's right edge and
+// the scroll viewport's. Fyne draws the transcript's vertical bar at the
+// viewport edge, and scrollable cards - grids, code tails, the docked live
+// area - draw theirs there too: without the gutter the two bars stack into
+// one column and grabbing the transcript bar is a coin flip on which
+// scrollbar answers.
+func scrollbarGutter() float32 { return theme.ScrollBarSize() + theme.Padding() }
 
 // estimateBlockHeight is the scrollbar's placeholder opinion about a block
 // it has not rendered: line counts against the theme's text metrics. The
