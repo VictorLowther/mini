@@ -300,3 +300,24 @@ func TestSummarizeRejectsTruncatedSummaries(t *testing.T) {
 		t.Fatal("a summary cut at the output limit must fail, not truncate")
 	}
 }
+
+// The reported-usage anchor must survive a usage map built in Go, not just one
+// decoded from JSON. An int that num() failed to read would silently fall back
+// to the chars/4 estimate, which runs ~1.4x low on tool-heavy sessions - and
+// the trigger would fire late by exactly that much.
+func TestContextTokensReadsIntegerUsage(t *testing.T) {
+	for _, usage := range []map[string]any{
+		{"total_tokens": 9000},
+		{"total_tokens": int64(9000)},
+		{"total_tokens": 9000.0},
+	} {
+		proj := []Message{
+			m("system", strings.Repeat("x", 4000), nil),
+			m("assistant", "reply", map[string]any{"model_stats": usage}),
+		}
+		tokens, reported := ContextTokens(proj)
+		if !reported || tokens != 9000 {
+			t.Errorf("usage %v: got %d reported=%v, want 9000 reported=true", usage, tokens, reported)
+		}
+	}
+}

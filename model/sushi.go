@@ -373,9 +373,18 @@ func (s *Sushi) cost(usage map[string]any) float64 {
 	return (in*s.Pricing.InputPerMtok + out*s.Pricing.OutputPerMtok) / 1e6
 }
 
+// num reads a JSON number. Decoded bodies only ever hold float64, but usage
+// maps are also built in Go (and ints are what a caller would naturally
+// write), and a missed case here silently drops the reported-token anchor
+// that ContextTokens prefers over its own estimate - so accept them all.
 func num(v any) float64 {
-	if f, ok := v.(float64); ok {
-		return f
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
 	}
 	return 0
 }

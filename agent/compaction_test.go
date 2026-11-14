@@ -419,3 +419,141 @@ func TestConfigThresholds(t *testing.T) {
 		t.Error("mini.yaml sets no context_window; compaction would default off")
 	}
 }
+
+// reportedLoop builds a transcript whose newest assistant turn carries a
+// server-reported usage far above what chars/4 measures - the real ratio
+// against sushi measured 1.4x on tool-output-heavy sessions - and returns it
+// ready for a direct compact() call.
+func reportedLoop(t *testing.T, d *model.Deterministic, reported int, mutate ...func(*Config)) (*Loop, *fakeRecorder) {
+	t.Helper()
+	l, rec := compactionLoop(t, d, mutate...)
+	big := strings.Repeat("o", 400)
+	l.Messages = []model.Message{
+		{"role": "system", "content": strings.Repeat("s", 2400)},
+		{"role": "user", "content": "the task"},
+		{"role": "assistant", "content": "elided middle", "extra": map[string]any{"turn": int64(3)}},
+		{"role": "tool", "content": big, "extra": map[string]any{
+			"turn": int64(4), "command": "echo middle", "tcr_path": "/tmp/middle.log"}},
+		{"role": "assistant", "content": "kept tail", "extra": map[string]any{
+			"turn":        int64(5),
+			"model_stats": map[string]any{"total_tokens": float64(reported)}}},
+		{"role": "tool", "content": big, "extra": map[string]any{"turn": int64(6)}},
+	}
+	return l, rec
+}
+
+// The two numbers on a compaction row must be in the same unit. Reported usage
+// and a chars/4 estimate differ by ~1.4x in practice, and the difference is
+// exactly what let a compaction that shrank nothing look like a 30% cut - and
+// slipped past the progress guard.
+func TestCompactionScoresTheRebuildInTheReportedBasis(t *testing.T) {
+	d := det(0, "## Goal\nshort checkpoint")
+	l, _ := reportedLoop(t, d, 8000, func(c *Config) {
+		c.ContextWindow = 2000 // threshold 1000, under the reported context
+		c.CompactThresholdRatio = 0.5
+		c.CompactKeepTokens = 60
+	})
+	proj := model.ProjectContext(l.Messages)
+	estBefore, reported := model.ContextTokens(proj)
+	if !reported {
+		t.Fatal("the fixture lost its reported-usage anchor")
+	}
+	if l.compact(context.Background(), proj, estBefore, false) {
+		t.Fatal("a rebuild whose reported-basis size still crosses the trigger must be refused")
+	}
+	if !l.autoCompactOff {
+		t.Error("the refused rebuild must stop automatic compaction")
+	}
+
+	// The same rebuild, measured in the estimator's own units, is well under
+	// that threshold: scoring in the reported basis is what catches it.
+	raw := estimateRebuild(proj, pickCut(proj, 60), "## Goal\nshort checkpoint")
+	if threshold := l.Cfg.compactThreshold(); raw >= threshold {
+		t.Fatalf("fixture is not discriminating: raw %d already exceeds %d", raw, threshold)
+	}
+}
+
+// And when the rebuild does fit, the row must carry the reported-basis number:
+// the GUI card compares tokens_before with tokens_after, and printing a
+// reported count against a raw estimate is what once advertised "64k -> 44k"
+// for a compaction that saved about thirty tokens.
+func TestCompactionRowReportsTheReportedBasis(t *testing.T) {
+	d := det(0, "## Goal\nshort checkpoint")
+	l, _ := reportedLoop(t, d, 8000, func(c *Config) {
+		c.ContextWindow = 20000 // threshold 10000: the scaled rebuild fits
+		c.CompactThresholdRatio = 0.5
+		c.CompactKeepTokens = 60
+	})
+	proj := model.ProjectContext(l.Messages)
+	estBefore, _ := model.ContextTokens(proj)
+	raw := estimateRebuild(proj, pickCut(proj, 60), "## Goal\nshort checkpoint")
+	if !l.compact(context.Background(), proj, estBefore, false) {
+		t.Fatal("a rebuild that fits under its trigger in reported units should commit")
+	}
+	var row model.Message
+	for _, m := range l.Messages {
+		if model.IsCompaction(m) {
+			row = m
+		}
+	}
+	extra, _ := row["extra"].(map[string]any)
+	after := extraInt(extra[model.ExtraTokensAfter])
+	before := extraInt(extra[model.ExtraTokensBefore])
+	if after <= raw {
+		t.Errorf("tokens_after %d was not raised into the reported basis (raw estimate %d)", after, raw)
+	}
+	if after >= before {
+		t.Errorf("card claims %d -> %d, which is no saving at all", before, after)
+	}
+}
+
+// A manual /compact early in a session summarizes a handful of turns into a
+// summary of the same size. The threshold guard cannot see that (both numbers
+// sit far under it, which is exactly how a real 64k-token /compact once traded
+// 11 turns for a summary worth 12), so the shrink guard must.
+func TestCompactionRefusesASummaryThatDoesNotShrink(t *testing.T) {
+	d := det(2, "## Goal\n"+strings.Repeat("a summary as long as what it replaced. ", 200))
+	l, rec := compactionLoop(t, d, func(c *Config) { c.ContextWindow = 0 }) // threshold 0: no guard but this one
+	l.Hooks = &manualHooks{l: l}
+	if _, err := run(t, l, "task"); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range rec.seen {
+		if model.IsCompaction(m) {
+			t.Fatal("committed a compaction that made the context larger")
+		}
+	}
+	if len(d.SummarizeQueries) != 1 {
+		t.Errorf("%d side queries, want 1", len(d.SummarizeQueries))
+	}
+	// A user asking once says nothing about what a full window would do, so a
+	// manual refusal must leave automatic compaction armed.
+	if l.autoCompactOff {
+		t.Error("a manual no-op switched automatic compaction off")
+	}
+}
+
+// The same no-progress outcome on the automatic path must switch compaction
+// off: the estimate is unchanged, so the trigger would fire and pay for the
+// same side-query on every remaining step.
+func TestCompactionNonShrinkStopsTheAutomaticPath(t *testing.T) {
+	d := det(4, "## Goal\n"+strings.Repeat("a summary as long as what it replaced. ", 200))
+	l, rec := compactionLoop(t, d, func(c *Config) {
+		c.ContextWindow = 3000 // crossed once, after the second big turn
+		c.CompactThresholdRatio = 0.9
+	})
+	if _, err := run(t, l, "task"); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range rec.seen {
+		if model.IsCompaction(m) {
+			t.Fatal("committed a compaction that made the context larger")
+		}
+	}
+	if !l.autoCompactOff {
+		t.Error("automatic compaction stayed armed after a no-progress compaction")
+	}
+	if n := len(d.SummarizeQueries); n != 1 {
+		t.Errorf("%d side queries, want 1 - the run must not re-pay for the same summary", n)
+	}
+}

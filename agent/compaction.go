@@ -173,14 +173,38 @@ func (l *Loop) compact(ctx context.Context, proj []model.Message, estBefore int,
 	}
 	kept := len(proj) - cut
 	estAfter := estimateRebuild(proj, cut, content)
+
+	// Everything below compares like with like. estBefore is the trigger's own
+	// quantity and prefers the server's REPORTED usage, while estAfter can only
+	// be estimated; on tool-output-heavy sessions a reported count runs well
+	// above chars/4 (1.4x measured against sushi), so the two must never be
+	// subtracted or thresholded against each other directly. estProj is the same
+	// projection measured with the same estimator as estAfter, and scale carries
+	// an estimate into the reported basis when a reported anchor exists.
+	estProj := estimateProjection(proj)
+	scale := 1.0
+	if _, reported := model.ContextTokens(proj); reported && estProj > 0 && estBefore > estProj {
+		scale = float64(estBefore) / float64(estProj)
+	}
+	estAfterTrue := int(float64(estAfter)*scale + 0.5)
+
+	// Inflation guard (qwen-code's "if the new history isn't smaller, NOOP"):
+	// a short session summarized near the end of its own tail trades a few
+	// turns for a summary of the same size, which costs a side-query and buys
+	// nothing. The threshold guard below cannot catch this - both numbers sit
+	// far under the trigger - so it needs its own same-units comparison.
+	if estAfter >= estProj {
+		l.rejectCompaction(manual, estProj, estAfter, kept)
+		return false
+	}
 	// Progress guard (omp's recovery band, kept minimal): a compaction that
 	// cannot land the context back under its trigger would only re-fire next
 	// step and repeat the work. That means the window/keep/summary budget is
 	// misconfigured, which a human has to hear about once, loudly.
-	if threshold := l.Cfg.compactThreshold(); threshold > 0 && estAfter >= threshold {
+	if threshold := l.Cfg.compactThreshold(); threshold > 0 && estAfterTrue >= threshold {
 		l.autoCompactOff = true
 		l.logger().Error("compaction would not fit the context under its trigger; automatic compaction stopped - check context_window, compact_threshold_ratio, compact_keep_tokens",
-			"estimated_after", estAfter, "threshold", threshold)
+			"estimated_after", estAfterTrue, "threshold", threshold)
 		return false
 	}
 
@@ -192,14 +216,31 @@ func (l *Loop) compact(ctx context.Context, proj []model.Message, estBefore int,
 			model.ExtraKeptN:           kept,
 			model.ExtraFirstKeptTurn:   firstKept,
 			model.ExtraTokensBefore:    estBefore,
-			model.ExtraTokensAfter:     estAfter,
+			model.ExtraTokensAfter:     estAfterTrue,
 			model.ExtraCompactionModel: l.modelName(),
 			"timestamp":                float64(time.Now().UnixMilli()) / 1000,
 		},
 	})
 	l.logger().Info("session compacted",
-		"tokens_before", estBefore, "tokens_after", estAfter, "kept_turns", kept)
+		"tokens_before", estBefore, "tokens_after", estAfterTrue, "kept_turns", kept,
+		"estimated_before", estProj, "estimated_after", estAfter, "token_scale", scale)
 	return true
+}
+
+// rejectCompaction refuses a compaction that would not make the context
+// smaller. Automatic requests also switch compaction off, because the estimate
+// is unchanged and the trigger would fire again next step, paying for the same
+// side-query forever; a manual one is a single user action that says nothing
+// about what a full context would do, so it leaves automatic compaction armed.
+func (l *Loop) rejectCompaction(manual bool, estBefore, estAfter, kept int) {
+	if manual {
+		l.logger().Warn("compaction would not shrink the context; history unchanged - the kept tail already covers most of the conversation",
+			"estimated_before", estBefore, "estimated_after", estAfter, "kept_turns", kept)
+		return
+	}
+	l.autoCompactOff = true
+	l.logger().Error("compaction would not shrink the context; automatic compaction stopped - check compact_keep_tokens against context_window",
+		"estimated_before", estBefore, "estimated_after", estAfter, "kept_turns", kept)
 }
 
 // pickCut chooses the first kept turn: walk backwards accumulating estimated
@@ -233,6 +274,17 @@ func pickCut(proj []model.Message, keepTokens int) int {
 		}
 	}
 	return len(proj) // no assistant at all: nothing survives verbatim
+}
+
+// estimateProjection measures a context the way estimateRebuild measures the
+// one a compaction produces - the same estimator over the same rows - so the
+// pair answers "does this actually shrink anything?" in one unit.
+func estimateProjection(proj []model.Message) int {
+	t := 0
+	for _, m := range proj {
+		t += model.EstimateMessageTokens(m)
+	}
+	return t
 }
 
 // estimateRebuild sizes the context the compaction is about to produce:
