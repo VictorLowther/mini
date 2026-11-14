@@ -688,6 +688,57 @@ func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 	}
 }
 
+// TestGUITallContentNeverGrowsTheWindow is the regression for the serious
+// one: a turn taller than the window - streaming or committed - must not
+// resize it. The live card grows to the space the window has left and its
+// content scrolls inside the card, and the content tree's MinSize (what the
+// glfw driver's fitContent would grow the window toward) stays far below the
+// window's height.
+func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	tall := strings.Repeat("a streamed line of prose that keeps coming\n", 200)
+	msg := model.Message{
+		"role":    "assistant",
+		"content": tall,
+		"extra":   map[string]any{"actions": []model.Action{{Command: submitCmd, ToolCallID: "c"}}, "cost": 1.0},
+	}
+	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second},
+		Model: &model.Deterministic{CostPerCall: 1, ObsTemplate: "{{ .output.returncode }}", Outputs: []model.Message{msg}}}
+	p := newGUIForTest(t, c, l)
+	open := p.v.rootC.Size()
+	if open.Height < 600 {
+		t.Fatalf("the content must be laid out at the window's size, got %v", open)
+	}
+	height := func() float32 { return p.v.rootC.Size().Height }
+
+	// A turn far taller than the whole window streams into the live card.
+	l.Handler.Content(tall)
+	p.do(func() {
+		if n, want := p.v.dockScroll.Size().Height, p.v.liveContentHeight(); n >= want {
+			t.Errorf("the live card got %v px for content of %v px: it was not capped to the window", n, want)
+		}
+		if p.v.dockScroll.Offset.Y <= 0 {
+			t.Errorf("the capped live card does not follow the stream (offset %v)", p.v.dockScroll.Offset.Y)
+		}
+		if min := p.v.rootC.MinSize().Height; min > height() {
+			t.Errorf("the content tree's minimum is %v px, over the window's %v: fitContent would force it open", min, height())
+		}
+	})
+
+	// Committing the same tall turn as a transcript card changes nothing:
+	// the transcript scroll already absorbs unbounded content.
+	p.Message(msg)
+	p.do(func() {
+		if min := p.v.rootC.MinSize().Height; min > height() {
+			t.Errorf("after the commit, content min height %v px exceeds the window's %v", min, height())
+		}
+	})
+	if got := p.v.rootC.Size(); got != open {
+		t.Errorf("the window's content resized to %v from %v without the user touching it", got, open)
+	}
+}
+
 // TestGUIThinkingStateIsLegible: hidden by default with its size named,
 // expanded by the toggle, always labelled.
 func TestGUIThinkingStateIsLegible(t *testing.T) {

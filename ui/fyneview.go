@@ -53,14 +53,22 @@ type guiView struct {
 	gui *GUI
 	win fyne.Window
 
-	body   *fyne.Container // VBox of committed bubbles, inside the scroll
-	dock   *fyne.Container // live streaming area, outside the scroll (see flushLive)
+	body   *fyne.Container // VBox of committed bubbles, inside the transcript scroll
+	dock   *fyne.Container // live streaming content, inside dockScroll (see centerLayout)
+	center *fyne.Container // middle column: transcript, question card, live dock
 	rootC  *fyne.Container // top border: refresh after dock changes
 	scroll *container.Scroll
-	panel  *fyne.Container // question panel content, swapped per prompt
-	card   *widget.Card    // the bordered box holding the panel
-	status *widget.Label
-	editor *chatInput
+	// dockScroll and panelScroll cap what the live area and the question
+	// card contribute to the window's MinSize. Without them the glfw
+	// driver's fitContent grows the OS window to whatever the streaming
+	// content's minimum height has become; with them the content scrolls
+	// inside its card and only the user resizes the window.
+	dockScroll  *container.Scroll
+	panelScroll *container.Scroll
+	panel       *fyne.Container // question panel content, swapped per prompt
+	card        *widget.Card    // the bordered box holding the panel
+	status      *widget.Label
+	editor      *chatInput
 
 	limitsLabel *widget.Label
 
@@ -96,10 +104,12 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 	v.body = container.NewVBox()
 	v.scroll = container.NewVScroll(v.body)
 	v.dock = container.NewVBox()
+	v.dockScroll = container.NewVScroll(v.dock)
 	v.editor = newChatInput(v)
 	v.limitsLabel = widget.NewLabel(limitLabelSteps)
 	v.panel = container.NewVBox()
-	v.card = widget.NewCard("", "", v.panel)
+	v.panelScroll = container.NewVScroll(v.panel)
+	v.card = widget.NewCard("", "", v.panelScroll)
 	v.card.Hide()
 	v.status = widget.NewLabel("")
 	v.status.Importance = widget.LowImportance
@@ -109,9 +119,98 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 }
 
 func (v *guiView) root() fyne.CanvasObject {
-	bottom := container.NewVBox(v.card, v.dock, v.status, v.editor)
-	v.rootC = container.NewBorder(nil, bottom, nil, nil, v.scroll)
+	v.center = container.New(centerLayout{v}, v.scroll, v.card, v.dockScroll)
+	fixed := container.NewVBox(v.status, v.editor)
+	v.rootC = container.NewBorder(nil, fixed, nil, nil, v.center)
 	return v.rootC
+}
+
+// The middle column is where content grows, and growth must stop at the
+// window edge: the glfw driver resizes the window up to the content tree's
+// MinSize (fitContent), so nothing inside it may report a minimum that
+// follows the transcript's length. centerLayout therefore distributes the
+// height the window actually has: the question card keeps its natural height
+// (it is the interactive surface), the live dock grows with the turn but only
+// to what is left over, and the transcript takes the rest down to its own
+// scroll minimum. Content outgrowing its share scrolls inside its card - the
+// scroller's Layout sizes content to max(content min, viewport) - so the
+// window changes size only when the user drags it.
+type centerLayout struct{ v *guiView }
+
+func (l centerLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
+	scroll, card, dock := o[0], o[1], o[2]
+	// A fresh RichText reports its minimum height at whatever width it last
+	// saw, which for a live area that has never been laid out is zero. Give
+	// the live box the viewport's width and lay it out now, so its measured
+	// natural height is real before any of it is apportioned (an area that
+	// starts mid-stream has never seen a layout pass at all).
+	if l.v.live != nil {
+		nat := l.v.dock.MinSize()
+		l.v.dock.Resize(fyne.NewSize(max(nat.Width, s.Width), nat.Height))
+		l.v.dock.Layout.Layout(l.v.dock.Objects, l.v.dock.Size())
+	}
+	floor := scroll.MinSize().Height
+
+	cardH := min(l.v.questionCardHeight(), s.Height)
+	rem := max(s.Height-cardH, 0)
+	dockH := min(l.v.liveContentHeight(), max(rem-floor, 0))
+	scrollH := max(rem-dockH, 0)
+
+	scroll.Resize(fyne.NewSize(s.Width, scrollH))
+	scroll.Move(fyne.Position{})
+	card.Resize(fyne.NewSize(s.Width, cardH))
+	card.Move(fyne.NewPos(0, scrollH))
+	dock.Resize(fyne.NewSize(s.Width, dockH))
+	dock.Move(fyne.NewPos(0, scrollH+cardH))
+	// Grow the scrolled contents to their natural size by hand - the same
+	// reason afterContentChange resizes the transcript body: the scroller
+	// resizes content in its renderer Layout, which may not have run yet,
+	// and an offset update against a not-yet-oversized content is a no-op.
+	if dockH > 0 || l.v.live != nil {
+		l.v.dock.Resize(fyne.NewSize(max(l.v.dock.MinSize().Width, s.Width),
+			max(l.v.liveContentHeight(), dockH)))
+	}
+	if cardH > 0 && l.v.panel.MinSize().Height > cardH {
+		l.v.panel.Resize(fyne.NewSize(max(l.v.panel.MinSize().Width, s.Width), l.v.panel.MinSize().Height))
+	}
+	// The live area is what streams: when its content outgrew the space the
+	// window had for it, follow the tail inside the card.
+	if dockH > 0 && l.v.liveContentHeight() > dockH {
+		l.v.dockScroll.ScrollToBottom()
+	}
+}
+
+func (l centerLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
+	var w float32
+	h := float32(0)
+	for _, c := range o {
+		m := c.MinSize()
+		if m.Width > w {
+			w = m.Width
+		}
+		h += m.Height
+	}
+	return fyne.NewSize(w, h)
+}
+
+// liveContentHeight is the natural height of the streaming turn, 0 when no
+// turn is in flight.
+func (v *guiView) liveContentHeight() float32 {
+	if v.live == nil {
+		return 0
+	}
+	return v.dock.MinSize().Height
+}
+
+// questionCardHeight is the card's natural height for the current panel:
+// the card's own chrome (measured around the empty panelScroll) plus what
+// the panel content needs, never below the card's minimum and 0 while hidden.
+func (v *guiView) questionCardHeight() float32 {
+	if !v.card.Visible() {
+		return 0
+	}
+	chrome := v.card.MinSize().Height - v.panelScroll.MinSize().Height
+	return max(v.card.MinSize().Height, chrome+v.panel.MinSize().Height)
 }
 
 // start shows the window and puts the focus on the input - input must always
@@ -216,9 +315,7 @@ func (v *guiView) commitBlock(b block) {
 func (v *guiView) removeLive() {
 	v.dock.Remove(v.live.box)
 	v.live = nil
-	if v.rootC != nil {
-		v.rootC.Layout.Layout(v.rootC.Objects, v.rootC.Size()) // see flushLive: layout-only, no Refresh cascade
-	}
+	v.layoutCenter() // see flushLive: layout-only, and direct: the border's Resize of a constant-height center would early-return
 }
 
 func (v *guiView) finalizeLive() block {
@@ -255,29 +352,41 @@ func (v *guiView) streamChunk() {
 }
 
 // flushLive repaints the streaming turn only: the live surfaces re-wrap, the
-// bottom section (dock) grows, and the scroll's committed content stays
-// untouched. rootC.Refresh re-runs the border layout; every committed child
-// early-returns from Resize because its size did not change - that is what
-// keeps a flush O(live) instead of O(transcript).
+// dock grows to the share of the window's height centerLayout has for it, and
+// the scroll's committed content stays untouched. rootC.Layout re-runs the
+// border and the center layout; every committed child early-returns from
+// Resize because its size did not change - that is what keeps a flush
+// O(live) instead of O(transcript).
 func (v *guiView) flushLive() {
 	v.flushPending = false
 	v.lastFlush = time.Now()
 	if v.live != nil {
 		v.live.refresh()
 	}
-	if v.rootC != nil {
-		// Layout, never Refresh: Container.Refresh cascades Refresh() into
-		// every committed bubble (full re-wrap + TextGrid re-cell). Re-laying
-		// the border recomputes the grown dock from child MinSizes, and size
-		// changes propagate down through Resize (whose children that did not
-		// change size early-return) - live-only work, O(transcript) avoided.
-		v.rootC.Layout.Layout(v.rootC.Objects, v.rootC.Size())
-	}
+	// Layout, never Refresh: Container.Refresh cascades Refresh() into every
+	// committed bubble (full re-wrap + TextGrid re-cell). Re-running the
+	// center layout sizes the live dock from its content's MinSize against
+	// the height the column actually has; size changes propagate down
+	// through Resize (whose children that did not change size early-return)
+	// - live-only work, O(transcript) avoided.
+	v.layoutCenter()
 	if v.pinned {
 		v.scroll.ScrollToBottom() // viewport shrank under the dock: keep the tail visible
 	}
 	v.repaint(v.scroll)
 	v.refreshStatus()
+}
+
+// layoutCenter re-runs centerLayout against the column's current size. It
+// goes straight to the center instead of re-laying the border: the border
+// sizes its center with Resize, which early-returns when the height did not
+// change - and with the fixed chrome moved out of the center, a streaming
+// flush rarely changes it. That early-return is what left the live area's
+// size stale between turns.
+func (v *guiView) layoutCenter() {
+	if v.center != nil {
+		v.center.Layout.Layout(v.center.Objects, v.center.Size())
+	}
 }
 
 // rebuildAll re-renders every block (the thinking toggle changes how past
@@ -293,9 +402,7 @@ func (v *guiView) rebuildAll() {
 	v.dock.Objects = nil
 	v.body.Objects = objs
 	v.body.Layout.Layout(v.body.Objects, v.body.Size()) // layout, not Refresh: new children lay out from
-	if v.rootC != nil {                                 // MinSize; nothing needs a repaint cascade
-		v.rootC.Layout.Layout(v.rootC.Objects, v.rootC.Size())
-	}
+	v.layoutCenter()                                    // MinSize; nothing needs a repaint cascade
 	v.repaint(v.scroll)
 	// Re-stream the turn in flight from its buffers, if any.
 	v.streamChunk()
@@ -776,6 +883,9 @@ func (v *guiView) setPanel(objs ...fyne.CanvasObject) {
 	}
 	v.panel.Refresh()
 	v.card.Refresh()
+	// The card's share of the center column depends on whether it is up and
+	// how tall its content is; layout-only, the same rule as flushLive.
+	v.layoutCenter()
 }
 
 func (v *guiView) showQuestion(q Question) {
