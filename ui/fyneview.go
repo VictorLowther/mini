@@ -54,16 +54,14 @@ type guiView struct {
 	win fyne.Window
 
 	body   *fyne.Container // virtualized transcript: spacers plus the rows in view (see virtualLayout)
-	dock   *fyne.Container // live streaming content, inside dockScroll (see centerLayout)
-	center *fyne.Container // middle column: transcript, question card, live dock
-	rootC  *fyne.Container // top border: refresh after dock changes
+	center *fyne.Container // middle column: transcript, question card
+	rootC  *fyne.Container // top border
 	scroll *container.Scroll
-	// dockScroll and panelScroll cap what the live area and the question
-	// card contribute to the window's MinSize. Without them the glfw
-	// driver's fitContent grows the OS window to whatever the streaming
-	// content's minimum height has become; with them the content scrolls
-	// inside its card and only the user resizes the window.
-	dockScroll  *container.Scroll
+	// panelScroll caps what the question card contributes to the window's
+	// MinSize. Without it the card reports a minimum that follows its
+	// content's height, and the glfw driver's fitContent grows the OS window
+	// to match; with it the content scrolls inside the card and only the
+	// user resizes the window.
 	panelScroll *container.Scroll
 	panel       *fyne.Container // question panel content, swapped per prompt
 	card        *widget.Card    // the bordered box holding the panel
@@ -92,11 +90,21 @@ type guiView struct {
 	// committed is the transcript source of truth the widgets are rendered
 	// from; the thinking toggle rebuilds every block from it.
 	committed []block
-	live      *liveArea
 	// pinned tracks whether the transcript was scrolled to the bottom before
 	// the last content change, so new output keeps the view at the bottom and
 	// scrolled-back history stays put.
 	pinned bool
+
+	// live is the streaming turn's incremental renderer; liveRow is its place
+	// in the transcript - a row of the same virtual scroll the committed cards
+	// live in, appended as a pseudo-block after the last committed row. A
+	// separate docked region made the transcript's viewport height change as
+	// the stream grew (the scrollbar jumps under the reader); sharing one
+	// scroll means one region whose size only the window controls. liveSeen
+	// records whether liveRow is currently materialized in the window.
+	live     *liveArea
+	liveRow  *fyne.Container
+	liveSeen bool
 
 	// Virtualization state. Fyne walks the whole object tree every repaint
 	// frame (EnsureMinSize + paint), and the driver repaints at frame rate no
@@ -129,8 +137,6 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 	v.botPad = canvas.NewRectangle(color.Transparent)
 	v.body = container.New(virtualLayout{v}, v.topPad, v.botPad)
 	v.scroll = container.NewVScroll(v.body)
-	v.dock = container.New(layout.NewCustomPaddedLayout(0, 0, 0, scrollbarGutter()))
-	v.dockScroll = container.NewVScroll(v.dock)
 	v.editor = newChatInput(v)
 	v.limitsLabel = widget.NewLabel(limitLabelSteps)
 	v.panel = container.NewVBox()
@@ -145,7 +151,7 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 }
 
 func (v *guiView) root() fyne.CanvasObject {
-	v.center = container.New(centerLayout{v}, v.scroll, v.card, v.dockScroll)
+	v.center = container.New(centerLayout{v}, v.scroll, v.card)
 	fixed := container.NewVBox(v.status, v.editor)
 	v.rootC = container.NewBorder(nil, fixed, nil, nil, v.center)
 	// Every scroll movement may cross a window boundary; the window is the
@@ -161,16 +167,18 @@ func (v *guiView) root() fyne.CanvasObject {
 }
 
 // virtualLayout lays the transcript window out between its spacers: the
-// content's total height is always sum(blockH), so the scroll bars describe
-// the whole session while only the rows in view exist as widgets. Heights are
-// re-measured through the rows' own MinSize each pass - wrapping changes
-// them, and the estimates only steer until the first real measurement.
+// content's total height is always sum(blockH) plus the live row's height,
+// so the scroll bars describe the whole session - streaming turn included -
+// while only the rows in view exist as widgets. Heights are re-measured
+// through the rows' own MinSize each pass - wrapping changes them, and the
+// estimates only steer until the first real measurement.
 type virtualLayout struct{ v *guiView }
 
 func (l virtualLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
 	v := l.v
 	// Cards stop short of the viewport's right edge so the transcript's
-	// scrollbar stands in a clear strip (see scrollbarGutter).
+	// scrollbar stands in a clear strip (see scrollbarGutter). The live row
+	// shares the width: it is a card like any other, newest in the column.
 	rw := max(s.Width-scrollbarGutter(), 0)
 	y := v.cumHeight(v.winFirst)
 	v.topPad.Resize(fyne.NewSize(rw, y))
@@ -182,6 +190,12 @@ func (l virtualLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
 		}
 		ref.c.Resize(fyne.NewSize(rw, h))
 		ref.c.Move(fyne.NewPos(0, y))
+		y += h
+	}
+	if v.liveSeen && v.liveRow != nil {
+		h := v.liveRow.MinSize().Height
+		v.liveRow.Resize(fyne.NewSize(rw, h))
+		v.liveRow.Move(fyne.NewPos(0, y))
 		y += h
 	}
 	// Below the window: whatever history is not materialized, plus any
@@ -223,12 +237,29 @@ func (v *guiView) cumHeight(i int) float32 {
 	return h
 }
 
-func (v *guiView) totalHeight() float32 { return v.cumHeight(len(v.blockH)) }
+// totalHeight is the whole session's scroll extent: every committed block
+// (measured or estimated) plus the live streaming row when one is in flight.
+func (v *guiView) totalHeight() float32 {
+	h := v.cumHeight(len(v.blockH))
+	if v.liveRow != nil {
+		h += v.liveRow.MinSize().Height
+	}
+	return h
+}
+
+// liveContentHeight is the natural height of the streaming turn, 0 when none
+// is in flight.
+func (v *guiView) liveContentHeight() float32 {
+	if v.liveRow == nil {
+		return 0
+	}
+	return v.liveRow.MinSize().Height
+}
 
 // scrollbarGutter is the clear strip kept between a card's right edge and
 // the scroll viewport's. Fyne draws the transcript's vertical bar at the
-// viewport edge, and scrollable cards - grids, code tails, the docked live
-// area - draw theirs there too: without the gutter the two bars stack into
+// viewport edge, and scrollable cards - grids, code tails, the streaming
+// row - draw theirs there too: without the gutter the two bars stack into
 // one column and grabbing the transcript bar is a coin flip on which
 // scrollbar answers.
 func scrollbarGutter() float32 { return theme.ScrollBarSize() + theme.Padding() }
@@ -310,49 +341,66 @@ func (v *guiView) recomputeWindow() {
 // setWindow moves the materialized window incrementally: rows still in
 // range keep their widgets (and their measured heights, textures, rasterized
 // glyphs), rows past either edge leave through Container.Remove, and only
-// newly exposed blocks get newRow. A no-op when the window did not move.
+// newly exposed blocks get newRow. The live row is not a winRows member - it
+// rides along whenever the window reaches the transcript's end - so scroll
+// transitions attach and detach it, and streaming that leaves the window
+// alone still finds it present.
 func (v *guiView) setWindow(first, last int) {
-	if first == v.winFirst && last == v.winLast {
-		return
-	}
-	v.winFirst, v.winLast = first, last
+	moved := first != v.winFirst || last != v.winLast
+	if moved {
+		v.winFirst, v.winLast = first, last
 
-	// Evict from the head and tail; the window is contiguous, so leaving
-	// rows are always at the ends of winRows.
-	for len(v.winRows) > 0 && v.winRows[0].idx < first {
-		v.body.Remove(v.winRows[0].c)
-		v.winRows = v.winRows[1:]
-	}
-	for len(v.winRows) > 0 && v.winRows[len(v.winRows)-1].idx >= last {
-		v.body.Remove(v.winRows[len(v.winRows)-1].c)
-		v.winRows = v.winRows[:len(v.winRows)-1]
-	}
-	// Fill any holes below/above what survives (a jump - rebuild, resize,
-	// or a fast drag - degrades to a full materialize of the new window).
-	var built []transcriptRow
-	if len(v.winRows) == 0 {
-		for i := first; i < last; i++ {
-			built = append(built, v.buildRow(i))
+		// Evict from the head and tail; the window is contiguous, so leaving
+		// rows are always at the ends of winRows.
+		for len(v.winRows) > 0 && v.winRows[0].idx < first {
+			v.body.Remove(v.winRows[0].c)
+			v.winRows = v.winRows[1:]
 		}
+		for len(v.winRows) > 0 && v.winRows[len(v.winRows)-1].idx >= last {
+			v.body.Remove(v.winRows[len(v.winRows)-1].c)
+			v.winRows = v.winRows[:len(v.winRows)-1]
+		}
+		// Fill any holes below/above what survives (a jump - rebuild, resize,
+		// or a fast drag - degrades to a full materialize of the new window).
+		var built []transcriptRow
+		if len(v.winRows) == 0 {
+			for i := first; i < last; i++ {
+				built = append(built, v.buildRow(i))
+			}
+		} else {
+			lo := v.winRows[0].idx
+			hi := v.winRows[len(v.winRows)-1].idx + 1
+			for i := first; i < lo; i++ {
+				built = append(built, v.buildRow(i))
+			}
+			built = append(built, v.winRows...)
+			for i := hi; i < last; i++ {
+				built = append(built, v.buildRow(i))
+			}
+		}
+		v.winRows = built
+	}
+	if v.setLiveShown(v.liveRow != nil && last == len(v.committed)) || moved {
+		// Rows live in body.Objects by creation order; layout positions from
+		// winRows, so slice order only affects paint order - and the window
+		// never overlaps itself.
+		v.body.Layout.Layout(v.body.Objects, v.body.Size())
+	}
+}
+
+// setLiveShown attaches or detaches the streaming row as the window reaches
+// or leaves the transcript's end. Returns whether that changed anything.
+func (v *guiView) setLiveShown(want bool) bool {
+	if v.liveSeen == want || v.liveRow == nil && want {
+		return false
+	}
+	if want {
+		v.body.Add(v.liveRow)
 	} else {
-		// After edge eviction, the survivors are exactly winRows[0].idx ...
-		// winRows[last].idx, all inside [first, last); head/tail loops fill
-		// whatever the new window gained beyond them.
-		lo := v.winRows[0].idx
-		hi := v.winRows[len(v.winRows)-1].idx + 1
-		for i := first; i < lo; i++ {
-			built = append(built, v.buildRow(i))
-		}
-		built = append(built, v.winRows...)
-		for i := hi; i < last; i++ {
-			built = append(built, v.buildRow(i))
-		}
+		v.body.Remove(v.liveRow)
 	}
-	v.winRows = built
-	// Rows were appended to body.Objects (creation order); our layout
-	// positions from winRows, so slice order only affects paint order - and
-	// the window never overlaps itself.
-	v.body.Layout.Layout(v.body.Objects, v.body.Size())
+	v.liveSeen = want
+	return true
 }
 
 func (v *guiView) buildRow(i int) transcriptRow {
@@ -383,54 +431,21 @@ func (v *guiView) scheduleRecompute() {
 // MinSize (fitContent), so nothing inside it may report a minimum that
 // follows the transcript's length. centerLayout therefore distributes the
 // height the window actually has: the question card keeps its natural height
-// (it is the interactive surface), the live dock grows with the turn but only
-// to what is left over, and the transcript takes the rest down to its own
-// scroll minimum. Content outgrowing its share scrolls inside its card - the
-// scroller's Layout sizes content to max(content min, viewport) - so the
-// window changes size only when the user drags it.
+// (it is the interactive surface) and the transcript takes the rest. The
+// streaming turn lives inside that transcript as its newest row, so the
+// scroll region's size is a function of the window alone - only the question
+// card ever moves its top edge - and content outgrowing the space scrolls
+// inside the card or inside the transcript, never resizes the window.
 type centerLayout struct{ v *guiView }
 
 func (l centerLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
-	scroll, card, dock := o[0], o[1], o[2]
-	// A fresh RichText reports its minimum height at whatever width it last
-	// saw, which for a live area that has never been laid out is zero. Give
-	// the live box the viewport's width and lay it out now, so its measured
-	// natural height is real before any of it is apportioned (an area that
-	// starts mid-stream has never seen a layout pass at all).
-	if l.v.live != nil {
-		nat := l.v.dock.MinSize()
-		l.v.dock.Resize(fyne.NewSize(max(nat.Width, s.Width), nat.Height))
-		l.v.dock.Layout.Layout(l.v.dock.Objects, l.v.dock.Size())
-	}
-	floor := scroll.MinSize().Height
-
+	scroll, card := o[0], o[1]
 	cardH := min(l.v.questionCardHeight(), s.Height)
-	rem := max(s.Height-cardH, 0)
-	dockH := min(l.v.liveContentHeight(), max(rem-floor, 0))
-	scrollH := max(rem-dockH, 0)
-
+	scrollH := max(s.Height-cardH, 0)
 	scroll.Resize(fyne.NewSize(s.Width, scrollH))
 	scroll.Move(fyne.Position{})
 	card.Resize(fyne.NewSize(s.Width, cardH))
 	card.Move(fyne.NewPos(0, scrollH))
-	dock.Resize(fyne.NewSize(s.Width, dockH))
-	dock.Move(fyne.NewPos(0, scrollH+cardH))
-	// Grow the scrolled contents to their natural size by hand - the same
-	// reason afterContentChange resizes the transcript body: the scroller
-	// resizes content in its renderer Layout, which may not have run yet,
-	// and an offset update against a not-yet-oversized content is a no-op.
-	if dockH > 0 || l.v.live != nil {
-		l.v.dock.Resize(fyne.NewSize(max(l.v.dock.MinSize().Width, s.Width),
-			max(l.v.liveContentHeight(), dockH)))
-	}
-	if cardH > 0 && l.v.panel.MinSize().Height > cardH {
-		l.v.panel.Resize(fyne.NewSize(max(l.v.panel.MinSize().Width, s.Width), l.v.panel.MinSize().Height))
-	}
-	// The live area is what streams: when its content outgrew the space the
-	// window had for it, follow the tail inside the card.
-	if dockH > 0 && l.v.liveContentHeight() > dockH {
-		l.v.dockScroll.ScrollToBottom()
-	}
 }
 
 func (l centerLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
@@ -444,15 +459,6 @@ func (l centerLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
 		h += m.Height
 	}
 	return fyne.NewSize(w, h)
-}
-
-// liveContentHeight is the natural height of the streaming turn, 0 when no
-// turn is in flight.
-func (v *guiView) liveContentHeight() float32 {
-	if v.live == nil {
-		return 0
-	}
-	return v.dock.MinSize().Height
 }
 
 // questionCardHeight is the card's natural height for the current panel:
@@ -506,24 +512,45 @@ func (v *guiView) updatePinned() {
 	v.pinned = v.scroll.Offset.Y >= bottom-4
 }
 
-// afterContentChange absorbs a structural change (a block committed): grow
-// the scroll content to its new minimum by resizing it - existing children
-// early-return from Resize (same size), so only the new widgets lay out -
-// then follow the tail (which also refreshes the scroll bars via the
-// renderer). Deliberately NOT scroll.Refresh(): that Refresh()es every
-// committed bubble - re-wrapping all prose and re-parsing every TextGrid -
-// the repaint storm the profile caught (textRenderer.Refresh + setCellRune +
-// wrapWordLines dominating, hundreds of MB/s on a long transcript).
-func (v *guiView) afterContentChange() {
-	v.recomputeWindow()
+// relayoutTranscript re-establishes the scroll after the content grew - by
+// a commit or by the live row streaming: resize the content to its new
+// minimum (existing children early-return from Resize at the same size),
+// follow the tail when pinned, and repaint. Deliberately NOT
+// scroll.Refresh(): that Refresh()es every committed bubble - re-wrapping
+// all prose and re-parsing every card - the repaint storm the profile
+// caught (textRenderer.Refresh + wrapWordLines dominating, hundreds of
+// MB/s on a long transcript).
+func (v *guiView) relayoutTranscript() {
+	// A freshly-built live row reports min height at whatever width it last
+	// saw - zero before its first layout - so lay it out at the row width
+	// before measuring it into the content height. Committed rows get the
+	// same treatment inside virtualLayout.Layout each pass.
+	v.layoutLiveRow(v.scroll.Size().Width)
 	if vs := v.scroll.Size(); vs.Height > 0 {
 		min := v.body.MinSize()
 		v.body.Resize(fyne.NewSize(max(min.Width, vs.Width), max(min.Height, vs.Height)))
 	}
 	if v.pinned {
-		v.scroll.ScrollToBottom()
+		v.scroll.ScrollToBottom() // keep the newest row - live or committed - in view
 	}
 	v.repaint(v.scroll)
+}
+
+// layoutLiveRow sizes the streaming row to the transcript's content width and
+// lays it out, so its measured height is real before it is summed into the
+// scroll extent. No-op when no turn is in flight.
+func (v *guiView) layoutLiveRow(width float32) {
+	if v.liveRow == nil || width <= 0 {
+		return
+	}
+	rw := max(width-scrollbarGutter(), 0)
+	v.liveRow.Resize(fyne.NewSize(rw, v.liveRow.MinSize().Height))
+	v.liveRow.Layout.Layout(v.liveRow.Objects, v.liveRow.Size())
+}
+
+func (v *guiView) afterContentChange() {
+	v.recomputeWindow()
+	v.relayoutTranscript()
 	v.refreshStatus()
 }
 
@@ -554,19 +581,28 @@ func (v *guiView) commitBlock(b block) {
 			// Something else ended the turn: keep what streamed as its own
 			// entry rather than letting a later commit replace it.
 			lb := v.finalizeLive()
-			v.removeLive()
+			v.detachLive()
 			v.appendBlock(lb)
 		} else {
-			v.removeLive()
+			v.detachLive()
 		}
 	}
 	v.appendBlock(b)
 }
 
-func (v *guiView) removeLive() {
-	v.dock.Remove(v.live.box)
+// detachLive retires the streaming row: the committed card that replaces it
+// arrives through appendBlock, so the transcript swaps the live tail for the
+// finished one in the same scroll region it already occupied.
+func (v *guiView) detachLive() {
 	v.live = nil
-	v.layoutCenter() // see flushLive: layout-only, and direct: the border's Resize of a constant-height center would early-return
+	if v.liveRow == nil {
+		return
+	}
+	if v.liveSeen {
+		v.body.Remove(v.liveRow)
+		v.liveSeen = false
+	}
+	v.liveRow = nil
 }
 
 func (v *guiView) finalizeLive() block {
@@ -587,7 +623,11 @@ func (v *guiView) streamChunk() {
 	if v.live == nil {
 		v.live = newLiveArea()
 		v.updatePinned()
-		v.dock.Add(v.live.box)
+		// The streaming turn is the transcript's newest row - same scroll,
+		// same gutter, same tail the pinned view follows. It grows the
+		// scroll's content, never the viewport that holds it.
+		v.liveRow = container.NewVBox(v.live.box, blockSpacer())
+		v.setLiveShown(v.winLast == len(v.committed))
 	}
 	v.live.setText(reasoning, content, g.showReasoning())
 	if v.paintGap <= 0 || time.Since(v.lastFlush) >= v.paintGap {
@@ -602,29 +642,20 @@ func (v *guiView) streamChunk() {
 	time.AfterFunc(wait, func() { g.post(func() { v.flushLive() }) })
 }
 
-// flushLive repaints the streaming turn only: the live surfaces re-wrap, the
-// dock grows to the share of the window's height centerLayout has for it, and
-// the scroll's committed content stays untouched. rootC.Layout re-runs the
-// border and the center layout; every committed child early-returns from
-// Resize because its size did not change - that is what keeps a flush
-// O(live) instead of O(transcript).
+// flushLive repaints the streaming row only: the live surfaces re-wrap, the
+// row's measured height grows the scroll content (the pinned view follows,
+// history stays put), and every other row early-returns from Resize because
+// its size did not change - that is what keeps a flush O(live) instead of
+// O(transcript).
 func (v *guiView) flushLive() {
 	v.flushPending = false
 	v.lastFlush = time.Now()
 	if v.live != nil {
 		v.live.refresh()
 	}
-	// Layout, never Refresh: Container.Refresh cascades Refresh() into every
-	// committed bubble (full re-wrap + TextGrid re-cell). Re-running the
-	// center layout sizes the live dock from its content's MinSize against
-	// the height the column actually has; size changes propagate down
-	// through Resize (whose children that did not change size early-return)
-	// - live-only work, O(transcript) avoided.
-	v.layoutCenter()
-	if v.pinned {
-		v.scroll.ScrollToBottom() // viewport shrank under the dock: keep the tail visible
+	if v.liveSeen {
+		v.relayoutTranscript()
 	}
-	v.repaint(v.scroll)
 	v.refreshStatus()
 }
 
@@ -647,8 +678,7 @@ func (v *guiView) rebuildAll() {
 	for i := range v.committed {
 		v.blockH[i] = estimateBlockHeight(v.committed[i])
 	}
-	v.live = nil
-	v.dock.Objects = nil
+	v.detachLive()
 	// Every materialized row is stale now (visibility changed what it
 	// renders): evict all of them and let the window rebuild from the new
 	// state.

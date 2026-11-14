@@ -179,12 +179,10 @@ func transcriptText(o fyne.CanvasObject) string {
 func (p *guiPane) transcript() string {
 	var s string
 	p.do(func() {
-		parts := make([]string, 0, len(p.v.body.Objects)+len(p.v.dock.Objects))
+		// body holds the materialized window - committed rows and, at the end,
+		// the live streaming row - so one walk covers committed and active.
+		parts := make([]string, 0, len(p.v.body.Objects))
 		for _, o := range p.v.body.Objects {
-			parts = append(parts, transcriptText(o))
-		}
-		// The live streaming areas render below the committed transcript.
-		for _, o := range p.v.dock.Objects {
 			parts = append(parts, transcriptText(o))
 		}
 		s = strings.Join(parts, "\n")
@@ -696,17 +694,16 @@ func TestGUICardsLeaveScrollbarGutter(t *testing.T) {
 		}
 	})
 
-	// The docked live area keeps the same clear strip.
+	// The live streaming row, now a row of the same scroll, keeps the same
+	// clear strip.
 	l.Handler.Content("streaming answer")
 	p.do(func() {
-		dw := p.v.dock.Size().Width
-		if dw <= 0 {
-			t.Fatal("the dock was never laid out")
+		if !p.v.liveSeen || p.v.liveRow == nil {
+			t.Fatal("the live row is not in the transcript scroll")
 		}
-		for _, o := range p.v.dock.Objects {
-			if w := o.Size().Width; w > dw-g+0.5 {
-				t.Errorf("live card is %v wide in a %v dock: no gutter", w, dw)
-			}
+		bodyW := p.v.body.Size().Width
+		if w := p.v.liveRow.Size().Width; bodyW > 0 && w > bodyW-g+0.5 {
+			t.Errorf("live row is %v wide in a %v body: no gutter", w, bodyW)
 		}
 	})
 }
@@ -846,10 +843,10 @@ func TestGUITranscriptVirtualizesToTheViewport(t *testing.T) {
 
 // TestGUITallContentNeverGrowsTheWindow is the regression for the serious
 // one: a turn taller than the window - streaming or committed - must not
-// resize it. The live card grows to the space the window has left and its
-// content scrolls inside the card, and the content tree's MinSize (what the
-// glfw driver's fitContent would grow the window toward) stays far below the
-// window's height.
+// resize it. The streaming turn is a row of the transcript scroll itself:
+// it grows the scrollable content, the pinned view follows its tail, and the
+// content tree's MinSize (what the glfw driver's fitContent would grow the
+// window toward) stays far below the window's height.
 func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
 	c := newConfig("yolo")
 	c.ConfirmExit = false
@@ -868,14 +865,20 @@ func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
 	}
 	height := func() float32 { return p.v.rootC.Size().Height }
 
-	// A turn far taller than the whole window streams into the live card.
+	// A turn far taller than the whole window streams into the transcript
+	// scroll itself: it grows the content the region scrolls, never the
+	// region, and the pinned view follows its tail.
 	l.Handler.Content(tall)
 	p.do(func() {
-		if n, want := p.v.dockScroll.Size().Height, p.v.liveContentHeight(); n >= want {
-			t.Errorf("the live card got %v px for content of %v px: it was not capped to the window", n, want)
+		if !p.v.liveSeen {
+			t.Error("the tall streaming row is not materialized in the transcript window")
 		}
-		if p.v.dockScroll.Offset.Y <= 0 {
-			t.Errorf("the capped live card does not follow the stream (offset %v)", p.v.dockScroll.Offset.Y)
+		if h := p.v.body.MinSize().Height; h <= p.v.scroll.Size().Height {
+			t.Errorf("scroll content height %v does not exceed the viewport %v: the tall turn vanished",
+				h, p.v.scroll.Size().Height)
+		}
+		if p.v.scroll.Offset.Y <= 0 {
+			t.Errorf("the pinned transcript did not follow the stream (offset %v)", p.v.scroll.Offset.Y)
 		}
 		if min := p.v.rootC.MinSize().Height; min > height() {
 			t.Errorf("the content tree's minimum is %v px, over the window's %v: fitContent would force it open", min, height())
@@ -883,7 +886,7 @@ func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
 	})
 
 	// Committing the same tall turn as a transcript card changes nothing:
-	// the transcript scroll already absorbs unbounded content.
+	// the scroll region already absorbed it, window min still bounded.
 	p.Message(msg)
 	p.do(func() {
 		if min := p.v.rootC.MinSize().Height; min > height() {
@@ -893,6 +896,54 @@ func TestGUITallContentNeverGrowsTheWindow(t *testing.T) {
 	if got := p.v.rootC.Size(); got != open {
 		t.Errorf("the window's content resized to %v from %v without the user touching it", got, open)
 	}
+}
+
+// TestGUILiveRowDoesNotResizeTranscript: the size of the scroll region is a
+// function of the window, not of what streams through it. The dock era let a
+// growing live area push the transcript viewport's top edge around mid-turn -
+// the scrollbar jumping under the reader. Stream a tall turn (thinking and
+// output) and commit it: the viewport height never moves while the scrollable
+// content grows.
+func TestGUILiveRowDoesNotResizeTranscript(t *testing.T) {
+	c := newConfig("yolo")
+	l := &agent.Loop{Cfg: c, Env: &env.Local{Timeout: 10 * time.Second}, Model: &model.Deterministic{}}
+	p := newGUIForTest(t, c, l)
+	p.setTask("T")
+	p.do(func() { p.prepareTranscript() })
+	var vp0, content0 float32
+	p.do(func() {
+		vp0 = p.v.scroll.Size().Height
+		content0 = p.v.body.MinSize().Height
+	})
+	if vp0 <= 0 {
+		t.Fatal("no transcript viewport geometry to hold constant")
+	}
+
+	l.Handler.Reasoning("pondering\n" + strings.Repeat("x\n", 60))
+	l.Handler.Content("answering\n" + strings.Repeat("y\n", 60))
+	p.do(func() {
+		if got := p.v.scroll.Size().Height; got != vp0 {
+			t.Errorf("streaming resized the transcript viewport from %v to %v", vp0, got)
+		}
+		if h := p.v.body.MinSize().Height; h <= content0 {
+			t.Errorf("scroll content did not grow with the stream: %v -> %v", content0, h)
+		}
+		if !p.v.liveSeen {
+			t.Error("the live row is not in the transcript window while streaming")
+		}
+	})
+
+	p.Message(model.Message{"role": "assistant", "content": "answering\n" + strings.Repeat("y\n", 60),
+		"reasoning_content": "pondering\n" + strings.Repeat("x\n", 60),
+		"extra":             map[string]any{"cost": 1.0}})
+	p.do(func() {
+		if got := p.v.scroll.Size().Height; got != vp0 {
+			t.Errorf("the commit resized the transcript viewport from %v to %v", vp0, got)
+		}
+		if p.v.liveSeen {
+			t.Error("the live row survived its commit")
+		}
+	})
 }
 
 // TestGUILiveMarkdownRendersAsItStreams: the whole point of the incremental
