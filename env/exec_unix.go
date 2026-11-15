@@ -15,8 +15,10 @@ import (
 	"mvdan.cc/sh/v3/interp"
 )
 
-// killGrace is the INT-to-KILL window when a command is cancelled.
-const killGrace = 2 * time.Second
+// KillGrace is the INT-to-KILL window when a command is cancelled. Exported
+// because the job manager promises a backgrounded command the same chance to
+// clean up that a foreground one gets (job.DefaultKillGrace).
+const KillGrace = 2 * time.Second
 
 // processGroupExecHandler is interp.DefaultExecHandler with one change that
 // matters: the child runs in its own session and cancellation signals the whole

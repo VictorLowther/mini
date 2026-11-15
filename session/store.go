@@ -1,9 +1,13 @@
 // Package session is the transcript's source of truth: one global SQLite
-// database holding sessions, turns, and tool-call records (plus a global
-// settings row-per-key table for interface state that outlives a session), the
-// per-call result files under <tcrBase>/<uuid>/<tcno>.log that hold every
-// command's complete merged stdout+stderr. Tool output never enters the
-// database; the call row only names the byte range the model was shown.
+// database holding sessions, turns, tool-call records, and job records (plus a
+// global settings row-per-key table for interface state that outlives a
+// session), the per-call result files under <tcrBase>/<uuid>/<tcno>.log that
+// hold every command's complete merged stdout+stderr, and the per-job files
+// under <tcrBase>/<uuid>/job-<id>.log that hold a background run's output while
+// it keeps growing. Tool output never enters the database; the call row only
+// names the byte range the model was shown. Jobs are durable for a different
+// reason: a job must be findable after the turn that started it has been
+// summarized away, and after the process that started it has died.
 package session
 
 import (
@@ -87,6 +91,49 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 	FOREIGN KEY (session_id, turn) REFERENCES turns (session_id, seq) ON DELETE CASCADE,
 	FOREIGN KEY (session_id, result_turn) REFERENCES turns (session_id, seq) ON DELETE CASCADE
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS jobs (
+	id           TEXT    NOT NULL PRIMARY KEY,
+	kind         TEXT    NOT NULL DEFAULT 'bash',
+	session_id   TEXT    NOT NULL,
+	parent_id    TEXT    NOT NULL DEFAULT '',
+	tcno         INTEGER,
+	label        TEXT    NOT NULL DEFAULT '',
+	command      TEXT    NOT NULL DEFAULT '',
+	description  TEXT    NOT NULL DEFAULT '',
+	state        TEXT    NOT NULL DEFAULT 'running'
+		CHECK (state IN ('running','completed','failed','killed','orphaned')),
+	pid          INTEGER,
+	pgid         INTEGER,
+	output_path  TEXT    NOT NULL,
+	exit_code    INTEGER,
+	exit_reason  TEXT    NOT NULL DEFAULT '',
+	started_at   INTEGER NOT NULL,
+	ended_at     INTEGER,
+	updated_at   INTEGER NOT NULL,
+	FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_session_started ON jobs (session_id, started_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs (parent_id);
+
+CREATE TABLE IF NOT EXISTS job_events (
+	id           INTEGER NOT NULL PRIMARY KEY,
+	session_id   TEXT    NOT NULL,
+	job_id       TEXT    NOT NULL,
+	monitor_id   TEXT    NOT NULL DEFAULT 'exit',
+	reason       TEXT    NOT NULL,
+	line_no      INTEGER,
+	byte_offset  INTEGER,
+	matched      TEXT    NOT NULL DEFAULT '',
+	context      TEXT    NOT NULL DEFAULT '',
+	elapsed      INTEGER NOT NULL DEFAULT 0,
+	exit_code    INTEGER,
+	fired_at     INTEGER NOT NULL,
+	delivered_at INTEGER,
+	FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
+	FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_events_pending ON job_events (session_id, delivered_at, id);
 `
 
 // Open prepares the database at path. Result files live under

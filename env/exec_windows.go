@@ -8,9 +8,9 @@ import (
 	"mvdan.cc/sh/v3/interp"
 )
 
-// killGrace is the INT-to-KILL window; unused on Windows but kept so the
-// call site in local.go is platform-neutral.
-const killGrace = 2 * time.Second
+// KillGrace is the INT-to-KILL window; kept so the call site in local.go is
+// platform-neutral, and shared with the job manager for the same reason.
+const KillGrace = 2 * time.Second
 
 // processGroupExecHandler falls back to the stock handler: setsid and
 // negative-PID signalling have no Windows equivalent, and mvdan's default

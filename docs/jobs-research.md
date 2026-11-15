@@ -154,10 +154,13 @@ Two consequences the model has to work around today, both easy to miss:
   `bash` exits immediately, its handler's `defer stop()` (`exec_unix.go:60`)
   deregisters the cancel func, and nothing is left to signal the group.
 
-  The lesson for §4 is precise: a job cannot be produced by running a command
-  through the exec handler and hoping it escapes. The manager must own the
-  spawn and its own context, outside the interpreter — and it must not be sold
-  as "the setsid fix", because that half is already done.
+  The lesson for §4 is precise, and it is about *lifetime*, not about which
+  shell answers: a job cannot be produced by running a command through the
+  interpreter and hoping it escapes, because the escape has nowhere to go. What
+  the manager must own is the **context**, so the run outlives the call that
+  started it while staying inside the same interpreter that serves the
+  foreground. And it must not be sold as "the setsid fix", because that half is
+  already done.
 
 ### 2.2 mini-swe-agent — the same wall, inherited
 
@@ -402,7 +405,7 @@ they are.
 | Component | Seen in | LOC ballpark | Pays off for mini? |
 |---|---|---|---|
 | Model-settable per-call timeout (`timeout_s`) | zero `bash.go:52` (120 s default, 600 s max) | ~15 | **Yes, first, minus the clamp.** Deletes mini's "yagni: no per-call timeout override" and covers a large share of the pain with no new state at all. Take zero's *dial* and not zero's *ceiling*: §4 decision 2 forbids an upper bound, so the 600 s max is the one part of zero's shape that is rejected. |
-| Do not let the group kill destroy a job the model *meant* to detach; document the escape | mini `env/exec_unix.go:50-58`, zero `:159-160` | prompt text | **Yes, but re-scoped.** `Setsid: true` is already in place (§2.1), so this is not a process-group fix: the fix is spawning jobs on a manager-owned context outside the exec handler, because `&` inherits the call's ctx via `interp/runner.go:307-328`. The prompt-text half is still owed, and it must not recommend `setsid`, which does not exist on macOS. |
+| Do not let the group kill destroy a job the model *meant* to detach; document the escape | mini `env/exec_unix.go:50-58`, zero `:159-160` | prompt text | **Yes, but re-scoped.** `Setsid: true` is already in place (§2.1), so this is not a process-group fix: the fix is running a job on a **manager-owned context** through the same interpreter, because `&` inherits the call's ctx via `interp/runner.go:307-328` and dies with it. Cancelling that context already signals the whole group of whatever the job has in flight. The prompt-text half is still owed, and it must not recommend `setsid`, which does not exist on macOS. |
 | Auto-background a foreground call past a threshold, returning a job id + next-step text | crush `bash.go:386-451` (default 60 s) | ~60 | **Yes — and this is the spine, not an option.** crush's threshold becomes mini's fixed 30 s foreground budget (§4 decision 3), so today's `DefaultTimeout` survives as the handoff point instead of the kill point. The fast-failure grace is what makes it not lie. |
 | Output stays in the tcr result file; the job tool *pages* it (offset/lines, tail default) | little-coder `ShellLog`, mini `model/view.go` | ~40 | **The file, yes; the paging tool, no.** mini's reader is `bash` plus the path, which the system prompt already teaches (`config/configs/mini.yaml:57-59`), so this row's first half is the design and its second half is deleted in §4 — see §"Why there is no `job_output` tool". Full output already lives on disk per call; a job is a row whose file keeps growing. crush/qwen had to build buffers; mini already has the file. Both halves of the read exist: `ReadView(path, offset, end)` (`model/view.go:140`) for byte ranges and `countNewlines` (`:116`) for the line numbers a `match` firing has to report. The one rule that keeps this safe is append-at-EOF, because result paths are *derived*, not stored (`session/tcr.go:12-16`), and rows carry fixed `tcr_offset`s that a rewrite would invalidate. The one part still owed is `output_path` on the `jobs` listing, because a path the model has never been given is a path it cannot read. |
 | Status is asserted, never inferred from output (status file or DB column) | qwen `statusFilePathFor` + the block-buffering guidance | ~30 | **Yes, and now load-bearing.** With monitors as the push mechanism (§4), a block-buffered program whose output file is empty looks identical to a stalled one — the exit rule still fires, but `match` silently never does. sushi-box commands are exactly the block-buffering kind, so `-u`/`stdbuf -oL` belongs in the tool description. |
@@ -660,8 +663,8 @@ label         TEXT               -- model-supplied "quantise llama 70b", the thi
 command       TEXT               -- kind-specific payload; for subagents, the task description
 description   TEXT               -- the model's own note, crush's shape
 state         TEXT               -- running|completed|failed|killed|orphaned
-pid           INTEGER NULL       -- kind='bash' detail; NULL for a run that is not a process
-pgid          INTEGER NULL       -- signalled as -pgid; also kind-specific
+pid           INTEGER NULL       -- only for a kind that forks a wrapper; NULL for an in-process run
+pgid          INTEGER NULL       -- signalled as -pgid; nil when there is no one pid for the job
 output_path   TEXT NOT NULL      -- STORED, not derived; see below
 started_at    INTEGER
 ended_at      INTEGER NULL
@@ -837,26 +840,40 @@ Kill(grace) Wait(<-chan firing)
 - `parent_id` plus a `ListByParent`-style query (zero `manager.go:525`) so
   `jobs` can render a tree and so **reaping a parent reaps its children** — the
   one subagent behaviour that would otherwise leak a process per child.
-- Process particulars (`pid`, `pgid`, `Setsid`, `killGrace`) live **inside the
-  bash kind's detail**, not on the generic job. `Setsid` in particular is not a
-  universal: an in-process subagent has nothing to signal.
+- Process particulars live **inside the kind's own stopper**, not on the generic
+  job — and for the bash kind they are not pids at all, because the run is
+  mini's own interpreter on a dedicated context and `&` children are sessions
+  the exec handler already owns. What a kind owes the generic path is
+  `stop(grace)` and nothing else. Note the consequence for `jobs`: it must not
+  promise a pid for a `bash` run, because there isn't one, and a model told
+  otherwise will `kill` mini.
 - What deliberately does **not** generalise: the `tcno` join. Only `kind='bash'`
   display resolves a job back to a tool call, and no generic path may do it.
 
 ### Process discipline and lifetime
 
-1. **Spawn in the manager, not the interpreter.** `exec.Cmd` with
-   `SysProcAttr{Setsid: true}` on a manager-owned context. This is the
-   load-bearing correction from §2.1: mini already gives every external command
-   its own session, so the work is not "add setsid" and `setsid` is not even
-   installed on macOS — the work is getting the job's lifetime off
-   `interp`'s call context, which `&` cannot escape because background
-   statements run in-process on that same context (`interp/runner.go:307-328`).
-2. **Kill the group, with the checks.** Negative-pid group signal (mini already
-   does this), PID-reuse verification before signalling and a restore-to-`running`
-   if the signal did not land (zero `isRunningPID` `:325`,
-   `restoreRunningAfterFailedKill` `:367`), SIGINT→SIGKILL over the existing
-   `killGrace` (`env/exec_unix.go:50-58`).
+1. **Own the context, keep the interpreter.** A job is the same
+   `mvdan.cc/sh` runner that answers every foreground call — `env.Local`, driven
+   on a `context.WithCancel` the manager holds instead of the tool call's. Forking
+   `/bin/bash` for background calls was the obvious design and it is wrong:
+   the prompts teach mini's bash grammar, the macOS system bash is 3.2, and a
+   loop or an expansion that behaves differently only once backgrounded reads
+   to the model as the harness lying. The manager-owned context is what §2.1
+   actually requires, since `&` cannot escape the call's context (background
+   statements run in-process on it, `interp/runner.go:307-328`), and "no
+   deadline" is a property of the environment, so `env.Local` gained
+   `Timeout < 0` rather than the job path growing its own runner.
+2. **Kill by cancelling; the group dies with it.** Cancellation reaches
+   `processGroupExecHandler`, which already SIGINTs, waits `env.KillGrace`,
+   then SIGKILLs **the group of the command in flight**, because every external
+   command it starts is its own session leader (`env/exec_unix.go:46`). So the
+   guarantee is per in-flight command rather than one job-wide pgid, and it
+   covers what matters: the `python train.py` and the dataloader workers
+   forked underneath it. PID-reuse cannot bite, because mini only ever signals
+   a process whose start it is sitting on inside the handler — which is a
+   stronger invariant than zero's `isRunningPID` check (`manager.go:325`)
+   obtained without tracking a pid across restarts. The cost is stated in the
+   sweep below: after a crash, nothing is signalled at all.
 3. **A job outlives a turn, never a session.** Written into the tool
    description the way omp documents `session.rs:44-56`; the documentation is
    part of the feature, because it is the only place the model can learn the
@@ -910,11 +927,12 @@ its cost.
 
 ### Build order
 
-1. **The registry.** `jobs` + `job_events` tables, the `Job` interface, the
-   manager-owned spawn with `SysProcAttr{Setsid: true}`, output to
-   `job-<id>.log`, the state machine, the `running ⇒ orphaned` sweep at store
-   open, and reap-on-quit. This is the foundation everything else reads, and it
-   is also what makes the feature safe to ship half-finished.
+1. **The registry.** ✅ *built* — `jobs` + `job_events` tables, the `Run`/
+   `stopper` seam, the manager-owned context over `env.Local`, output to
+   `job-<id>.log` in the session's own result directory, the state machine, the
+   `running ⇒ orphaned` sweep at open, and reap-on-quit. Foundation everything
+   else reads, and safe to ship half-finished precisely because the sweep and
+   the reap are live before any job can be started.
 2. **Promotion.** `bash` gains `background` and optional unbounded `timeout_s`;
    the 30 s auto-background with fast-failure grace; `jobs` **with
    `output_path` and log size**; `job_kill`; `MAX_JOBS`. After this step a job is
@@ -937,6 +955,27 @@ its cost.
 6. **Subagents**, when they arrive, as a second `kind` behind the same
    interface. If that step needs a new monitor, a new injection path, or a
    kind-specific output reader, steps 1–5 were built wrong.
+
+### What is built
+
+Step 1 is in the tree:
+
+- `job` — `Manager` (cap, live set, `Sweep`, `KillAll`), `Run`
+  (`State/Alive/Elapsed/Wait/Kill/Done/Row/OutputPath`), `Spec`, and
+  `local.go`'s interpreter-backed `Start` and outcome watcher.
+- `session/jobs.go` + two tables in `session/store.go` — the registry, the
+  first-writer-wins `FinishJob`, the sweep that returns its warnings, and the
+  `job_events` firings the monitor engine will write.
+- `env` — `KillGrace` exported so a job and a foreground command share one
+  number, and `Timeout < 0` meaning no deadline.
+- `cmd/mini` — one manager per run over the session's own `env.Local`, the
+  sweep with the warnings surfaced, and the reap folded into the cleanup path
+  both front ends already share.
+
+Nothing starts a job yet, which is the point of building the registry first:
+the guarantees that are easy to get wrong — ownership after a crash, reaping,
+one interpreter, append-only output — are already enforced before the model can
+ask for a job. Step 2 (promotion) is where the tool surface appears.
 
 ### Open questions to settle before step 1
 

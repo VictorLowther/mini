@@ -26,6 +26,7 @@ import (
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
+	"github.com/VictorLowther/mini/job"
 	"github.com/VictorLowther/mini/model"
 	"github.com/VictorLowther/mini/session"
 	"github.com/VictorLowther/mini/ui"
@@ -380,7 +381,13 @@ type miniRun struct {
 	// Store is the same handle Sess writes through, handed to the front ends
 	// for the store's global settings table - the interface state that is not
 	// part of any session (ui/prefs.go).
-	Store      *session.Store
+	Store *session.Store
+	// Jobs is the registry of runs that outlive their tool call. Nothing starts
+	// one yet - the bash parameters and the job_* tools are the next steps of
+	// docs/jobs-research.md §4's build order - but the sweep at open and the
+	// reap on exit are already wired, which is what keeps the feature safe to
+	// ship half-finished.
+	Jobs       *job.Manager
 	ResumeMsgs []model.Message
 	ResumeNote string
 	ConfigName string
@@ -492,11 +499,32 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	}
 	l.Recorder = sess
 
+	// Job registry, one per run. It interprets backgrounded commands through the
+	// same env.Local that answers the foreground bash tool, so a job is the same
+	// shell with a longer leash rather than a second dialect the model cannot
+	// see coming. The sweep runs before anything can start: a row still marked
+	// 'running' is a claim about a process this mini does not own, so it becomes
+	// orphaned and the human is told, which is the honest version of "still
+	// running" (docs/jobs-research.md §4).
+	jobs := &job.Manager{Session: sess, Local: e, Logger: slog.Default()}
+	for _, w := range jobs.Sweep() {
+		slog.Warn("job left running by a previous run", "warning", w)
+	}
+
 	return &miniRun{
 		O: o, AgentCfg: agentCfg, Model: m, Env: e, Loop: l, Sess: sess, Store: store,
+		Jobs:       jobs,
 		ResumeMsgs: resumeMsgs, ResumeNote: resumeNote,
 		ConfigName: configName, LogTarget: logTarget,
-		closeStore: func() { _ = store.Close() },
+		// Reaping rides the one cleanup path both front ends already share, and
+		// runs before the database closes so the ended states are recorded: a
+		// job outlives a turn, never a session.
+		closeStore: func() {
+			if n := jobs.KillAll(); n > 0 {
+				slog.Info("reaped live jobs on exit", "count", n)
+			}
+			_ = store.Close()
+		},
 	}, nil
 }
 

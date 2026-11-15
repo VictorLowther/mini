@@ -25,15 +25,32 @@ type Local struct {
 	CWD string
 	// Env overrides the inherited process environment (the config's env block).
 	Env map[string]string
-	// Timeout bounds one command. Zero means DefaultTimeout.
+	// Timeout bounds one command. Zero means DefaultTimeout, and a negative
+	// value means no deadline at all: only the caller's context can end the
+	// run. That is what a background job needs
+	// (docs/jobs-research.md §4 decision 2 - the model's timeouts are its own
+	// and there is no upper bound), and it is why the job manager drives this
+	// same Execute rather than a second runner of its own.
 	Timeout time.Duration
 }
 
 func (l *Local) timeout() time.Duration {
-	if l.Timeout <= 0 {
+	if l.Timeout == 0 {
 		return DefaultTimeout
 	}
 	return l.Timeout
+}
+
+// runContext applies the command's budget and hands back its cancel.
+func (l *Local) runContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	d := l.timeout()
+	if d < 0 {
+		// No deadline: the caller's context is the whole story, and cctx.Err()
+		// can never report DeadlineExceeded, so the timeout branch in Execute
+		// stays unreachable without a fake timer to prove it.
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 // Execute runs one command and returns its Result. The only Go error it
@@ -52,7 +69,9 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 	}
 
 	// yagni: no per-call timeout override; nothing in the reference passes one.
-	cctx, cancel := context.WithTimeout(ctx, l.timeout())
+	// Callers that need a per-call budget build the context themselves, which
+	// is exactly how the job manager runs one command with no deadline.
+	cctx, cancel := l.runContext(ctx)
 	defer cancel()
 
 	file, perr := syntax.NewParser().Parse(strings.NewReader(command), "")
@@ -88,7 +107,7 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 		// The singular, deprecated option on purpose: interp.ExecHandlers
 		// always appends DefaultExecHandler, which signals only the child PID
 		// and would orphan grandchildren.
-		interp.ExecHandler(processGroupExecHandler(killGrace)),
+		interp.ExecHandler(processGroupExecHandler(KillGrace)),
 	)
 	if rerr != nil {
 		return Result{ReturnCode: -1, ExceptionInfo: fmt.Sprintf("An error occurred while executing the command: %v", rerr)}, nil
