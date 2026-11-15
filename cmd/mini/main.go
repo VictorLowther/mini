@@ -507,6 +507,7 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	// orphaned and the human is told, which is the honest version of "still
 	// running" (docs/jobs-research.md §4).
 	jobs := &job.Manager{Session: sess, Local: e, Logger: slog.Default()}
+	l.Jobs = jobs
 	for _, w := range jobs.Sweep() {
 		slog.Warn("job left running by a previous run", "warning", w)
 	}

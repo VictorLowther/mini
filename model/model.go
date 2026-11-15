@@ -19,6 +19,16 @@ type Message = map[string]any
 type Action struct {
 	Command    string `json:"command"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// TimeoutS is the model's own budget for this command, in seconds, from the
+	// optional timeout_s parameter. 0 means "no opinion": the environment's
+	// default applies. There is deliberately no ceiling - a training run is
+	// longer than any number the harness could pick (docs/jobs-research.md §4,
+	// decision 2) - and a value the model asks for expires into the same
+	// handoff as the default, never into a silent kill.
+	TimeoutS int `json:"timeout_s,omitempty"`
+	// Background asks for the run as a job: start it, report the id and the
+	// path its output is accumulating at, and return without waiting.
+	Background bool `json:"background,omitempty"`
 }
 
 // ToolCall is an issued call plus the open file its complete merged output is
@@ -96,14 +106,27 @@ func (h *Handler) content(s string) {
 var BASH_TOOL = map[string]any{
 	"type": "function",
 	"function": map[string]any{
-		"name":        "bash",
-		"description": "Execute a bash command",
+		"name": "bash",
+		"description": "Execute a bash command. Output is merged stdout+stderr. " +
+			"A command that is still running after 30 seconds is interrupted and " +
+			"comes back as a timeout observation, so for anything longer ask for " +
+			"the time it needs with timeout_s, or set background: true to get a " +
+			"job id and an output path back immediately and keep working. A job " +
+			"outlives a turn, never a session.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"command": map[string]any{
 					"type":        "string",
 					"description": "The bash command to execute",
+				},
+				"timeout_s": map[string]any{
+					"type":        "integer",
+					"description": "Seconds to wait for this command before giving up on it. Optional and uncapped: set it to what the command actually needs, such as a build or a training run. 0 or omitted means the default of 30 seconds. On expiry the command is interrupted and its output so far comes back as a timeout observation, so ask for more time rather than re-running something that was half done.",
+				},
+				"background": map[string]any{
+					"type":        "boolean",
+					"description": "Start the command as a job and return immediately with its job id and output path, instead of waiting for it. Use for anything that outlives a few minutes: training, quantising, servers, soak tests, long builds. The job keeps its own output file; read it with tail, sed -n, or grep.",
 				},
 			},
 			"required": []string{"command"},

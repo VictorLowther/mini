@@ -20,6 +20,7 @@ import (
 
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
+	"github.com/VictorLowther/mini/job"
 	"github.com/VictorLowther/mini/model"
 	"github.com/VictorLowther/mini/tpl"
 )
@@ -153,6 +154,11 @@ type Loop struct {
 	Cfg   *Config
 	Model model.Model
 	Env   env.Environment
+	// Jobs is the registry backgrounded commands are handed to. nil means this
+	// run cannot background anything - a test harness, or a front end that has
+	// not wired one up - and `background: true` then comes back as a reported
+	// failure rather than a command that silently ran in the foreground.
+	Jobs  *job.Manager
 	Hooks Hooks
 	// Recorder persists the transcript; nil turns persistence off, but never
 	// the capture: the loop still writes each command's output to a scratch
@@ -209,6 +215,69 @@ func (l *Loop) scratchToolCall(action model.Action) (model.ToolCall, error) {
 // render or append them again; Cost and NCalls are seeded by the caller from
 // the session row.
 func (l *Loop) Resume(msgs []model.Message) { l.resumed = msgs }
+
+// callContext applies the model's own budget for one command. The deadline
+// travels on the context because that is how env.Local is told to prefer a
+// caller's number over its default, which keeps the Environment signature free
+// of a timeout argument a container environment would have to imitate blindly.
+func (l *Loop) callContext(ctx context.Context, action model.Action) (context.Context, context.CancelFunc) {
+	if action.TimeoutS <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, time.Duration(action.TimeoutS)*time.Second)
+}
+
+// runForeground is one command with the model's own budget applied and released.
+func (l *Loop) runForeground(ctx context.Context, action model.Action, sink io.Writer) (env.Result, error) {
+	cctx, cancel := l.callContext(ctx, action)
+	defer cancel()
+	return l.Env.Execute(cctx, action.Command, "", sink)
+}
+
+// startJob hands the command to the job registry and writes the handoff into the
+// tool call's own result file.
+//
+// Two files, deliberately: the call's file keeps the harness's note and is
+// finished here like any other observation, while the job appends to its own
+// for as long as it lives. Rewriting the call's file when the job ended would
+// break the append-at-EOF rule that keeps every stored tcr_offset true, and a
+// model reading the transcript later sees the handoff exactly as it was told it.
+func (l *Loop) startJob(action model.Action, tc model.ToolCall, sink io.Writer) (env.Result, error) {
+	if l.Jobs == nil {
+		return env.Result{
+			ReturnCode:    -1,
+			ExceptionInfo: "this run has no job registry: run the command without background, or restart mini with sessions enabled",
+			Extra:         map[string]any{"exception_type": "JobsUnavailable"},
+		}, nil
+	}
+	r, err := l.Jobs.Start(job.Spec{Command: action.Command, TCNO: tc.Number})
+	if err != nil {
+		// A refusal is an observation, not a crash: the cap error names the
+		// remedy, and the model can act on it in the next turn.
+		return env.Result{
+			ReturnCode:    -1,
+			ExceptionInfo: err.Error(),
+			Extra:         map[string]any{"exception_type": "JobRefused"},
+		}, nil
+	}
+	path := r.OutputPath()
+	res := env.Result{ReturnCode: 0, Extra: map[string]any{
+		"job_id":          r.ID(),
+		"job_output_path": path,
+	}}
+	if sink == nil {
+		return res, nil
+	}
+	// The handoff is the only place the model learns where the bytes are going,
+	// so it states the path twice: once as a fact, once inside a command it can
+	// copy. The window in the recipe is the one the prompt already teaches, so a
+	// first read of a job log cannot waste a turn re-truncating.
+	fmt.Fprintf(sink, "started in the background as job %s; the command is running in its own process group.\n", r.ID())
+	fmt.Fprintf(sink, "output is appended to %s\n", path)
+	fmt.Fprintf(sink, "read it with: tail -n %d %s   (or grep -n PATTERN %s; prefer narrowing to cat)\n", model.MaxViewLines, path, path)
+	fmt.Fprintf(sink, "the job keeps running when this turn ends, and is killed when the session closes.\n")
+	return res, nil
+}
 
 // QueueMessage appends a user message to the history before the next model
 // call. This is the GUI's steering input: the user can always type, even while
@@ -700,7 +769,13 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		if tc.File != nil {
 			sink = tc.File
 		}
-		res, err := l.Env.Execute(ctx, action.Command, "", sink)
+		var res env.Result
+		var err error
+		if action.Background {
+			res, err = l.startJob(action, tc, sink)
+		} else {
+			res, err = l.runForeground(ctx, action, sink)
+		}
 		// Stop the shell's writes and measure the file once, before any
 		// branch returns: this is the only place tail arithmetic happens.
 		// Closing first keeps the fd from leaking on the cancellation path;

@@ -233,10 +233,16 @@ func pgrepHas(t *testing.T, pattern string) bool {
 	return strings.TrimSpace(string(out)) != ""
 }
 
+// Two ways a run can be cut short, and they must not be confused: a
+// cancellation is something the caller did to the loop, and a deadline is
+// something the command failed to beat.
 func TestBusyLoopStopsOnContextCancel(t *testing.T) {
 	l := &Local{Timeout: time.Minute}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(time.Second)
+		cancel()
+	}()
 	start := time.Now()
 	_, err := l.Execute(ctx, "while :; do :; done", "", io.Discard)
 	if err == nil {
@@ -244,6 +250,23 @@ func TestBusyLoopStopsOnContextCancel(t *testing.T) {
 	}
 	if time.Since(start) > 20*time.Second {
 		t.Fatalf("pure-shell loop ignored cancellation for %v", time.Since(start))
+	}
+}
+
+// This is the case a model-set timeout_s arrives as: the caller carries the
+// deadline, so ctx is cctx and its error is DeadlineExceeded. Treating that as
+// an interruption would report a user Ctrl-C that never happened and throw away
+// the partial output, which is the useful half of a timed-out build.
+func TestBusyLoopDeadlineIsAnObservationNotAnInterruption(t *testing.T) {
+	l := &Local{Timeout: time.Minute}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	res, err := l.Execute(ctx, "while :; do :; done", "", io.Discard)
+	if err != nil {
+		t.Fatalf("a deadline the caller set must not surface as an error: %v", err)
+	}
+	if res.ReturnCode != -1 || res.Extra["exception_type"] != "TimeoutExpired" {
+		t.Errorf("res = %+v, want the timeout observation shape", res)
 	}
 }
 
@@ -306,5 +329,71 @@ func TestUnameTemplateVars(t *testing.T) {
 	}
 	if _, ok := vars["env"].(map[string]any); !ok {
 		t.Errorf("config dump missing env map: %#v", vars["env"])
+	}
+}
+
+// A caller's deadline beats the environment default, and the message names the
+// number that expired rather than the default: this is how a model-set
+// timeout_s outlives or undercuts Local.Timeout without a parameter for it.
+func TestCallerDeadlineBeatsTheDefault(t *testing.T) {
+	l := &Local{Timeout: 30 * time.Second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res, err := l.Execute(ctx, "sleep 5", t.TempDir(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("the environment default won: the call took %v", d)
+	}
+	if res.ReturnCode != -1 || res.Extra["exception_type"] != "TimeoutExpired" {
+		t.Errorf("res = %+v", res)
+	}
+	msg, _ := res.Extra["exception"].(string)
+	if !strings.Contains(msg, "after 0 seconds") && !strings.Contains(msg, "after 1 seconds") {
+		t.Errorf("the message names the wrong deadline: %q", msg)
+	}
+	if strings.Contains(msg, "30 seconds") {
+		t.Errorf("the message named the default instead of the caller's budget: %q", msg)
+	}
+}
+
+// A budget longer than the default has to work too, or the model cannot build
+// anything: the whole reason timeout_s exists.
+func TestCallerDeadlineCanExceedTheDefault(t *testing.T) {
+	l := &Local{Timeout: 300 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := l.Execute(ctx, "echo took-my-time", t.TempDir(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReturnCode != 0 || res.Extra["exception_type"] == "TimeoutExpired" {
+		t.Errorf("the default cut a command that was given a longer budget: %+v", res)
+	}
+}
+
+// Negative Timeout means no deadline at all, which is what a background job
+// runs under: nothing in mini may decide that a training run has taken long
+// enough.
+func TestNegativeTimeoutMeansNoDeadline(t *testing.T) {
+	l := &Local{Timeout: -1}
+	dir := t.TempDir()
+	var buf bytes.Buffer
+	start := time.Now()
+	res, err := l.Execute(context.Background(), "sleep 1.2; echo done", dir, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReturnCode != 0 {
+		t.Fatalf("res = %+v", res)
+	}
+	if !strings.Contains(buf.String(), "done") {
+		t.Errorf("output = %q", buf.String())
+	}
+	if time.Since(start) < time.Second {
+		t.Error("the run returned before the sleep finished")
 	}
 }

@@ -41,16 +41,29 @@ func (l *Local) timeout() time.Duration {
 	return l.Timeout
 }
 
-// runContext applies the command's budget and hands back its cancel.
-func (l *Local) runContext(ctx context.Context) (context.Context, context.CancelFunc) {
+// runContext applies the command's budget and hands back its cancel and the
+// number of seconds it settled on, so the timeout message can name the deadline
+// that actually expired instead of the environment default.
+//
+// A deadline already carried by ctx wins, which is how a per-call budget reaches
+// an Environment whose Execute signature has no timeout field: the caller wraps
+// the context. That keeps the interface something a docker or singularity
+// environment can imitate, and makes the precedence one rule instead of a second
+// budget to keep in sync. l.Timeout is the default for callers with no opinion,
+// and negative means no default at all, which is what a background job needs.
+func (l *Local) runContext(ctx context.Context) (context.Context, context.CancelFunc, time.Duration) {
+	if deadline, ok := ctx.Deadline(); ok {
+		return ctx, func() {}, time.Until(deadline)
+	}
 	d := l.timeout()
 	if d < 0 {
-		// No deadline: the caller's context is the whole story, and cctx.Err()
-		// can never report DeadlineExceeded, so the timeout branch in Execute
-		// stays unreachable without a fake timer to prove it.
-		return ctx, func() {}
+		// No deadline: cctx.Err() can never report DeadlineExceeded, so the
+		// timeout branch in Execute stays unreachable without a fake timer to
+		// prove it.
+		return ctx, func() {}, 0
 	}
-	return context.WithTimeout(ctx, d)
+	cctx, cancel := context.WithTimeout(ctx, d)
+	return cctx, cancel, d
 }
 
 // Execute runs one command and returns its Result. The only Go error it
@@ -71,7 +84,7 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 	// The budget comes from l.Timeout; a caller that wants a different one per
 	// call wraps the context itself, which is how the job manager runs one
 	// command with no deadline at all (Timeout < 0).
-	cctx, cancel := l.runContext(ctx)
+	cctx, cancel, budget := l.runContext(ctx)
 	defer cancel()
 
 	file, perr := syntax.NewParser().Parse(strings.NewReader(command), "")
@@ -130,15 +143,27 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 	runErr := runner.Run(cctx, file)
 
 	switch {
-	case ctx.Err() != nil:
-		// The user (or the shutdown signal) stopped the run mid-command: an
-		// interruption, not an observation.
+	case ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// A cancellation somebody asked for - the user, or the shutdown signal -
+		// stopped the run mid-command: an interruption, not an observation.
+		// Testing Canceled-ness rather than "ctx.Err() != nil" matters now that a
+		// caller may carry the deadline itself: with no deadline of its own,
+		// ctx IS cctx, so a model-set timeout would otherwise be reported as
+		// though the human had pressed Ctrl-C, and the partial output - the
+		// useful half of a timed-out build - would be dropped on the floor.
 		return Result{}, ctx.Err()
 	case errors.Is(cctx.Err(), context.DeadlineExceeded):
-		// Killed the whole process group, so partial output (already in out)
-		// is all we get; returncode -1 mirrors subprocess.TimeoutExpired
-		// handling.
-		msg := fmt.Sprintf("Command %q timed out after %d seconds", command, int(l.timeout().Seconds()))
+		// Either budget expiring lands here - the environment's default or a
+		// per-call one the model asked for. Killed the whole process group, so
+		// partial output (already in out) is all we get, and returncode -1 is the shape the observation template
+		// already renders for a command that could not finish. budget is the
+		// number the model asked for when it asked for one, which is the only
+		// honest thing to name in a message about a deadline it can read back.
+		secs := int(budget.Seconds())
+		if secs < 1 {
+			secs = 1
+		}
+		msg := fmt.Sprintf("Command %q timed out after %d seconds", command, secs)
 		return Result{
 			ReturnCode:    -1,
 			CWD:           dir,

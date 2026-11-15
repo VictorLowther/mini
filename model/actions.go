@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,15 +11,68 @@ import (
 	"github.com/VictorLowther/mini/tpl"
 )
 
-// parseToolCallActions is the port of parse_toolcall_actions, with one
-// deliberate departure from the Python original: a response that ended
-// naturally with no tool calls is not an error but a submission - the model
-// putting its tools down and going quiet, which the prompts define as "the
-// task is done, I am ready for the user's next prompt". Only a call-less
-// response that did NOT end naturally (truncated, or a stream that died
-// without a finish reason) is a FormatError. Error texts are reproduced
-// verbatim otherwise, concatenated in the same order and stripped, and every
-// failure becomes a FormatError carrying the rendered template plus the
+// optionalSeconds reads an optional timeout_s. Models emit the same value as a
+// number, a string, or a float with a zero fraction depending on how the turn
+// was sampled, and all three mean the same thing; anything else means the model
+// did not ask, so the default budget applies. Negative and zero both mean
+// "no opinion" - there is no way to ask for an uncapped foreground wait, because
+// an uncapped wait would be the harness hanging on a command nobody is watching.
+func optionalSeconds(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return clampSeconds(int(n))
+	case int:
+		return clampSeconds(n)
+	case int64:
+		return clampSeconds(int(n))
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0
+		}
+		return clampSeconds(int(i))
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(n))
+		if err != nil {
+			return 0
+		}
+		return clampSeconds(i)
+	}
+	return 0
+}
+
+func clampSeconds(n int) int {
+	if n < 1 {
+		return 0
+	}
+	return n
+}
+
+// optionalBool reads an optional background flag, accepting the "true" spelling
+// a model sometimes quotes.
+func optionalBool(v any) bool {
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		s := strings.ToLower(strings.TrimSpace(b))
+		return s == "true" || s == "1" || s == "yes"
+	}
+	return false
+}
+
+// parseToolCallActions turns one response's tool calls into actions. A response
+// that ended naturally with no tool calls is not an error but a submission - the
+// model putting its tools down and going quiet, which the prompts define as "the
+// task is done, I am ready for the user's next prompt". Only a call-less response
+// that did NOT end naturally (truncated, or a stream that died without a finish
+// reason) is a FormatError.
+//
+// The error texts are worth keeping stable for their own reason, not for
+// anyone's benefit: they are the only feedback a model gets when it malformed a
+// call, so a rewrite that loses "Missing 'command' argument in bash tool call"
+// costs a turn to rediscover what the message already said. All of them arrive
+// concatenated in order through the FormatError template with the
 // {error, actions, has_tool_calls, finish_reason} context.
 func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx map[string]any) ([]Action, error) {
 	if len(toolCalls) == 0 {
@@ -55,7 +109,15 @@ func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx ma
 			b, _ := json.Marshal(args["command"])
 			command = string(b)
 		}
-		actions = append(actions, Action{Command: command, ToolCallID: id})
+		action := Action{Command: command, ToolCallID: id,
+			// Both optional parameters are permissive on purpose, matching the
+			// rule in docs/jobs-research.md §4 that a job which failed to start
+			// is worse than one missing a knob: a value that is not a number
+			// falls back to "no opinion" rather than failing the call.
+			TimeoutS:   optionalSeconds(args["timeout_s"]),
+			Background: optionalBool(args["background"]),
+		}
+		actions = append(actions, action)
 	}
 	return actions, nil
 }
