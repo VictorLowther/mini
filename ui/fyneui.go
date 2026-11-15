@@ -25,6 +25,10 @@ type GUIOptions struct {
 	// and a stray log write to the launching terminal is noise nobody reads.
 	LogWriter *LogTarget
 	App       fyne.App
+	// Settings carries the state that survives a quit - the thinking toggle
+	// and the window's size - and is read once, at construction. nil is a
+	// valid value (a GUI with no store opens collapsed at the default size).
+	Settings Settings
 }
 
 // GUI is the Fyne desktop front end, the interactive face of mini. It is both
@@ -65,7 +69,8 @@ type GUI struct {
 	runDone  chan struct{}
 	// cancelRun stops the run (quit).
 	cancelRun context.CancelFunc
-	// reasoningVisible is toggled with ctrl+t / /t; hidden by default.
+	// reasoningVisible is toggled with ctrl+t / /t, and is sticky across
+	// launches (see ui/prefs.go); hidden until someone asks otherwise.
 	reasoningVisible bool
 	// task is the run's task text, shown on one line in place of the rendered
 	// instance template.
@@ -75,6 +80,11 @@ type GUI struct {
 	resume     []model.Message
 	resumeNote string
 	sessionID  string
+
+	// settings is the sticky-state store handed in through GUIOptions; nil
+	// means this GUI has nowhere to remember anything. It is written from the
+	// toolkit goroutine only, and never read after construction.
+	settings Settings
 }
 
 // NewGUI builds the window and installs the GUI as the loop's streaming
@@ -97,6 +107,10 @@ func NewGUI(o GUIOptions) *GUI {
 		app:        a,
 		runDone:    make(chan struct{}),
 		post:       fyne.Do,
+		settings:   o.Settings,
+		// The thinking toggle comes back from the store; with nothing stored
+		// the window opens collapsed, as it always did.
+		reasoningVisible: loadThinkingShown(o.Settings),
 	}
 	if o.Model != nil {
 		g.modelName = o.Model.Model
@@ -114,7 +128,10 @@ func NewGUI(o GUIOptions) *GUI {
 	g.v = newGUIView(g, w)
 	w.SetContent(g.v.root())
 	w.SetMainMenu(g.menus())
-	w.Resize(fyne.NewSize(960, 720))
+	// The saved size is the user's, and it is applied before Show so the
+	// window opens at the size it closed at instead of cascading one resize
+	// in front of them.
+	w.Resize(loadWindowSize(o.Settings))
 	// Closing the window is the deliberate way out: same path as /quit,
 	// cancelling the run if one is in flight.
 	w.SetOnClosed(g.quit)
@@ -232,7 +249,10 @@ func (g *GUI) finish(info map[string]any, err error) {
 }
 
 // quit ends the app: the window closes and Run returns. A running loop is
-// cancelled first, so leaving never orphans a command mid-execution.
+// cancelled first, so leaving never orphans a command mid-execution, and the
+// sticky state is written before the driver takes the window away - this is
+// the one moment the size is guaranteed to still be readable and the last
+// moment anybody cares.
 func (g *GUI) quit() {
 	g.mu.Lock()
 	cancel := g.cancelRun
@@ -240,7 +260,24 @@ func (g *GUI) quit() {
 	if g.loopRunning() && cancel != nil {
 		cancel()
 	}
+	g.saveStickyState()
 	g.app.Quit()
+}
+
+// saveStickyState writes what the next launch restores: the thinking toggle
+// and the window's content size (the same unit Resize takes, which is why
+// reading the canvas rather than the content tree is the honest measurement).
+// Safe from the toolkit goroutine, the only place it is called.
+func (g *GUI) saveStickyState() {
+	if g.settings == nil {
+		return
+	}
+	saveThinkingShown(g.settings, g.showReasoning())
+	if g.window != nil {
+		if size := g.window.Canvas().Size(); size.Width > 0 && size.Height > 0 {
+			saveWindowSize(g.settings, size)
+		}
+	}
 }
 
 var _ UI = (*GUI)(nil)
@@ -401,12 +438,19 @@ func (g *GUI) PendingQuestion() Question {
 	return g.lastQ
 }
 
-// ToggleReasoning flips the collapsed state of thinking blocks.
+// ToggleReasoning flips the collapsed state of thinking blocks, and remembers
+// the flip: quitting and coming back leaves it exactly where the user left it.
 func (g *GUI) ToggleReasoning() bool {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.reasoningVisible = !g.reasoningVisible
-	return g.reasoningVisible
+	on := g.reasoningVisible
+	g.mu.Unlock()
+	// Written outside the lock, because the write is a database call: one
+	// upsert on a local WAL file is microseconds, and the settings layer caps
+	// itself at two seconds, so the worst a locked database can cost is a slow
+	// keystroke rather than a hung window.
+	g.saveStickyState()
+	return on
 }
 
 func (g *GUI) showReasoning() bool {

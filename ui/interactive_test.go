@@ -64,7 +64,7 @@ func newConfig(mode string, whitelist ...string) *agent.Config {
 func newHarness(t *testing.T, c *agent.Config, in string, terminal bool) *harness {
 	t.Helper()
 	out := &lockedBuffer{}
-	p := NewPrint(out, strings.NewReader(in), c)
+	p := NewPrint(out, strings.NewReader(in), c, nil)
 	p.Terminal = terminal
 	return &harness{ui: &printUI{Print: p}, out: out}
 }
@@ -474,6 +474,7 @@ func TestStreamedContentIsPrintedOnce(t *testing.T) {
 	c.ConfirmExit = false
 	l, h := pair(t, c, []any{"echo hi"}, &env.Local{}, "", true)
 	h.ui.Print.Loop = l
+	h.ui.Print.SetThinkingShown(true) // the streaming half of the /t preference
 	// Simulate a streaming model: the UI sees chunks, then the finished message.
 	l.Handler = &model.Handler{
 		Content:   func(s string) { h.ui.Content(s) },
@@ -554,6 +555,9 @@ func TestThinkingStateIsVisible(t *testing.T) {
 	c := newConfig("yolo")
 	c.ConfirmExit = false
 	l, h := pair(t, c, []any{submit("done")}, &env.Local{Timeout: 10 * time.Second}, "", true)
+	// Thinking is collapsed until the preference says otherwise (ui/prefs.go),
+	// and this test is about the shown half of that switch.
+	h.ui.Print.SetThinkingShown(true)
 	l.Handler = &model.Handler{
 		Reasoning: func(s string) { h.ui.Reasoning(s) },
 		Content:   func(s string) { h.ui.Content(s) },

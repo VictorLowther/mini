@@ -1,5 +1,6 @@
 // Package session is the transcript's source of truth: one global SQLite
-// database holding sessions, turns, and tool-call records, plus the
+// database holding sessions, turns, and tool-call records (plus a global
+// settings row-per-key table for interface state that outlives a session), the
 // per-call result files under <tcrBase>/<uuid>/<tcno>.log that hold every
 // command's complete merged stdout+stderr. Tool output never enters the
 // database; the call row only names the byte range the model was shown.
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 	updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project_updated ON sessions (project, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS settings (
+	key        TEXT    NOT NULL PRIMARY KEY,
+	value      TEXT    NOT NULL DEFAULT '',
+	updated_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS turns (
 	session_id   TEXT    NOT NULL,

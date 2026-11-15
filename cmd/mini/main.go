@@ -306,7 +306,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	defer stop()
 
 	if o.printMode {
-		p := ui.NewPrint(stdout, stdin, r.AgentCfg)
+		p := ui.NewPrint(stdout, stdin, r.AgentCfg, r.Store)
 		p.Loop = r.Loop
 		h, err := ui.New(p, r.AgentCfg, r.Loop)
 		if err != nil {
@@ -337,6 +337,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	g := ui.NewGUI(ui.GUIOptions{
 		Cfg: r.AgentCfg, Loop: r.Loop, Model: r.Model,
 		ConfigName: r.ConfigName, LogWriter: logTarget, App: a,
+		Settings: r.Store,
 	})
 	// A stalled window with no explanation is indistinguishable from a crash,
 	// so the retry schedule goes into the transcript.
@@ -361,17 +362,25 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	return exitCode(info, err)
 }
 
+// The store's settings table is the front ends' sticky state (ui/prefs.go):
+// one row per key of interface state that is nobody's session.
+var _ ui.Settings = (*session.Store)(nil)
+
 // miniRun is a fully configured run, ready for whichever frontend owns it:
 // everything `mini` does before it opens a UI (config, model, environment,
 // loop, session, resume) and no terminal interaction beyond the first-time
 // setup the shared call sequence already performs.
 type miniRun struct {
-	O          *options
-	AgentCfg   *agent.Config
-	Model      *model.Sushi
-	Env        *env.Local
-	Loop       *agent.Loop
-	Sess       *session.Session
+	O        *options
+	AgentCfg *agent.Config
+	Model    *model.Sushi
+	Env      *env.Local
+	Loop     *agent.Loop
+	Sess     *session.Session
+	// Store is the same handle Sess writes through, handed to the front ends
+	// for the store's global settings table - the interface state that is not
+	// part of any session (ui/prefs.go).
+	Store      *session.Store
 	ResumeMsgs []model.Message
 	ResumeNote string
 	ConfigName string
@@ -484,7 +493,7 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	l.Recorder = sess
 
 	return &miniRun{
-		O: o, AgentCfg: agentCfg, Model: m, Env: e, Loop: l, Sess: sess,
+		O: o, AgentCfg: agentCfg, Model: m, Env: e, Loop: l, Sess: sess, Store: store,
 		ResumeMsgs: resumeMsgs, ResumeNote: resumeNote,
 		ConfigName: configName, LogTarget: logTarget,
 		closeStore: func() { _ = store.Close() },

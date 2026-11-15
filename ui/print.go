@@ -15,13 +15,18 @@ import (
 
 // Print is the headless front end used by --print and whenever stdout is not a
 // terminal. It streams the model's text to stdout and prompts on stdin,
-// including the /y /c /u /h /m slash commands, so the interactive state machine
-// is testable without a terminal.
+// including the /y /c /u /h /t /m slash commands, so the interactive state
+// machine is testable without a terminal. The thinking toggle is the same
+// stored preference the window reads (ui/prefs.go).
 type Print struct {
 	Out io.Writer
 	Cfg *agent.Config
 	// Loop supplies the step/cost figures for the message headers.
 	Loop *agent.Loop
+	// settings is where /t writes the thinking toggle so the next launch -
+	// this one or the window's - starts where the user left it. nil (tests,
+	// no store) keeps the toggle for the session only.
+	settings Settings
 
 	in *bufio.Reader
 	// Terminal reports whether a human is on stdin. Set from os.Stdin's mode;
@@ -32,17 +37,44 @@ type Print struct {
 	streamed       bool
 	reasoningOpen  bool
 	reasoningKnown bool
+	// showThinking is the printed half of the /t toggle and of the sticky
+	// preference behind it: thinking is collapsed until someone asks for it,
+	// in --print exactly as in the window.
+	showThinking bool
 }
 
-func NewPrint(out io.Writer, in io.Reader, cfg *agent.Config) *Print {
+func NewPrint(out io.Writer, in io.Reader, cfg *agent.Config, settings Settings) *Print {
 	fi, err := os.Stdin.Stat()
-	return &Print{Out: out, Cfg: cfg, in: bufio.NewReader(in), Terminal: err == nil && fi.Mode()&os.ModeCharDevice != 0}
+	return &Print{
+		Out: out, Cfg: cfg, settings: settings,
+		in:           bufio.NewReader(in),
+		Terminal:     err == nil && fi.Mode()&os.ModeCharDevice != 0,
+		showThinking: loadThinkingShown(settings),
+	}
+}
+
+// SetThinkingShown applies a thinking preference held by something other than
+// the store (a test, or a caller that owns the state). It does not write the
+// store: toggleThinking is the user-facing act that does.
+func (p *Print) SetThinkingShown(shown bool) { p.showThinking = shown }
+
+// toggleThinking is --print's /t, which the help text has always advertised:
+// the same collapse the window's chord performs, the same wording, and the
+// same sticky write - so a preference set headlessly is waiting in the window
+// next time, and vice versa.
+func (p *Print) toggleThinking() {
+	p.showThinking = !p.showThinking
+	saveThinkingShown(p.settings, p.showThinking)
+	fmt.Fprintf(p.Out, "\nthinking %s\n", map[bool]string{true: "shown", false: "hidden"}[p.showThinking])
 }
 
 // Interactive reports whether stdin is a terminal worth prompting on.
 func (p *Print) Interactive() bool { return p.Terminal }
 
 func (p *Print) Reasoning(text string) {
+	if !p.showThinking {
+		return
+	}
 	if !p.reasoningOpen {
 		fmt.Fprint(p.Out, "\n[thinking] ")
 		p.reasoningOpen = true
@@ -60,12 +92,18 @@ func (p *Print) Content(text string) {
 	fmt.Fprint(p.Out, text)
 }
 
+// closeReasoning ends an open streamed thinking block. It deliberately does
+// NOT mark the turn's reasoning as known - Reasoning already does that when it
+// opens the block - because this runs for every message, including the system
+// and user turns that precede the first reply. Marking it there made the
+// replayed-thinking branch in Message ask a question that was always no, which
+// is why --print showed no thinking at all even when the model's reasoning was
+// on the turn.
 func (p *Print) closeReasoning() {
 	if p.reasoningOpen {
 		fmt.Fprint(p.Out, "\n")
 		p.reasoningOpen = false
 	}
-	p.reasoningKnown = true
 }
 
 // Resume prints a stored transcript before the run continues, so a resumed
@@ -94,11 +132,17 @@ func (p *Print) Message(m model.Message) {
 	role, _ := m["role"].(string)
 	content, _ := m["content"].(string)
 	if role == "assistant" {
+		// A model reply that never streamed (a replayed turn, or --print,
+		// which no one wires a streaming handler for) shows its thinking when
+		// the preference says to, so the transcript says what the model
+		// considered rather than nothing. reasoningKnown is the marker for
+		// "this turn's thinking already reached the output" - the streaming
+		// path sets it when it opens the block, and this branch clears it at
+		// the end - so the question is asked here, where it still means what
+		// it says.
+		showStored := p.showThinking && !p.reasoningKnown
 		p.closeReasoning()
-		// A model reply that never streamed (a replayed turn, or a non-streaming
-		// server) still shows its thinking, so the transcript says what the
-		// model considered rather than nothing.
-		if !p.reasoningKnown {
+		if showStored {
 			if r, ok := m["reasoning_content"].(string); ok && r != "" {
 				fmt.Fprintf(p.Out, "\n[thinking] %s\n", r)
 			}
@@ -198,6 +242,10 @@ func (p *Print) Ask(ctx context.Context, q Question) (Answer, error) {
 		}
 		if err != nil {
 			return Answer{}, err
+		}
+		if line == "/t" {
+			p.toggleThinking()
+			continue // re-prompt: a toggle is not an answer to the question
 		}
 		text, reprompt := slash(p.Cfg, line, p.Out, func() string { return p.readMultiline(ctx) })
 		if reprompt {

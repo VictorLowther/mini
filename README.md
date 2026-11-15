@@ -20,8 +20,8 @@ prompts driving agents like the one reading this file.
 | `model` | HTTP/SSE client for the sushi server: streaming (`stream.go`), tool-call → action parsing (`actions.go`), cost stats (`stats.go`), the transcript→context projection and token estimation (`compaction.go`), the startup model-info lookup that decides the context window (`info.go`: what `GET /v1/models` reports for this model, else `agent.context_window`, else `model.DefaultContextWindow`), and a scriptable `testmodel`. |
 | `tpl` | Prompt rendering: a `text/template` engine for the prompt templates in `mini.yaml`, plus the custom filters they use (`toJSON`, `head`/`tail`/`charlen`, arithmetic). |
 | `config` | mini-swe-agent's config layering: recursive merge with an UNSET sentinel, config-spec resolution (file / embedded name / `key=value`), global `.env` handling. Embedded configs live in `config/configs/`; `mini.yaml` is the only supported system config. |
-| `session` | The SQLite session store: sessions, turns, and per-call tool records in `$HOME/.mini`; `mini -r` resumes from it. |
-| `ui` | The human end. The interactive UI is the Fyne desktop GUI (`fyneui.go`/`fyneview.go`); `print.go` is the headless `--print` front end. `blocks.go` is the transcript model both render from — the `block` type and the one `messageBlock` mapping every message-to-card conversion passes through, so live and resumed turns cannot drift — and `slash.go`/`interactive.go` carry the slash-commands, modes, and `Interactive`, which adapts a UI to `agent.Hooks` (confirm/yolo modes, whitelists). The GUI mutes the process logger (`logtarget.go`) while a run is in flight, because nobody reads a terminal the window has superseded. |
+| `session` | The SQLite session store: sessions, turns, and per-call tool records in `$HOME/.mini`; `mini -r` resumes from it. Its `settings` table is the global half — one row per key of interface state (thinking visibility, window size) that must outlive every session. |
+| `ui` | The human end. The interactive UI is the Fyne desktop GUI (`fyneui.go`/`fyneview.go`); `print.go` is the headless `--print` front end. `blocks.go` is the transcript model both render from — the `block` type and the one `messageBlock` mapping every message-to-card conversion passes through, so live and resumed turns cannot drift — and `slash.go`/`interactive.go` carry the slash-commands, modes, and `Interactive`, which adapts a UI to `agent.Hooks` (confirm/yolo modes, whitelists); `prefs.go` is the sticky interface state both front ends share (thinking, window size), read and written through a two-method seam so the UI never imports `session`. The GUI mutes the process logger (`logtarget.go`) while a run is in flight, because nobody reads a terminal the window has superseded. |
 | `testdata` | Offline fixtures: hand-written SSE scripts and `fakesushi`, an HTTP replay server for GPU-free testing. See `testdata/README.md`. |
 
 ## Usage
@@ -61,6 +61,20 @@ the native quit hotkey (⌘Q / Ctrl+Q, or the menu), or closing the window;
 Enter sends, Shift+Enter (or ⌥Enter on macOS) adds a newline — multi-line
 input is a keystroke, not a mode. Thinking toggles with ⌃⌘T on macOS (plain
 ⌘T stays free for future tabs) and Ctrl+T elsewhere.
+
+Two pieces of interface state are sticky, kept in the session database's global
+`settings` table rather than in the config file, which is run configuration that
+scripts and `-c` overrides depend on and `--print` should not silently rewrite:
+the thinking toggle (`/t` works headlessly too, and both front ends read and
+write one key) and the window's size, applied before the window is first shown.
+A key that was never written is not `false` — mini keeps its default and
+writes nothing, so a preference is stored only once a human expresses it. Placement is deliberately *not* remembered: Fyne
+2.8's public `Window` interface has no position getter and no move callback, and
+its one write-side call (`desktop.Window.RequestPosition`) may be ignored and
+has no coordinate contract across monitors, so a stored position could be
+applied but never observed — and a stale one can park the window past an
+unplugged display. To forget what is stored: `sqlite3 ~/.mini/sessions.db
+'delete from settings'`.
 
 ## Testing
 
