@@ -508,6 +508,9 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	// running" (docs/jobs-research.md §4).
 	jobs := &job.Manager{Session: sess, Local: e, Logger: slog.Default()}
 	l.Jobs = jobs
+	// One number for the foreground wait, from the same setting that governs
+	// the environment's own deadline.
+	l.CommandBudget = e.Timeout
 	for _, w := range jobs.Sweep() {
 		slog.Warn("job left running by a previous run", "warning", w)
 	}

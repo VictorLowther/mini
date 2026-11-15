@@ -155,6 +155,13 @@ type Loop struct {
 	Cfg   *Config
 	Model model.Model
 	Env   env.Environment
+	// CommandBudget is how long a foreground command is waited on before it is
+	// moved to the background. Set it from the environment's configured
+	// timeout so there is one number; zero means env.DefaultTimeout. Keeping it
+	// here rather than reading it off the Environment is deliberate: the
+	// interface has no timeout to expose, and a container environment's idea of
+	// a sane wait should not have to widen the contract.
+	CommandBudget time.Duration
 	// Jobs is the registry backgrounded commands are handed to. nil means this
 	// run cannot background anything - a test harness, or a front end that has
 	// not wired one up - and `background: true` then comes back as a reported
@@ -273,7 +280,7 @@ func (l *Loop) runCommand(ctx context.Context, action model.Action, tc model.Too
 		return l.handoff(run, action, "started in the background")
 	}
 
-	budget := env.DefaultTimeout
+	budget := l.budget()
 	if action.TimeoutS > 0 {
 		budget = time.Duration(action.TimeoutS) * time.Second
 	}
@@ -293,6 +300,17 @@ func (l *Loop) runCommand(ctx context.Context, action model.Action, tc model.Too
 		return l.handoff(run, action, fmt.Sprintf(
 			"still running after %s", budget.Truncate(time.Second)))
 	}
+}
+
+// budget is the foreground wait, honouring whatever the configuration set for
+// the environment: a user who raised environment.timeout to two minutes expects
+// long commands to be *waited on* for two minutes, and promoting them at 30
+// seconds anyway would make that setting lie in a new and more confusing way.
+func (l *Loop) budget() time.Duration {
+	if l.CommandBudget > 0 {
+		return l.CommandBudget
+	}
+	return env.DefaultTimeout
 }
 
 // handoff detaches a run and composes what the model reads instead of output:

@@ -12,9 +12,11 @@ package session
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"uuid"
@@ -93,7 +95,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS jobs (
-	id           TEXT    NOT NULL PRIMARY KEY,
+	id           TEXT    NOT NULL,
 	kind         TEXT    NOT NULL DEFAULT 'bash',
 	session_id   TEXT    NOT NULL,
 	parent_id    TEXT    NOT NULL DEFAULT '',
@@ -111,8 +113,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 	started_at   INTEGER NOT NULL,
 	ended_at     INTEGER,
 	updated_at   INTEGER NOT NULL,
+	-- (session_id, id), not id alone: a job id is a per-session handle the model
+	-- quotes back ("j12"), and every read, kill and sweep in this store is
+	-- scoped to a session. An id-only key makes two sessions' first jobs collide
+	-- across the whole database, which is exactly what the live run found -
+	-- UNIQUE constraint failed on the second session to background anything.
+	PRIMARY KEY (session_id, id),
 	FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
-);
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_jobs_session_started ON jobs (session_id, started_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs (parent_id);
 
@@ -131,7 +139,7 @@ CREATE TABLE IF NOT EXISTS job_events (
 	fired_at     INTEGER NOT NULL,
 	delivered_at INTEGER,
 	FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
-	FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE
+	FOREIGN KEY (session_id, job_id) REFERENCES jobs (session_id, id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_job_events_pending ON job_events (session_id, delivered_at, id);
 `
@@ -158,11 +166,48 @@ func Open(path, tcrBase string) (*Store, error) {
 	// *same session* at once is unsupported and only produces interleaved
 	// turns. No flock/lease machinery.
 	db.SetMaxOpenConns(1)
+	if err := migrateJobKeys(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("session store: migrate: %w", err)
 	}
 	return &Store{db: db, tcrBase: tcrBase}, nil
+}
+
+// migrateJobKeys rebuilds the job tables when they were created with an
+// id-only primary key, which is the shape the first version of this table had
+// and which cannot hold two sessions' first jobs.
+//
+// Rebuilding rather than rewriting rows is deliberate: the schema has no version
+// tracking (see the note on schema above), the tables are new, and what they can
+// contain from the affected build is a handful of finished rows and their
+// firings - history, not state. Preserved: nothing worth the extra failure mode
+// of a column swap under foreign keys, and the note is worth more than the rows.
+func migrateJobKeys(db *sql.DB) error {
+	var ddl string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`).Scan(&ddl)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // fresh database: the schema const creates the right shape
+	}
+	if err != nil {
+		return fmt.Errorf("session store: inspect jobs table: %w", err)
+	}
+	// SQLite stores the CREATE text verbatim, and the shipped version aligned
+	// its columns with runs of spaces - so comparing against any single-spacing
+	// spelling silently never matches, which is exactly how this migration
+	// passed its own test and then failed against a real database. Collapse the
+	// whitespace and match on that.
+	if !strings.Contains(strings.Join(strings.Fields(ddl), " "),
+		"id TEXT NOT NULL PRIMARY KEY") {
+		return nil // already per-session keyed, or hand-edited and none of our business
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS job_events; DROP TABLE IF EXISTS jobs;`); err != nil {
+		return fmt.Errorf("session store: rebuild job tables: %w", err)
+	}
+	return nil
 }
 
 // Close closes the underlying database.

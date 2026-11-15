@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"uuid"
 )
 
 func mkJob(t *testing.T, s *Session, id string) *JobRow {
@@ -281,4 +283,126 @@ func TestJobsAreScopedToTheirSession(t *testing.T) {
 func readDir(p string) (int, error) {
 	ents, err := os.ReadDir(p)
 	return len(ents), err
+}
+
+// Job ids are per-session handles, and the live run proved the key has to agree
+// with that: with an id-only primary key, the second session in the database
+// that backgrounded anything failed with "UNIQUE constraint failed: jobs.id".
+// The unit tests missed it because every test used its own database.
+func TestSameJobIDInTwoSessions(t *testing.T) {
+	st, _ := openStore(t)
+	a, b := newSession(t, st), newSession(t, st)
+
+	if _, err := a.CreateJob(JobRow{ID: "j1", Command: "make"}); err != nil {
+		t.Fatalf("first session: %v", err)
+	}
+	if _, err := b.CreateJob(JobRow{ID: "j1", Command: "pytest"}); err != nil {
+		t.Fatalf("second session refused the same id: %v", err)
+	}
+	// Each session sees its own job and only its own job.
+	ja, err := a.GetJob("j1")
+	if err != nil || ja.Command != "make" {
+		t.Errorf("session a = %+v, %v", ja, err)
+	}
+	jb, err := b.GetJob("j1")
+	if err != nil || jb.Command != "pytest" {
+		t.Errorf("session b = %+v, %v", jb, err)
+	}
+	// Ending one does not end the other, which is what the composite key buys
+	// for the update path too.
+	code := 0
+	if _, err := a.FinishJob("j1", JobCompleted, &code, "exited 0"); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := b.GetJob("j1"); row.State != JobRunning {
+		t.Errorf("finishing a's job touched b's: %+v", row)
+	}
+	// Firings are scoped the same way, and the composite FK still cascades.
+	if _, err := b.RecordJobEvent(JobEventRow{JobID: "j1", Reason: "exit"}); err != nil {
+		t.Fatalf("event on the second session's job: %v", err)
+	}
+	if err := st.Delete(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.GetJob("j1"); err != nil {
+		t.Errorf("deleting session b removed a's job: %v", err)
+	}
+}
+
+// A database created by the build with the id-only key has to be repaired on
+// open, not fail on the next backgrounded command.
+func TestOpenRebuildsTheOldJobShape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.db")
+	st, err := Open(path, filepath.Join(dir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := st.Create(Row{ID: uuid.NewV7(), Workdir: "/w", Project: "/p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`INSERT INTO jobs (id, kind, session_id, command, state, output_path, started_at, updated_at)
+VALUES ('j1','bash',?,'make','completed',?,1,1)`, sess.ID.String(), sess.JobPath("j1")); err != nil {
+		t.Fatal(err)
+	}
+	// Hand the file back exactly as the first build would have left it.
+	// Deliberately the *shipped* DDL, column alignment and all: the stored text
+	// is verbatim, and a detector that only matches a tidier spelling of it is
+	// the bug this test exists to keep dead.
+	if _, err := st.db.Exec(`DROP TABLE IF EXISTS job_events; DROP TABLE IF EXISTS jobs;
+CREATE TABLE IF NOT EXISTS jobs (
+	id           TEXT    NOT NULL PRIMARY KEY,
+	kind         TEXT    NOT NULL DEFAULT 'bash',
+	session_id   TEXT    NOT NULL,
+	tcno         INTEGER,
+	label        TEXT    NOT NULL DEFAULT '',
+	command      TEXT    NOT NULL DEFAULT '',
+	description  TEXT    NOT NULL DEFAULT '',
+	state        TEXT    NOT NULL DEFAULT 'running'
+		CHECK (state IN ('running','completed','failed','killed','orphaned')),
+	pid          INTEGER,
+	pgid         INTEGER,
+	output_path  TEXT NOT NULL,
+	exit_code    INTEGER,
+	exit_reason  TEXT NOT NULL DEFAULT '',
+	started_at   INTEGER NOT NULL,
+	ended_at     INTEGER,
+	updated_at   INTEGER NOT NULL,
+	FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
+);`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	reopened, err := Open(path, filepath.Join(dir, "tcr"))
+	if err != nil {
+		t.Fatalf("reopen after the old-shape downgrade: %v", err)
+	}
+	defer reopened.Close()
+	var ddl string
+	if err := reopened.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='jobs'`).Scan(&ddl); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, "PRIMARY KEY (session_id, id)") {
+		t.Errorf("open did not rebuild the table:\n%s", ddl)
+	}
+	var n int
+	if err := reopened.db.QueryRow(`SELECT count(*) FROM jobs`).Scan(&n); err != nil {
+		t.Errorf("rebuilt table is unreadable: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("the old rows survived a key change that could not hold them: %d", n)
+	}
+	st2, err := Open(path, filepath.Join(dir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if err := st2.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='jobs'`).Scan(&ddl); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, "PRIMARY KEY (session_id, id)") {
+		t.Error("a second open changed the shape again: the rebuild is not idempotent")
+	}
 }

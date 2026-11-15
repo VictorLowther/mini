@@ -281,3 +281,47 @@ func TestTimeoutSReachesTheCommandAsADeadline(t *testing.T) {
 		t.Errorf("unbudgeted command got a deadline of %v", d.budgets[1])
 	}
 }
+
+// The promotion threshold is the configured wait, not a constant the loop
+// invented: raising environment.timeout must mean "wait longer", not "kill at
+// the same 30 seconds and call it a job".
+func TestPromotionUsesTheConfiguredBudget(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("takes a moment", model.Action{Command: "echo one; sleep 2; echo two"}),
+		done("submitted"),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 10 * time.Second})
+	l.CommandBudget = 3 * time.Second
+
+	if _, err := run(t, l, "run it"); err != nil {
+		t.Fatal(err)
+	}
+	// Under the configured budget the command finishes normally: no job, and
+	// the output is the observation rather than a handoff. The absence of a row
+	// is the timing assertion - a 2s command inside a 3s budget was waited on
+	// to the end, and measuring wall-clock here would only test the scheduler.
+	if list, _ := jm.List(); len(list) != 0 {
+		t.Errorf("a command inside its budget became a job: %+v", list)
+	}
+	if !strings.Contains(lastObservation(l), "two") {
+		t.Errorf("observation = %q", lastObservation(l))
+	}
+
+	// Over it, it is promoted at the configured number and not before.
+	m2 := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("takes longer", model.Action{Command: "sleep 30"}),
+		done("submitted"),
+	}}
+	l2, jm2, _ := newJobLoop(t, m2, &env.Local{Timeout: 60 * time.Second})
+	l2.CommandBudget = 1 * time.Second
+	if _, err := run(t, l2, "run it long"); err != nil {
+		t.Fatal(err)
+	}
+	last := lastObservation(l2)
+	if !strings.Contains(last, "still running after 1s as job j1") {
+		t.Errorf("observation = %q, want a handoff at the configured budget", last)
+	}
+	if list, _ := jm2.List(); len(list) != 1 || list[0].State != session.JobRunning {
+		t.Errorf("registry = %+v", list)
+	}
+}
