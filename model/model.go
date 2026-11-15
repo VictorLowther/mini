@@ -87,8 +87,12 @@ func (h *Handler) content(s string) {
 	}
 }
 
-// BASH_TOOL is the only tool the agent advertises, byte-for-byte the shape
-// mini-swe-agent sends (models/utils/actions_toolcall.py).
+// BASH_TOOL is the only tool the agent advertises. The shape is mini's own to
+// change: it arrived as a port of mini-swe-agent's, which was the fastest way
+// to tell whether the loop worked, and that scaffolding is not a constraint.
+// A command that outlives its tool call needs parameters the ported agent never
+// had, and the tool description - not a reference implementation - is where the
+// model learns what this one does (docs/jobs-research.md §4).
 var BASH_TOOL = map[string]any{
 	"type": "function",
 	"function": map[string]any{

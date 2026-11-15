@@ -1,5 +1,8 @@
-// Package agent runs the linear query-execute loop: the port of
-// minisweagent/agents/default.py (and the interactive subclass's control flow).
+// Package agent runs the linear query-execute loop. The control flow began as a
+// port of minisweagent/agents/default.py, which was the shortest path to a loop
+// worth testing against, and it has grown past that shape: compaction, the
+// session store, and background jobs each answer a problem the ported agent does
+// not have. Provenance, not a ceiling.
 package agent
 
 import (
@@ -756,8 +759,9 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 func (l *Loop) Serialize(extra ...map[string]any) map[string]any {
 	lastExtra := map[string]any{}
 	if len(l.Messages) > 0 {
-		// Read without creating: Extra() would add an "extra" key to messages
-		// the reference leaves bare.
+		// Read without creating: Extra() would add an "extra" key to the
+		// messages that never had one, and the trajectory would gain a field
+		// mid-document.
 		if e, ok := l.Messages[len(l.Messages)-1]["extra"].(map[string]any); ok {
 			lastExtra = e
 		}

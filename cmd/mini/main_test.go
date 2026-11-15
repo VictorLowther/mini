@@ -117,8 +117,9 @@ func TestBuildConfigWithoutSpecsUsesEmbeddedMini(t *testing.T) {
 }
 
 func TestBuildConfigSpecsReplaceTheDefault(t *testing.T) {
-	// This is the loud typer semantic the reference warns about: -c X drops the
-	// default file entirely.
+	// A deliberate and surprising semantic, pinned here so it stays chosen
+	// rather than accidental: naming -c replaces the default config file, it
+	// does not layer on top of it.
 	o, err := parseFlags([]string{"-c", "agent.step_limit=7"})
 	if err != nil {
 		t.Fatal(err)

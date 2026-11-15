@@ -26,7 +26,8 @@ type Question struct {
 	Title   string
 	Actions []model.Action
 	// Cfg lets the UI read and change the interactive mode: slash commands
-	// write config.mode, exactly like Python's agent.
+	// write config.mode, so the mode a run started in is the mode the footer
+	// reports and the one the next turn obeys.
 	Cfg *agent.Config
 	// Limits echoed back for the AskLimits prompt.
 	StepLimit int

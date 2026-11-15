@@ -68,9 +68,9 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 		out = io.Discard
 	}
 
-	// yagni: no per-call timeout override; nothing in the reference passes one.
-	// Callers that need a per-call budget build the context themselves, which
-	// is exactly how the job manager runs one command with no deadline.
+	// The budget comes from l.Timeout; a caller that wants a different one per
+	// call wraps the context itself, which is how the job manager runs one
+	// command with no deadline at all (Timeout < 0).
 	cctx, cancel := l.runContext(ctx)
 	defer cancel()
 
