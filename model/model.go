@@ -4,7 +4,9 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"strings"
 
 	"github.com/VictorLowther/mini/env"
 )
@@ -15,10 +17,29 @@ import (
 // model's thinking on every turn (along with any future sibling field).
 type Message = map[string]any
 
-// Action is one parsed bash tool call.
+// Tool names the agent advertises. bash is the workhorse; the job_* set exists
+// because ending a run is something only the harness can do - see Needs-
+// Confirmation for why the kill among them asks for nothing.
+const (
+	ToolBash    = "bash"
+	ToolJobs    = "jobs"
+	ToolJobKill = "job_kill"
+)
+
+// Action is one parsed tool call.
 type Action struct {
+	// Tool is the advertised name the call was made against; empty means bash,
+	// which is what every model turn and every stored row predates.
+	Tool string `json:"-"`
+	// Command is the bash script. For the job tools it is the single string
+	// argument they take (a job id), so the ledger and the confirm panel still
+	// have one column of "what this call asked for" to show.
 	Command    string `json:"command"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Args is the parsed argument object, kept for the optional parameters the
+	// job tools take and read through Str/Bool rather than growing a field per
+	// key on this struct.
+	Args map[string]any `json:"-"`
 	// TimeoutS is the model's own budget for this command, in seconds, from the
 	// optional timeout_s parameter. 0 means "no opinion": the environment's
 	// default applies. There is deliberately no ceiling - a training run is
@@ -29,6 +50,82 @@ type Action struct {
 	// Background asks for the run as a job: start it, report the id and the
 	// path its output is accumulating at, and return without waiting.
 	Background bool `json:"background,omitempty"`
+	// Description is the model's own short name for the call. It lands on the
+	// job's label, which is what `jobs` prints and what a wake will quote, so
+	// "j3" becomes "quantise 70b" in anything a human or a later turn reads.
+	Description string `json:"description,omitempty"`
+}
+
+// Str reads an optional string argument. Absent, null, or the wrong shape all
+// come back "", which for these tools means "not specified" and never a
+// rejected call.
+func (a Action) Str(key string) string {
+	switch v := a.Args[key].(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case nil:
+		return ""
+	default:
+		b, _ := json.Marshal(v)
+		return strings.TrimSpace(string(b))
+	}
+}
+
+// Bool reads an optional boolean argument, forgiving the quoted spellings a
+// model produces.
+func (a Action) Bool(key string) bool {
+	switch v := a.Args[key].(type) {
+	case bool:
+		return v
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s == "true" || s == "1" || s == "yes"
+	case float64:
+		return v != 0
+	}
+	return false
+}
+
+// ToolName is the advertised tool, defaulting to bash for actions built before
+// the tool set grew (and for the human-mode path, which only ever runs shell).
+func (a Action) ToolName() string {
+	if a.Tool == "" {
+		return ToolBash
+	}
+	return a.Tool
+}
+
+// Display is what a human reads when the call is listed: the panel that asks for
+// confirmation, the transcript's tool card, and the ledger's command column. A
+// job call has to say which tool it is, because `job_kill j1` and a bare `j1`
+// are not the same thing to skim past.
+func (a Action) Display() string {
+	if a.ToolName() == ToolBash {
+		return a.Command
+	}
+	if a.Command == "" {
+		return a.ToolName()
+	}
+	return a.ToolName() + " " + a.Command
+}
+
+// NeedsConfirmation reports whether the action must reach a human before it can
+// have its effect.
+//
+// Only starting work counts. `job_kill` deliberately does NOT, even though it
+// signals processes: it can only end runs this session already started, and
+// those already passed whatever gate applied to launching them. A kill cannot
+// begin anything new, cannot touch a process the harness did not launch, and
+// cannot lose data that was not already being written - it is the mitigation,
+// and prompting for it is the one design that makes the mitigation slower than
+// the problem. `jobs` reads a table.
+//
+// This is where the survey's advice stops applying: zero marks TaskStop
+// SideEffectShell + PermissionPrompt, little-coder puts ShellStart in the
+// gate's SHELL_TOOLS set, and both are right for a registry that can *launch*
+// from a tool. Neither argument reaches ending a run that exists.
+func (a Action) NeedsConfirmation() bool {
+	return a.ToolName() == ToolBash
 }
 
 // ToolCall is an issued call plus the open file its complete merged output is
@@ -125,12 +222,60 @@ var BASH_TOOL = map[string]any{
 					"type":        "integer",
 					"description": "Seconds to wait for this command before it is moved to the background. Optional and uncapped: set it to what the command actually needs, such as a build or a training run. 0 or omitted means the default of 30 seconds. The deadline ends the wait and never the command, so nothing is killed at it and a half-finished run must not be re-started - ask for the time instead, or background it on purpose.",
 				},
+				"description": map[string]any{
+					"type":        "string",
+					"description": "A few words naming what this command is for. Shown in the jobs listing and in anything that reports on the job later, so a long run stays identifiable after the turn that started it.",
+				},
 				"background": map[string]any{
 					"type":        "boolean",
 					"description": "Start the command as a job and return immediately with its job id and output path, instead of waiting for it. Use for anything that outlives a few minutes: training, quantising, servers, soak tests, long builds. The job keeps its own output file; read it with tail, sed -n, or grep.",
 				},
 			},
 			"required": []string{"command"},
+		},
+	},
+}
+
+// JOBS_TOOL answers "what is running, and where is its output". It exists
+// because the registry, not the conversation, is the truth about live jobs:
+// compaction keeps recency and can summarize a handoff away, and a model that
+// cannot enumerate what it left on the GPU will either re-run it or forget it.
+var JOBS_TOOL = map[string]any{
+	"type": "function",
+	"function": map[string]any{
+		"name":        ToolJobs,
+		"description": "List the session's jobs: id, state, how long, why it is still around, exit status, and the path its output is accumulating at. Read-only. A job is the only way to end a command that outlived its turn - the shell runs in-process, so no pattern-based kill command can reach a whole job.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id": map[string]any{
+					"type":        "string",
+					"description": "One job id to describe instead of listing them all. Optional.",
+				},
+			},
+		},
+	},
+}
+
+// JOB_KILL_TOOL is the only way to end a job. It takes no confirmation, on
+// purpose: see Action.NeedsConfirmation.
+var JOB_KILL_TOOL = map[string]any{
+	"type": "function",
+	"function": map[string]any{
+		"name":        ToolJobKill,
+		"description": "End a job, or all of them. Give it the job id from `jobs`, or all: true. This is the only reliable way to stop a backgrounded command: a job may be holding several processes at once and they are not addressable from inside a shell, because the shell is the agent process itself. No confirmation is required, and the command it stops does not need re-running.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id": map[string]any{
+					"type":        "string",
+					"description": "The job id to end, exactly as `jobs` reported it.",
+				},
+				"all": map[string]any{
+					"type":        "boolean",
+					"description": "End every running job of this session. Use when the work is finished or when you are giving up on a batch.",
+				},
+			},
 		},
 	},
 }

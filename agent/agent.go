@@ -23,6 +23,7 @@ import (
 	"github.com/VictorLowther/mini/env"
 	"github.com/VictorLowther/mini/job"
 	"github.com/VictorLowther/mini/model"
+	"github.com/VictorLowther/mini/session"
 	"github.com/VictorLowther/mini/tpl"
 )
 
@@ -261,8 +262,7 @@ func (l *Loop) runCommand(ctx context.Context, action model.Action, tc model.Too
 			// intent: running a 30-second command in the foreground after being
 			// told not to wait for it is worse than an error, because the model
 			// would have no way to tell the two apart.
-			return refusedObservation(errors.New(
-				"this run has no job registry: run the command without background, or restart mini with sessions enabled")), false, nil
+			return noRegistryResult(), false, nil
 		}
 		// No registry, so nothing can be promoted: the environment's own
 		// deadline is the only bound, and it still ends the command.
@@ -270,7 +270,8 @@ func (l *Loop) runCommand(ctx context.Context, action model.Action, tc model.Too
 		return r, false, err
 	}
 	run, err := l.Jobs.Launch(job.Spec{
-		Command: action.Command, TCNO: tc.Number, File: tc.File, Path: tc.Path,
+		Command: action.Command, Label: action.Description,
+		TCNO: tc.Number, File: tc.File, Path: tc.Path,
 	})
 	if err != nil {
 		return refusedObservation(err), false, nil
@@ -299,6 +300,208 @@ func (l *Loop) runCommand(ctx context.Context, action model.Action, tc model.Too
 	case <-timer.C:
 		return l.handoff(run, action, fmt.Sprintf(
 			"still running after %s", budget.Truncate(time.Second)))
+	}
+}
+
+// jobsObservation answers the jobs tool by writing the registry listing into the
+// call's own result file. That is deliberate: a session with two hundred
+// finished jobs then gets mini's normal truncate-and-spill treatment instead of a
+// special case, and the model gets a path it already knows how to page through.
+func (l *Loop) jobsObservation(action model.Action, sink io.Writer) env.Result {
+	if l.Jobs == nil {
+		return noRegistryResult()
+	}
+	list, err := l.Jobs.List()
+	if err != nil {
+		return env.Result{ReturnCode: 1, ExceptionInfo: err.Error()}
+	}
+	want := action.Command
+	running := 0
+	var b strings.Builder
+	for _, j := range list {
+		if want != "" && j.ID != want {
+			continue
+		}
+		if j.State == session.JobRunning {
+			running++
+		}
+		fmt.Fprintf(&b, "%s  %s  %s", j.ID, j.State, jobAge(j))
+		if j.ExitCode != nil {
+			fmt.Fprintf(&b, "  exit %d", *j.ExitCode)
+		}
+		if why := jobWhy(l, j); why != "" {
+			fmt.Fprintf(&b, "  why=%s", why)
+		}
+		fmt.Fprintf(&b, "\n    out=%s", j.OutputPath)
+		if size, age, ok := jobFileStat(j.OutputPath); ok {
+			fmt.Fprintf(&b, "  (%s, last write %s)", size, age)
+		}
+		if j.Label != "" {
+			fmt.Fprintf(&b, "\n    label=%s", j.Label)
+		}
+		if j.Command != "" {
+			fmt.Fprintf(&b, "\n    cmd=%s", oneLine(j.Command, 200))
+		}
+		b.WriteString("\n")
+	}
+	if b.Len() == 0 {
+		if want != "" {
+			return env.Result{ReturnCode: 1,
+				View: fmt.Sprintf("no job %s in this session\n", want)}
+		}
+		return env.Result{ReturnCode: 0, View: "no jobs in this session. A command that outlives " +
+			"its wait, or one started with background: true, appears here with its id and output path.\n"}
+	}
+	fmt.Fprintf(&b, "%d job(s), %d running. Read a log with tail -n %d <path>; end one with job_kill.\n",
+		strings.Count(b.String(), "\n    out="), running, model.MaxViewLines)
+	if sink != nil {
+		_, _ = io.WriteString(sink, b.String())
+	}
+	return env.Result{ReturnCode: 0}
+}
+
+// killObservation ends jobs. It is the only way to do that, and the reason is
+// structural rather than a permission: the interpreter is in-process, so a
+// command may be holding several external children at once (a pipeline, a
+// `&`, make -j, a loop) and none of them is addressable as "the job" from
+// inside a shell. Cancellation reaches all of them, because the run owns the
+// context every command it started was signalled through.
+func (l *Loop) killObservation(action model.Action, sink io.Writer) env.Result {
+	if l.Jobs == nil {
+		return noRegistryResult()
+	}
+	all := action.Bool("all")
+	ids := []string{}
+	switch {
+	case all:
+		list, err := l.Jobs.List()
+		if err != nil {
+			return env.Result{ReturnCode: 1, ExceptionInfo: err.Error()}
+		}
+		for _, j := range list {
+			if j.State == session.JobRunning {
+				ids = append(ids, j.ID)
+			}
+		}
+	case action.Command != "":
+		ids = append(ids, action.Command)
+	default:
+		return env.Result{ReturnCode: 1,
+			View: "job_kill needs an id from the jobs tool, or all: true\n"}
+	}
+
+	var b strings.Builder
+	failed := 0
+	for _, id := range ids {
+		run, err := l.Jobs.Get(id)
+		if err != nil {
+			// No live handle. It may be a row this process never started -
+			// after a restart mini cannot prove a pid is still the job's, and
+			// guessing is how you kill somebody else's recycled process.
+			row, rerr := l.Jobs.Session.GetJob(id)
+			switch {
+			case rerr != nil:
+				failed++
+				fmt.Fprintf(&b, "%s: no such job in this session\n", id)
+			case row.State == session.JobOrphaned:
+				failed++
+				fmt.Fprintf(&b, "%s: already orphaned when mini restarted; its process is outside this run's ownership and was not signalled\n", id)
+			default:
+				fmt.Fprintf(&b, "%s: already finished (%s)\n", id, row.State)
+			}
+			continue
+		}
+		if err := run.Kill(); err != nil {
+			failed++
+			fmt.Fprintf(&b, "%s: %v\n", id, err)
+			continue
+		}
+		row, _ := run.Row()
+		fmt.Fprintf(&b, "%s: killed\n", id)
+		if row != nil && row.Command != "" {
+			fmt.Fprintf(&b, "  stopped: %s\n", oneLine(row.Command, 120))
+		}
+	}
+	if len(ids) == 0 {
+		b.WriteString("no running jobs to kill\n")
+	}
+	code := 0
+	if failed > 0 && failed == len(ids) {
+		code = 1
+	}
+	if sink != nil {
+		_, _ = io.WriteString(sink, b.String())
+	}
+	return env.Result{ReturnCode: code}
+}
+
+// jobWhy is the answer to "why is this still here". For a live run the manager
+// knows whether the model backgrounded it or it outran its budget; for one that
+// has already ended, or an orphan from before a restart, the row's own reason is
+// all that survives, and the difference is worth having in the listing rather
+// than inferred.
+func jobWhy(l *Loop, j session.JobRow) string {
+	if run, err := l.Jobs.Get(j.ID); err == nil {
+		if r := run.Reason(); r != "" {
+			return r
+		}
+	}
+	return j.ExitReason
+}
+
+// jobAge is how long the run has been around, ending at its end time.
+func jobAge(j session.JobRow) string {
+	end := j.StartedAt
+	if j.EndedAt != nil {
+		end = *j.EndedAt
+	}
+	d := time.Duration(end-j.StartedAt) * time.Millisecond
+	if d < 0 {
+		d = 0
+	}
+	return d.Truncate(100 * time.Millisecond).String()
+}
+
+// jobFileStat reports a job log's size and how long since its last write, which
+// is the cheap version of the stall question: a running job that has not written
+// in twenty minutes is worth looking at, and nothing here needs to read the file
+// to say so. Line counts are deliberately not reported - that would be a full
+// scan per listing over logs that are routinely hundreds of megabytes, and
+// `wc -l` on the path is exact and local to the one job being asked about.
+func jobFileStat(path string) (size, age string, ok bool) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", "", false
+	}
+	return humanBytes(st.Size()), time.Since(st.ModTime()).Truncate(time.Second).String(), true
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+// oneLine keeps a multi-line command from breaking the listing's shape.
+func oneLine(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "..."
+	}
+	return s
+}
+
+func noRegistryResult() env.Result {
+	return env.Result{
+		ReturnCode:    -1,
+		ExceptionInfo: "this run has no job registry: restart mini with sessions enabled",
+		Extra:         map[string]any{"exception_type": "JobsUnavailable"},
 	}
 }
 
@@ -844,7 +1047,17 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		if tc.File != nil {
 			sink = tc.File
 		}
-		res, detached, err := l.runCommand(ctx, action, tc, sink)
+		var res env.Result
+		var detached bool
+		var err error
+		switch action.ToolName() {
+		case model.ToolJobs:
+			res = l.jobsObservation(action, sink)
+		case model.ToolJobKill:
+			res = l.killObservation(action, sink)
+		default:
+			res, detached, err = l.runCommand(ctx, action, tc, sink)
+		}
 		// Stop the shell's writes and measure the file once, before any
 		// branch returns: this is the only place tail arithmetic happens.
 		// Closing first keeps the fd from leaking on the cancellation path;

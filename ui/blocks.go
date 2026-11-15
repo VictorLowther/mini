@@ -179,7 +179,7 @@ func panelActionLines(actions []model.Action) []string {
 		shown = shown[:panelMaxActions]
 	}
 	for _, a := range shown {
-		lines = append(lines, truncateVisible(a.Command, 6))
+		lines = append(lines, truncateVisible(a.Display(), 6))
 	}
 	return lines
 }

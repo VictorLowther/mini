@@ -92,30 +92,54 @@ func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx ma
 		var args map[string]any
 		if err := json.Unmarshal([]byte(orNull(rawArgs)), &args); err != nil {
 			errMsgs = append(errMsgs, fmt.Sprintf("Error parsing tool call arguments: %s.", err))
+			args = map[string]any{}
 		}
-		if name != "bash" {
+		if name == "" {
+			name = ToolBash
+		}
+		switch name {
+		case ToolBash, ToolJobs, ToolJobKill:
+		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("Unknown tool '%s'.", name))
 		}
-		if _, ok := args["command"]; !ok {
-			errMsgs = append(errMsgs, "Missing 'command' argument in bash tool call.")
+		if name == ToolBash {
+			if _, ok := args["command"]; !ok {
+				errMsgs = append(errMsgs, "Missing 'command' argument in bash tool call.")
+			}
+		}
+		if name == ToolJobKill {
+			// "kill it" with no target is not a request the harness can guess
+			// at: all: true ends every job in the session, so it has to be the
+			// model's own word, and an id it actually read from jobs.
+			if id, _ := args["id"].(string); strings.TrimSpace(id) == "" && !optionalBool(args["all"]) {
+				errMsgs = append(errMsgs, "job_kill needs an 'id' (from the jobs tool) or all: true.")
+			}
 		}
 		if len(errMsgs) > 0 {
 			return nil, formatError(errTemplate, strings.Join(errMsgs, " "), true, ctx)
 		}
-		// A non-string command survives as its JSON spelling, like Python
-		// passing the value straight through.
-		command, ok := args["command"].(string)
-		if !ok {
-			b, _ := json.Marshal(args["command"])
-			command = string(b)
-		}
-		action := Action{Command: command, ToolCallID: id,
+		action := Action{Tool: name, ToolCallID: id, Args: args}
+		switch name {
+		case ToolBash:
+			// A non-string command survives as its JSON spelling, like Python
+			// passing the value straight through.
+			command, ok := args["command"].(string)
+			if !ok {
+				b, _ := json.Marshal(args["command"])
+				command = string(b)
+			}
+			action.Command = command
 			// Both optional parameters are permissive on purpose, matching the
 			// rule in docs/jobs-research.md §4 that a job which failed to start
 			// is worse than one missing a knob: a value that is not a number
 			// falls back to "no opinion" rather than failing the call.
-			TimeoutS:   optionalSeconds(args["timeout_s"]),
-			Background: optionalBool(args["background"]),
+			action.TimeoutS = optionalSeconds(args["timeout_s"])
+			action.Background = optionalBool(args["background"])
+			action.Description = action.Str("description")
+		default:
+			// The job tools carry one addressing argument, and Command is where
+			// the ledger and the panels already know to look.
+			action.Command = action.Str("id")
 		}
 		actions = append(actions, action)
 	}
@@ -187,7 +211,10 @@ func formatObservations(actions []Action, results []env.Result, obsTemplate stri
 			// Transcript metadata: the UI shows what ran and where without
 			// having to re-read the assistant message. Never sent to the API,
 			// since extra is stripped before the request.
-			"command": action.Command,
+			// Display is the script for bash and "job_kill j1" for the job
+			// tools, so a card never shows a bare id with no verb.
+			"tool":    action.ToolName(),
+			"command": action.Display(),
 			"cwd":     result.CWD,
 			// The complete output, untrimmed, in this file; the loop adds
 			// tcno/tcr_offset/elided_lines when the call has a database row.

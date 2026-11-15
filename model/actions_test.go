@@ -105,13 +105,100 @@ func TestParseStillRejectsBrokenCalls(t *testing.T) {
 	if text := parse("bash", `{"timeout_s":60}`); !strings.Contains(text, "Missing 'command' argument in bash tool call.") {
 		t.Errorf("rejection text = %q", text)
 	}
-	// The new parameters are extras on the bash tool and nothing else: an
-	// unknown tool stays unknown however well-formed its arguments are.
-	if text := parse("jobs", `{"timeout_s":60}`); !strings.Contains(text, "Unknown tool 'jobs'") {
+	// An unknown tool stays unknown however well-formed its arguments are.
+	if text := parse("shell_start", `{}`); !strings.Contains(text, "Unknown tool 'shell_start'") {
 		t.Errorf("rejection text = %q", text)
 	}
 	// And a call that only adds optional keys is not a problem.
 	if a := parseOne(t, `{"command":"ls","timeout_s":42}`); a.TimeoutS != 42 {
 		t.Errorf("action = %+v", a)
+	}
+}
+
+// The job tools are their own calls now: bash's required 'command' must not be
+// demanded of them, and job_kill must not be allowed to mean "guess".
+func TestParseJobToolCalls(t *testing.T) {
+	parse := func(name, arguments string) (Action, error) {
+		actions, err := parseToolCallActions(
+			[]map[string]any{{"id": "c1", "function": map[string]any{"name": name, "arguments": arguments}}},
+			"{{ .error }}", map[string]any{"finish_reason": "tool_calls"})
+		if err != nil || len(actions) == 0 {
+			return Action{}, err
+		}
+		return actions[0], nil
+	}
+
+	a, err := parse("jobs", `{}`)
+	if err != nil {
+		t.Fatalf("a bare jobs call must parse: %v", err)
+	}
+	if a.ToolName() != ToolJobs || a.Command != "" {
+		t.Errorf("action = %+v", a)
+	}
+	a, err = parse("jobs", `{"id":"j7"}`)
+	if err != nil || a.Command != "j7" {
+		t.Errorf("scoped listing = %+v, %v", a, err)
+	}
+
+	a, err = parse("job_kill", `{"id":"j7"}`)
+	if err != nil || a.Command != "j7" || a.ToolName() != ToolJobKill {
+		t.Errorf("action = %+v, %v", a, err)
+	}
+	a, err = parse("job_kill", `{"all":true}`)
+	if err != nil {
+		t.Fatalf("kill all: %v", err)
+	}
+	if !a.Bool("all") {
+		t.Errorf("all flag lost: %+v", a)
+	}
+	// No target at all is the one thing the tool cannot do: all:true ends every
+	// job in the session, so guessing is not an option.
+	if _, err := parse("job_kill", `{}`); err == nil {
+		t.Error("job_kill with no target was accepted")
+	} else if !strings.Contains(rejectionText(t, err), "job_kill needs an 'id'") {
+		t.Errorf("rejection text = %q", rejectionText(t, err))
+	}
+}
+
+// rejectionText pulls the message the model would actually read out of a format
+// interrupt: the error's own text is just "FormatError".
+func rejectionText(t *testing.T, err error) string {
+	t.Helper()
+	var in *Interrupt
+	if !errors.As(err, &in) || len(in.Messages) == 0 {
+		t.Fatalf("%v is not a format interrupt", err)
+	}
+	text, _ := in.Messages[0]["content"].(string)
+	return text
+}
+
+// The gate policy in one table, because it is the part a reviewer will not
+// believe: ending a job asks for nothing.
+func TestNeedsConfirmationIsOnlyAboutStartingWork(t *testing.T) {
+	cases := []struct {
+		tool string
+		want bool
+	}{
+		{"", true},           // human-mode and legacy rows: bash
+		{ToolBash, true},     // starts work
+		{ToolJobs, false},    // reads a table
+		{ToolJobKill, false}, // ends work already permitted
+	}
+	for _, c := range cases {
+		a := Action{Tool: c.tool, Command: "anything"}
+		if got := a.NeedsConfirmation(); got != c.want {
+			t.Errorf("%q: NeedsConfirmation = %v, want %v", c.tool, got, c.want)
+		}
+	}
+	// Display names the tool for the job calls and stays the raw script for
+	// bash, so every existing panel and ledger line is unchanged.
+	if got := (Action{Command: "make && make install"}).Display(); got != "make && make install" {
+		t.Errorf("bash Display = %q", got)
+	}
+	if got := (Action{Tool: ToolJobKill, Command: "j1"}).Display(); got != "job_kill j1" {
+		t.Errorf("job_kill Display = %q", got)
+	}
+	if got := (Action{Tool: ToolJobs}).Display(); got != "jobs" {
+		t.Errorf("jobs Display = %q", got)
 	}
 }

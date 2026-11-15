@@ -50,7 +50,11 @@ func (h *Interactive) shouldAskConfirmation(command string) bool {
 func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action, _ map[string]any) error {
 	ask := false
 	for _, a := range actions {
-		if h.shouldAskConfirmation(a.Command) {
+		// The job tools never reach the prompt: reading the registry asks
+		// nothing of anyone, and job_kill can only end work that already
+		// passed the gate when it started. Asking before letting a runaway
+		// be stopped would make the mitigation slower than the problem.
+		if a.NeedsConfirmation() && h.shouldAskConfirmation(a.Command) {
 			ask = true
 			break
 		}

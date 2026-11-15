@@ -76,11 +76,19 @@ combine freely:
    background job as fire-and-forget, which quietly means "no REPL, no
    confirm-prompting installer, no interactive git".
 8. **Permissions and safety.** A background shell is the same capability as a
-   foreground one, so it must inherit the same gate. little-coder registers
-   `ShellStart` in the whitelist gate's `SHELL_TOOLS` set precisely because a
-   new shell tool that skipped the gate "would silently reopen issue #70"; zero
-   marks `TaskStop` as `SideEffectShell` + `PermissionPrompt` even though it is
-   only a kill.
+   foreground one, so *starting* one must inherit the same gate. little-coder
+   registers `ShellStart` in the whitelist gate's `SHELL_TOOLS` set precisely
+   because a new shell tool that skipped the gate "would silently reopen issue
+   #70"; zero marks `TaskStop` as `SideEffectShell` + `PermissionPrompt` even
+   though it is only a kill - and that is the one place in this survey where the
+   reasoning does not transfer. A kill can only end runs this session already
+   started, and those already passed whatever gate applied to launching them; it
+   cannot begin anything, cannot touch a process the harness did not launch, and
+   cannot lose data that was not already being written. Gating it makes the
+   mitigation slower than the problem it mitigates, which on a single-GPU box is
+   the difference between a runaway training job costing one turn and costing
+   however long it takes a human to notice. §4 therefore gates `bash` and exempts
+   `jobs` and `job_kill`.
 
 The axes combine into three recognisable shapes: **promote** (crush, qwen-code:
 one bash tool that becomes a job), **registry** (zero: jobs are first-class
@@ -423,7 +431,7 @@ they are.
 | Session-close vs cancel semantics, written down | omp `session.rs:44-56` | policy, 0 | **Yes — the documentation is the feature.** Pick the rule and put it in the tool description. |
 | Coaching hint after a long foreground call, with the double-side-effect caveat | qwen `buildLongRunningForegroundHint` | ~25 | Yes — cheap, and the caveat is the part that makes it safe. |
 | Background tasks surfaced in the human UI (`/tasks`, TUI dialog, GUI card) | qwen, crush (metadata on the response) | ~150 GUI | Yes late — mini's footer is already fed by `Snapshot`; a live-job count belongs there before a full dialog does. |
-| Reuse the same permission gate for the new shell tool | little-coder `SHELL_TOOLS`, zero `TaskStop` prompt | ~10 | **Yes, mandatory.** mini's confirm/yolo mode applies to `bash`; a job tool that bypasses it is a hole. |
+| Reuse the same permission gate for the new shell tool | little-coder `SHELL_TOOLS`, zero `TaskStop` prompt | ~10 | **For launching, mandatory; for ending, refused.** A backgrounded `bash` is the same capability as a foreground one and prompts identically. `jobs` reads a table and `job_kill` can only stop work already permitted, so neither asks - see §1 axis 8. `Action.NeedsConfirmation()` is the one-line statement of that policy, with a table of tests on it. |
 
 ---
 
@@ -514,19 +522,36 @@ rather than the decision.
 ### Surface: two parameters and four tools
 
 Keep `bash` as the workhorse. Everything new is named `job_*` so the family is
-obvious in a tool list, and every one of them goes through the same
-confirm-mode gate as `bash` — a background shell is the same capability as a
-foreground one, and a kill is still a shell side effect (little-coder registers
-`ShellStart` in `SHELL_TOOLS` and zero marks `TaskStop` `SideEffectShell` +
-`PermissionPrompt` for precisely this reason).
+obvious in a tool list. **The gate divides by whether an action starts work:**
+`bash` prompts in confirm mode exactly as it always has - including when
+`background: true`, because a background shell is the same capability as a
+foreground one - while `jobs` and `job_kill` never prompt. zero marks even its
+`TaskStop` as a permissioned side effect; that caution does not survive contact
+with a single-GPU box, where the reason a model reaches for `job_kill` is that
+something is wasting memory *now*. `Action.NeedsConfirmation()` says so in one
+place, and `ui/interactive.go` consults it rather than pattern-matching command
+text, which is also what lets a non-shell tool exist without falling through the
+whitelist into "prompt for everything".
+
+**There is no alternative to `job_kill`, and that is a structural point rather
+than a UX preference.** The interpreter runs in-process, so a single command can
+be holding several external children at once - a pipeline, three `&` clauses,
+`make -j`, a loop that forks - and the interpreter gives each of them its own
+session, which is exactly what makes the harness able to end them. So there is no
+process, and no command line, that names "the job" for a `pkill -f` to match; and
+a `kind='subagent'` job will have no process at all. Cancellation reaches every
+one of them because the run owns the context they were all started under, which
+is the capability no shell command can imitate. `TestKillEndsEveryConcurrent-
+ExternalOfARun` holds that guarantee: four simultaneous `sleep` children, one
+kill, none surviving.
 
 | Tool | Parameters | Notes |
 |---|---|---|
 | `bash` *(modified)* | `command`, **`background`** (bool, default false), **`timeout_s`** (int, optional, **unbounded above**) | `timeout_s` bounds the *foreground wait*, not the command's life. Description states the 30 s handoff, says an unbounded command is fine, and warns about buffering (below). |
-| `jobs` | none, or `id` | id, kind, state, exit code and reason, elapsed, label/command, **`output_path`, the log's current size and its total line count**, armed monitor rules, **why it is still around**, and how long since last output. Parent shown as an indent so a subagent tree reads as a tree. The listing is where liveness and location come from; `bash` is how the bytes get read. |
+| `jobs` | none, or `id` | ✅ built.  id, kind, state, exit code and reason, elapsed, label/command, **`output_path`, the log's current size and the age of its last write** (not a line count: that is a full scan per listing over logs that are routinely hundreds of megabytes, and `wc -l` on the path is exact and only ever run on the one job being asked about), armed monitor rules, **why it is still around**, and how long since last output. Parent shown as an indent so a subagent tree reads as a tree. The listing is where liveness and location come from; `bash` is how the bytes get read. |
 | `job_monitor` | `id`, `add` (patterns), `remove` (patterns), `list` | Add/remove/list text-match rules. `mode` picks `literal` or `regex` (default literal), `every_n_matches` throttle, per-rule min interval. Exit rule is not addressable — it cannot be removed. |
 | `job_wait` | `ids` (list or `all`), `timeout_ms` (optional, default 30 000, unbounded above) | Blocks until the **first** monitor across the set fires; returns *state of the set* on deadline, never an error. |
-| `job_kill` | `id` or `all` | Group kill with PID-reuse check, SIGINT→SIGKILL over `killGrace`. |
+| `job_kill` | `id`, or `all` | Cancels the run's context, which is what ends *every* external command it started; env then does SIGINT → `KillGrace` → SIGKILL per command group. Never prompts, including `all`. An orphaned row from before a restart reports that it is not this process's to signal rather than guessing at a pid. |
 
 Two rules about the parameters that are easy to get wrong later:
 
@@ -938,7 +963,7 @@ its cost.
    kills, and the tool description says so. The fast-failure grace needs no code
    here: a command that dies before the budget is simply `<-run.Done()` winning
    the select. `MAX_JOBS` is enforced at `Detach`. Still owed: `jobs` **with
-   `output_path`, log size and total line count**; `job_kill`. After this step a job is
+   `output_path`, log size and last-write age**; `job_kill`. After this step a job is
    spawnable, listable, readable, and killable, the feature already pays for
    itself, and it changes nothing for a model that never hits the wall. There is
    deliberately no read-tool step: the first thing to instrument here is whether
@@ -992,6 +1017,9 @@ Step 1 is in the tree:
     not complete, it handed off, and the store already models an unfinished call
     (that is the cancellation case). Closing the row with a return code nobody
     measured would put a number in the ledger that the job later contradicts.
+  - `bash` also gained `description`, a few words from the model that becomes the
+    job's label - the thing `jobs` prints and a wake will quote, which is what
+    turns "j3" into "quantise 70b" in anything read later.
   - **A promoted run keeps the call's file**, because the row stores the path it
     has been writing to rather than a new one. So the transcript's `tcr_path` for
     a long command *is* the live job log, `append-at-EOF` keeps every stored
@@ -1033,10 +1061,15 @@ ask for a job. Step 2 (promotion) is where the tool surface appears.
 2. **`job_wait` return shape when several jobs fire together** — earliest only
    plus "3 more pending", or all of them up to the byte cap? Earliest-only is
    the stated default here; it is also the one that keeps the digest bounded.
-3. **Confirm mode and `all`.** `job_kill {all: true}` is a wildcard shell side
-   effect; it should prompt even in a session where individual kills were
-   already approved, and nothing in the current gate models "one approval, N
-   targets".
+3. ~~Confirm mode and `all`.~~ **Settled: no prompt, for `all` included.** This
+   doc originally said a kill is still a shell side effect and should inherit the
+   gate, by way of zero's `TaskStop`. That is wrong, and the mistake is
+   instructive: zero's tool stops a specialist it launches *from the tool*, so
+   the prompt is where the launch is authorised. Here the launch was already
+   authorised when `bash` ran, and `job_kill` only removes work in progress. The
+   blast radius is also bounded by construction - it can address jobs in this
+   session with a live handle, and nothing else. So `all: true` is the safe
+   emergency exit rather than the wildcard that needed guarding.
 4. **Headless `--print` with live jobs at the end**: reap (current plan, and
    consistent with "never a session") or gain a `--wait-for-jobs` flag that
    holds the run open until every monitor has fired? A soak test launched with

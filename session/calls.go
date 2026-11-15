@@ -56,11 +56,12 @@ func (s *Session) OpenToolCall(msg model.Message, idx int, action model.Action) 
 		}
 		if _, err := s.store.db.Exec(`INSERT INTO tool_calls (session_id, turn, idx, tcno, id, name, command, created_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			// name is "bash" today, the only tool parseToolCallActions accepts
-			// (model/actions.go:31-35); the column exists so a second tool needs
-			// no migration. id is "" for a human-mode command, which has no
-			// provider tool_call_id.
-			s.ID.String(), turn, idx, tcno, action.ToolCallID, "bash", action.Command, now); err != nil {
+			// name carries the advertised tool - bash, jobs, job_kill - which is
+			// why the column exists: the ledger stays readable when a turn's
+			// rows are a mix, and nothing has to guess from the command text.
+			// id is "" for a human-mode command, which has no provider
+			// tool_call_id and is always bash.
+			s.ID.String(), turn, idx, tcno, action.ToolCallID, action.ToolName(), action.Command, now); err != nil {
 			return model.ToolCall{}, fmt.Errorf("session store: open tool call %d: %w", tcno, err)
 		}
 	} else if err != nil {

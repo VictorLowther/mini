@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -323,5 +324,132 @@ func TestPromotionUsesTheConfiguredBudget(t *testing.T) {
 	}
 	if list, _ := jm2.List(); len(list) != 1 || list[0].State != session.JobRunning {
 		t.Errorf("registry = %+v", list)
+	}
+}
+
+// pgrepCount counts live processes whose command line matches, which is how
+// these tests prove a kill reached the process and not just the row.
+func pgrepCount(t *testing.T, pattern string) int {
+	t.Helper()
+	out, _ := exec.Command("pgrep", "-f", pattern).Output()
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return 0
+	}
+	return len(strings.Split(s, "\n"))
+}
+
+func TestJobsToolDescribesALiveJob(t *testing.T) {
+	const marker = "43.7"
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("background it", model.Action{Command: "sleep " + marker, Background: true, Description: "soak"}),
+		turnActions("what is running", model.Action{Tool: model.ToolJobs}),
+		done("submitted"),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	if _, err := run(t, l, "background a soak and list it"); err != nil {
+		t.Fatal(err)
+	}
+	// The process really is there before the listing says so.
+	if pgrepCount(t, "sleep "+marker) == 0 {
+		t.Fatal("the backgrounded command never started")
+	}
+
+	obs := observations(l)
+	if len(obs) != 2 {
+		t.Fatalf("observations = %d", len(obs))
+	}
+	listing := obs[1]
+	for _, want := range []string{"j1", "running", "out=", "cmd=sleep " + marker, "soak", "1 job(s), 1 running", "job_kill"} {
+		if !strings.Contains(listing, want) {
+			t.Errorf("listing missing %q:\n%s", want, listing)
+		}
+	}
+	// Why it exists is in the listing, because "backgrounded on purpose" and
+	// "outran its budget" call for different next moves.
+	if !strings.Contains(listing, "why=started in the background") {
+		t.Errorf("listing lost the reason:\n%s", listing)
+	}
+	// And the registry is what it reads - not the conversation.
+	if list, _ := jm.List(); len(list) != 1 {
+		t.Errorf("registry = %+v", list)
+	}
+}
+
+func TestJobKillToolEndsTheJobAndItsProcess(t *testing.T) {
+	const marker = "55.3"
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("start it", model.Action{Command: "sleep " + marker, Background: true}),
+		turnActions("kill it", model.Action{Tool: model.ToolJobKill, Command: "j1"}),
+		done("submitted"),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	if _, err := run(t, l, "start then stop a soak"); err != nil {
+		t.Fatal(err)
+	}
+
+	obs := observations(l)
+	if len(obs) != 2 {
+		t.Fatalf("observations = %d", len(obs))
+	}
+	if !strings.Contains(obs[1], "j1: killed") {
+		t.Errorf("kill observation = %q", obs[1])
+	}
+	list, err := jm.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].State != session.JobKilled {
+		t.Fatalf("registry after kill = %+v", list)
+	}
+	// The claim that matters: the process is gone. Nothing here used a pattern
+	// kill, and the run's own context is what ended it.
+	for i := 0; i < 60; i++ {
+		if pgrepCount(t, "sleep "+marker) == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if left := pgrepCount(t, "sleep "+marker); left != 0 {
+		t.Errorf("%d processes survived job_kill", left)
+	}
+}
+
+// An id the session does not have must not look like success, and an orphan from
+// before a restart must say it cannot be touched rather than pretend.
+func TestJobKillReportsWhatItCouldNotDo(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("ghost", model.Action{Tool: model.ToolJobKill, Command: "j99"}),
+		done("submitted"),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	if _, err := run(t, l, "kill a ghost"); err != nil {
+		t.Fatal(err)
+	}
+	obs := observations(l)
+	if !strings.Contains(obs[0], "j99: no such job in this session") {
+		t.Errorf("observation = %q", obs[0])
+	}
+	// The return code has to carry the failure, or a typo id reads as a kill.
+	if !strings.Contains(obs[0], "<returncode>1</returncode>") {
+		t.Errorf("unknown id did not fail: %q", obs[0])
+	}
+
+	// An orphaned row has no handle, and killing it is not this process's to do.
+	if _, err := jm.Session.CreateJob(session.JobRow{ID: "j7", Command: "python train.py"}); err != nil {
+		t.Fatal(err)
+	}
+	jm.Sweep()
+	m2 := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("kill the orphan", model.Action{Tool: model.ToolJobKill, Command: "j7"}),
+		done("submitted"),
+	}}
+	l2, _, _ := newJobLoop(t, m2, &env.Local{Timeout: 5 * time.Second})
+	l2.Jobs = jm
+	if _, err := run(t, l2, "kill the leftover"); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastObservation(l2); !strings.Contains(got, "orphaned") {
+		t.Errorf("observation = %q, want the honest refusal", got)
 	}
 }

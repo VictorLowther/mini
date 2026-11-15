@@ -570,3 +570,49 @@ func TestThinkingStateIsVisible(t *testing.T) {
 		t.Errorf("print mode never showed the thinking text:\n%s", h.output())
 	}
 }
+
+// The gate is about starting work. Reading the registry and ending a job that
+// already started must not cost a prompt - least of all job_kill, which is what
+// you reach for when something is wrong and burning the GPU right now.
+func TestJobToolsSkipTheConfirmationGate(t *testing.T) {
+	// First prove the gate is armed in this configuration, so the negative
+	// result below means something.
+	l, h := pair(t, newConfig("confirm"), []any{"echo hi", submit("done")},
+		&env.Local{Timeout: 5 * time.Second}, "\n/quit\n", true)
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(kinds(h), "confirm") {
+		t.Fatalf("bash did not prompt in confirm mode: kinds=%q", kinds(h))
+	}
+
+	kill := model.Message{
+		"role": "assistant", "content": "stop it",
+		"extra": map[string]any{"actions": []model.Action{
+			{Tool: model.ToolJobs, ToolCallID: "c1"},
+			{Tool: model.ToolJobKill, Command: "j1", ToolCallID: "c2"},
+		}, "cost": 1.0},
+	}
+	l2, h2 := pair(t, newConfig("confirm"), []any{kill, submit("done")},
+		&env.Local{Timeout: 5 * time.Second}, "/quit\n", true)
+	if _, err := l2.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
+	}
+	if k := kinds(h2); strings.Contains(k, "confirm,") || strings.Contains(k, ",confirm") || k == "confirm" {
+		t.Errorf("the job tools prompted: kinds=%q", k)
+	}
+	// And they still ran: the loop answered both calls.
+	if got := len(observationsOf(l2)); got != 2 {
+		t.Errorf("observations = %d, want one per job tool call", got)
+	}
+}
+
+func observationsOf(l *agent.Loop) []model.Message {
+	var out []model.Message
+	for _, m := range l.Messages {
+		if model.IsToolResult(m) {
+			out = append(out, m)
+		}
+	}
+	return out
+}

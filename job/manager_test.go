@@ -583,3 +583,52 @@ func TestRefusedStartLeaksNoGoroutine(t *testing.T) {
 		t.Errorf("goroutines went %d -> %d across 50 refused starts", before, after)
 	}
 }
+
+// A single bash command can hold several external processes at the same time -
+// pipelines, `&`, make -j, a loop that forks. They are not one process group
+// either: the interpreter gives each external command its own session, because
+// that is what lets a foreground call's timeout take down the tree it started.
+// So there is nothing a pattern-based kill could aim at that names "the job",
+// and this is why ending a run has to be the harness cancelling the context
+// every one of those commands was started under.
+func TestKillEndsEveryConcurrentExternalOfARun(t *testing.T) {
+	m, _ := newMgr(t, 0)
+	marker := markerFor(t)
+	const leaves = 4
+	script := ""
+	for i := 0; i < leaves; i++ {
+		script += "sleep " + marker
+		if i < leaves-1 {
+			script += " & "
+		}
+	}
+	r, err := m.Start(Spec{Command: script, Label: "many children"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerPIDs(t, "sleep "+marker, leaves)
+	if got := len(pgrep(t, "sleep "+marker)); got < leaves {
+		t.Fatalf("expected %d concurrent externals, saw %d", leaves, got)
+	}
+
+	if err := r.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	// Every leaf dies, including the backgrounded ones - which is the whole
+	// claim. A kill that reached only the command still attached to the
+	// interpreter would leak the GPU memory the design exists to protect.
+	for i := 0; i < 100; i++ {
+		left := pgrep(t, "sleep "+marker)
+		if len(left) == 0 {
+			break
+		}
+		if i == 99 {
+			t.Fatalf("%d of %d children survived the kill: %v", len(left), leaves, left)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	row := finish(t, r)
+	if row.State != session.JobKilled {
+		t.Errorf("state = %s, want killed", row.State)
+	}
+}

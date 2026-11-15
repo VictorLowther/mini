@@ -283,7 +283,7 @@ func toolCallEntries(m model.Message, actions []model.Action) []slotEntry {
 	var out []slotEntry
 	for _, a := range actions {
 		if a.ToolCallID != "" {
-			out = append(out, slotEntry{id: a.ToolCallID, name: "bash", command: a.Command})
+			out = append(out, slotEntry{id: a.ToolCallID, name: a.ToolName(), command: a.Command})
 		}
 	}
 	return out
