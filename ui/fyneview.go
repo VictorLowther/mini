@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"image/color"
+	"log/slog"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -15,6 +17,13 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+// layoutProbe logs, once per width change, the size every surface in the column
+// was actually handed (MINI_DEBUG_LAYOUT=1, DEBUG level so it lands in
+// --log-file). It changes nothing about rendering: the widths reported here were
+// the only trustworthy measurement of a real drag in this whole investigation,
+// and they exonerated the layout chain.
+var layoutProbe = os.Getenv("MINI_DEBUG_LAYOUT") != ""
 
 // isMacOS picks the platform-conventional modifier for the GUI's chords
 // (Fyne's KeyModifierShortcutDefault already is ⌘ on macOS and Ctrl
@@ -65,6 +74,7 @@ type guiView struct {
 	panelScroll *container.Scroll
 	panel       *fyne.Container // question panel content, swapped per prompt
 	card        *widget.Card    // the bordered box holding the panel
+	row         *fyne.Container // the fixed bottom row (status + input), for the probe
 	status      *widget.Label
 	editor      *chatInput
 
@@ -129,6 +139,32 @@ type guiView struct {
 
 	inRecompute   bool
 	recalcPending bool
+
+	// probeW is the centre width the probe last reported, so it logs per width
+	// change rather than once per layout pass.
+	probeW float32
+}
+
+// probe reports the width every surface in the column was handed. Called from
+// the centre layout, which runs on every resize.
+func (v *guiView) probe(given fyne.Size) {
+	if !layoutProbe || given.Width == v.probeW {
+		return
+	}
+	v.probeW = given.Width
+	slog.Debug("layout probe", "given", given,
+		"canvas", v.win.Canvas().Size(), "root", v.rootC.Size(),
+		"bottom", v.bottomRowSize(), "editor", v.editor.Size(),
+		"center", v.center.Size(), "scroll", v.scroll.Size())
+}
+
+// bottomRowSize is the fixed bottom row's current size, or the zero size before
+// root() has built it.
+func (v *guiView) bottomRowSize() fyne.Size {
+	if v.row == nil {
+		return fyne.Size{}
+	}
+	return v.row.Size()
 }
 
 func newGUIView(g *GUI, w fyne.Window) *guiView {
@@ -153,6 +189,7 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 func (v *guiView) root() fyne.CanvasObject {
 	v.center = container.New(centerLayout{v}, v.scroll, v.card)
 	fixed := container.NewVBox(v.status, v.editor)
+	v.row = fixed
 	v.rootC = container.NewBorder(nil, fixed, nil, nil, v.center)
 	// Every scroll movement may cross a window boundary; the window is the
 	// tree, so the tree follows the thumb. Caveat from the scroller: a
@@ -446,6 +483,7 @@ func (l centerLayout) Layout(o []fyne.CanvasObject, s fyne.Size) {
 	scroll.Move(fyne.Position{})
 	card.Resize(fyne.NewSize(s.Width, cardH))
 	card.Move(fyne.NewPos(0, scrollH))
+	l.v.probe(s)
 }
 
 func (l centerLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
@@ -1537,11 +1575,24 @@ type chatInput struct {
 }
 
 func newChatInput(v *guiView) *chatInput {
-	e := widget.NewMultiLineEntry()
-	e.Wrapping = fyne.TextWrapWord
+	// Built as a struct, NOT with widget.NewMultiLineEntry(): that constructor
+	// ends in e.ExtendBaseWidget(e), and ExtendBaseWidget is first-write-wins, so
+	// the wrapper's claim below would be a silent no-op. Lose the claim and
+	// internal/cache keys the wrapper's renderer and the inner entry's renderer
+	// apart - Renderer stores under the widget it was asked for while every
+	// lookup re-resolves through super() - and each miss runs
+	// Entry.CreateRenderer again, which rebuilds e.content/e.scroll from scratch.
+	// Two renderers, two scrolls: Resize(1272) laid out a scroll that was never
+	// painted while the painted one kept the width the window was created at. That
+	// is this widget's four symptoms at once - the box not following the window,
+	// no caret after the first character, text that never wraps, no growth or
+	// scrolling past a few lines.
+	//
+	// The keyed literal sets what the constructor would have, minus the claim.
+	e := &widget.Entry{MultiLine: true, Wrapping: fyne.TextWrapWord}
 	e.PlaceHolder = "message · enter sends · shift+enter adds a newline · /h commands"
 	c := &chatInput{Entry: e, v: v}
-	c.ExtendBaseWidget(c)
+	c.ExtendBaseWidget(c) // now the first call, so it lands: one identity, one renderer
 	return c
 }
 
