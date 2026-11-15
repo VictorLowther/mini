@@ -3,9 +3,15 @@ agent:
   # append-only; near the trigger the loop asks the model to checkpoint its
   # own conversation in one cache-reading side-query, and the projected
   # context restarts at [prompt plumbing + summary + compact_keep_tokens of
-  # verbatim tail]. context_window is what the server actually runs - set it
-  # to the YaRN-extended extent when you serve beyond native; 0 disables
-  # automatic compaction (manual /compact still works).
+  # verbatim tail]. context_window is the LOCAL answer for what the server
+  # runs: a run first asks the server itself (GET /v1/models, the OpenAI model
+  # list) for this model's context, then falls back to this number, then to
+  # model.DefaultContextWindow. Set it to the YaRN-extended extent when you
+  # serve beyond native on a server that does not report one. To compact
+  # earlier than the window the server reports - the model-quality lever, since
+  # attention degrades past the native extent - use compact_threshold_ratio;
+  # to stop automatic compaction altogether use compact_enabled: false (manual
+  # /compact still works). 0 here means only "no local opinion".
   context_window: 262144
   compact_threshold_ratio: 0.9
   compact_keep_tokens: 40000

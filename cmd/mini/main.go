@@ -408,6 +408,16 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	if m.Model == "" {
 		return nil, errors.New("no model set. Pass -m NAME or run `mini config setup`.")
 	}
+
+	// The window is the server's to know: ask it (GET /v1/models) before the
+	// loop and the front ends are built, so the compaction trigger, the
+	// footer's ctx%% and the trajectory all run against the extent this session
+	// actually has. agent.context_window stays the fallback for a server that
+	// will not say, then model.DefaultContextWindow. It is a startup question
+	// with a known-good default answer, so a silent or unreachable server
+	// costs one short request and never a run.
+	agentCfg.ContextWindow, _ = m.DiscoverContextWindow(context.Background(), agentCfg.ContextWindow)
+
 	e := newEnvironment(envCfg)
 
 	// A store that cannot be opened is fatal: a transcript source of truth
@@ -690,7 +700,8 @@ func printBanner(w io.Writer, printMode bool, configName string, m *model.Sushi)
 	if !printMode {
 		out = w
 	}
-	fmt.Fprintf(out, "mini-go %s . config %s . model %s @ %s\n", agent.Version, configName, m.Model, m.BaseURL)
+	fmt.Fprintf(out, "mini-go %s . config %s . model %s @ %s . ctx %s\n",
+		agent.Version, configName, m.Model, m.BaseURL, m.ContextWindowNote())
 }
 
 func setupLogging(logFile string, stderr io.Writer) func() {

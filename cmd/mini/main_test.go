@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -324,6 +325,154 @@ func TestRunPrintModeEndToEnd(t *testing.T) {
 	// history carries it (proved by the recorded stream containing it).
 	if _, ok := traj.Messages[2]["reasoning_content"]; !ok {
 		t.Errorf("assistant message lost reasoning_content: %#v", traj.Messages[2])
+	}
+}
+
+// modelInfoFixtureServer is fixtureServer with a /v1/models answer, so a run
+// can be pointed at a server that reports a context window (or one that does
+// not, which is what fixtureServer's 404 already is).
+func modelInfoFixtureServer(t *testing.T, modelInfo string, names ...string) *httptest.Server {
+	t.Helper()
+	var bodies [][]byte
+	for _, n := range names {
+		b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "sushi", n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, b)
+	}
+	i := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, modelInfo)
+			return
+		}
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		body := bodies[len(bodies)-1]
+		if i < len(bodies) {
+			body = bodies[i]
+		}
+		i++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write(body)
+	}))
+}
+
+// runToEndTraj runs --print to completion against srvURL and hands back the
+// trajectory's info.config, where both halves of the context-window decision
+// land: agent.context_window (what the loop compacted against) and
+// model.context_window_source (who said so).
+func runToEndTraj(t *testing.T, srvURL, out string, extraArgs ...string) map[string]any {
+	t.Helper()
+	t.Setenv("MINI_STATE_DIR", t.TempDir())
+	t.Setenv("MINI_GLOBAL_CONFIG_DIR", t.TempDir())
+	t.Setenv("MINI_CONFIGURED", "true")
+	t.Setenv("MINI_MODEL_NAME", "test-model")
+	t.Setenv("MINI_SILENT_STARTUP", "1")
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	stdout, err := os.CreateTemp(t.TempDir(), "mini-out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdout.Close()
+	code := run(append([]string{
+		"-p", "-y", "-m", "test-model", "--url", srvURL,
+		"-t", "run 'echo hi', verify, then submit", "-o", out, "--exit-immediately",
+	}, extraArgs...), devnull, stdout, os.Stderr)
+	data, _ := os.ReadFile(out)
+	if code != 0 {
+		t.Fatalf("exit code %d, output:\n%s", code, data)
+	}
+	var traj struct {
+		Info struct {
+			Config map[string]any `json:"config"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(data, &traj); err != nil {
+		t.Fatal(err)
+	}
+	return traj.Info.Config
+}
+
+func section(cfg map[string]any, name string) map[string]any {
+	m, _ := cfg[name].(map[string]any)
+	return m
+}
+
+// TestRunTakesTheContextWindowFromTheServer: the shipped config's
+// context_window is a fallback, not the answer. A session running against a
+// server serving 1M has to compact against 1M, or the trigger fires while the
+// context still has three quarters of the window left.
+func TestRunTakesTheContextWindowFromTheServer(t *testing.T) {
+	srv := modelInfoFixtureServer(t,
+		`{"object":"list","data":[{"id":"test-model","context_length":1048576,"loaded":true,"state":"ready"}]}`,
+		"toolcall.sse", "submit.sse")
+	defer srv.Close()
+	out := filepath.Join(t.TempDir(), "server.traj.json")
+	cfg := runToEndTraj(t, srv.URL, out)
+
+	if got := section(cfg, "agent")["context_window"]; got != float64(1048576) {
+		t.Errorf("agent.context_window = %v, want the server's 1048576", got)
+	}
+	if got := section(cfg, "model")["context_window"]; got != float64(1048576) {
+		t.Errorf("model.context_window = %v", got)
+	}
+	if got := section(cfg, "model")["context_window_source"]; got != model.ContextFromServer {
+		t.Errorf("model.context_window_source = %v, want %q", got, model.ContextFromServer)
+	}
+}
+
+// TestRunFallsBackToTheConfiguredWindow: the servers that answer /v1/models
+// with nothing but ids are the OpenAI standard, not a bug - and a server that
+// is not listening at all must not stop a run from starting either.
+func TestRunFallsBackToTheConfiguredWindow(t *testing.T) {
+	srv := fixtureServer(t, "toolcall.sse", "submit.sse") // 404s /v1/models
+	defer srv.Close()
+	out := filepath.Join(t.TempDir(), "config.traj.json")
+	cfg := runToEndTraj(t, srv.URL, out)
+
+	want := agent.ConfigFromMap(nil).ContextWindow
+	if want != 0 {
+		t.Fatalf("the default local config is no longer 0; this test's premise moved (%d)", want)
+	}
+	// mini.yaml's own value, which the embedded config sets on purpose.
+	if got := section(cfg, "agent")["context_window"]; got != float64(262144) {
+		t.Errorf("agent.context_window = %v, want the configured 262144", got)
+	}
+	if got := section(cfg, "model")["context_window_source"]; got != model.ContextFromConfig {
+		t.Errorf("model.context_window_source = %v, want %q", got, model.ContextFromConfig)
+	}
+}
+
+// TestRunTakesAnExplicitlyConfiguredWindowOnlyWhenAsked: -c on the command
+// line is the local fallback, and the server still outranks it - the operator
+// who wants the config number wins by pointing at a server that does not say.
+// TestServerWindowOutranksAConfiguredOverride: -c agent.context_window=... is
+// the local fallback for a server that will not say, not a pin on the server's
+// answer. The operator who wants a smaller working set uses
+// compact_threshold_ratio, which keeps the trigger's relation to the real
+// window honest.
+func TestServerWindowOutranksAConfiguredOverride(t *testing.T) {
+	srv := modelInfoFixtureServer(t,
+		`{"object":"list","data":[{"id":"test-model","context_length":1048576}]}`,
+		"toolcall.sse", "submit.sse")
+	defer srv.Close()
+	out := filepath.Join(t.TempDir(), "override.traj.json")
+	cfg := runToEndTraj(t, srv.URL, out, "-c", "mini", "-c", "agent.context_window=32768")
+
+	if got := section(cfg, "agent")["context_window"]; got != float64(1048576) {
+		t.Errorf("agent.context_window = %v, want the server's number to outrank the config", got)
+	}
+	if got := section(cfg, "model")["context_window_source"]; got != model.ContextFromServer {
+		t.Errorf("model.context_window_source = %v, want %q", got, model.ContextFromServer)
 	}
 }
 

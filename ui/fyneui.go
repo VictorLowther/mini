@@ -42,6 +42,9 @@ type GUI struct {
 	modelName  string
 	baseURL    string
 	configName string
+	// contextNote is the resolved context window and its source, from the
+	// model client (see model.Sushi.DiscoverContextWindow).
+	contextNote string
 
 	app       fyne.App
 	window    fyne.Window
@@ -98,6 +101,13 @@ func NewGUI(o GUIOptions) *GUI {
 	if o.Model != nil {
 		g.modelName = o.Model.Model
 		g.baseURL = o.Model.BaseURL
+		// The header states the window only once discovery has settled it:
+		// "window unknown" in a transcript line nobody asked about is noise,
+		// and by the time a run exists the CLI has already resolved one way or
+		// the other (model.DiscoverContextWindow).
+		if o.Model.ContextWindow > 0 {
+			g.contextNote = o.Model.ContextWindowNote()
+		}
 	}
 	w := a.NewWindow("mini")
 	g.window = w
@@ -163,7 +173,7 @@ func (g *GUI) ShowError(err error) int {
 // Call on the main goroutine before app.Run: widget access is safe there and
 // fyne.Do would only queue onto a loop nothing runs yet.
 func (g *GUI) prepareTranscript() {
-	g.v.noteLocal(sessionHeaderLine(g.modelName, g.baseURL, g.configName, g.sessionID))
+	g.v.noteLocal(sessionHeaderLine(g.modelName, g.baseURL, g.configName, g.sessionID, g.contextNote))
 	for _, msg := range g.resume {
 		// The stored system and instance rows are prompt plumbing, exactly as
 		// in a live run: they never reach the transcript.

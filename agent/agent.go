@@ -44,9 +44,12 @@ type Config struct {
 	// the live context is append-only; a summary event fires near the edge of
 	// the window, reads the warm prompt cache, and anchors the new projection.
 	// ContextWindow is what the server actually runs - native extent, or the
-	// YaRN-extended one; 0 disables automatic compaction (crush's rule for
-	// models whose window is unknown). 0 < CompactThresholdRatio <= 1 picks
-	// the trigger point; CompactKeepTokens is the verbatim tail budget.
+	// YaRN-extended one. A run started by the CLI never trusts this number
+	// over what the server's model list says; agent.context_window is the
+	// fallback (see model.DiscoverContextWindow). The zero it can still hold
+	// when a Config is built directly disables automatic compaction, crush's
+	// rule for models whose window is unknown. 0 < CompactThresholdRatio <= 1
+	// picks the trigger point; CompactKeepTokens is the verbatim tail budget.
 	ContextWindow           int
 	CompactEnabled          bool
 	CompactThresholdRatio   float64
@@ -365,6 +368,7 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	l.autoCompactOff = false
 	l.overflowBudget = maxOverflowCompactions
 	l.manualCompact = false
+	l.checkWindowParams()
 	for _, kw := range kwargs {
 		for k, v := range kw {
 			l.extraVars[k] = v

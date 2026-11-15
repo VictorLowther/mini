@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -410,13 +411,54 @@ func TestConfigThresholds(t *testing.T) {
 	if got := c.compactThreshold(); got != 900 {
 		t.Errorf("absurd ratio fell to %d, want the 0.9 default", got)
 	}
-	// The embedded config ships with a real window set.
+	// The embedded config ships a real window, which is the fallback the CLI
+	// uses when the server declines to report one (model.DiscoverContextWindow
+	// asks /v1/models first); 0 here would leave only the built-in default.
 	m, err := config.FromSpec("mini")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := ConfigFromMap(config.Sub(m, "agent")).ContextWindow; got == 0 {
-		t.Error("mini.yaml sets no context_window; compaction would default off")
+		t.Error("mini.yaml sets no context_window; a silent server would leave only the default")
+	}
+}
+
+// TestCheckWindowParams: a run whose window cannot hold the tail plus the
+// summary says so at startup instead of quietly never compacting. This became a
+// live concern when the window started arriving from the server: the config
+// file a human set compact_keep_tokens in no longer shows the number it has to
+// fit under.
+func TestCheckWindowParams(t *testing.T) {
+	warns := func(c *Config) string {
+		var buf strings.Builder
+		l := &Loop{Cfg: c, Logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+		l.checkWindowParams()
+		return buf.String()
+	}
+	shipped := func(window int) *Config {
+		return &Config{ContextWindow: window, CompactEnabled: true, CompactThresholdRatio: 0.9,
+			CompactKeepTokens: 40000, CompactSummaryMaxTokens: 16384}
+	}
+	if out := warns(shipped(262144)); out != "" {
+		t.Errorf("the shipped budgets against their own window warned: %s", out)
+	}
+	if out := warns(shipped(1048576)); out != "" {
+		t.Errorf("a bigger window warned: %s", out)
+	}
+	// 8192 leaves a trigger of 7372, under the 56384 the compaction needs.
+	out := warns(shipped(8192))
+	for _, want := range []string{"no headroom", "context_window=8192", "keep_tokens=40000"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning %q missing %q", out, want)
+		}
+	}
+	if out := warns(shipped(0)); out != "" {
+		t.Errorf("an unresolved window warned; automatic compaction is already off: %s", out)
+	}
+	c := shipped(8192)
+	c.CompactEnabled = false
+	if out := warns(c); out != "" {
+		t.Errorf("compaction the operator switched off warned: %s", out)
 	}
 }
 

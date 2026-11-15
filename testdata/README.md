@@ -7,7 +7,7 @@ read-only: `git status --porcelain testdata/` must stay clean after
 |Item|What it is|Regenerate with|
 |---|---|---|
 |`sushi/*.sse`|Hand-written OpenAI-style SSE scripts (one turn per file) with sushi's exact frame shapes: keepalive comments, `finish_reason` `length`/`error`, a complete tool call in one delta, a fragmented one, parallel calls, an `include_usage` chunk with `timings`.|edit by hand; `testdata/fakesushi` replays them byte-for-byte|
-|`fakesushi/main.go`|Replays those streams over HTTP so the CLI and the model client can be exercised with no GPU. `package main` under `testdata/` is invisible to `./...`, so it never ships.|`go run ./testdata/fakesushi -addr :8009 -delay 150ms -keepalive`|
+|`fakesushi/main.go`|Replays those streams over HTTP so the CLI and the model client can be exercised with no GPU. Also answers `GET /v1/models` like sushi, including the `context_length` fields mini reads at startup; `-context-length 0` omits them, which is a plain OpenAI list and makes mini fall back to its config for the window. `package main` under `testdata/` is invisible to `./...`, so it never ships.|`go run ./testdata/fakesushi -addr :8009 -delay 150ms -keepalive -context-length 131072`|
 
 Try it against the real agent loop:
 

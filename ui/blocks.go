@@ -147,14 +147,18 @@ func runStatsText(snap agent.Snapshot, mode string, thinking bool, contextWindow
 }
 
 // sessionHeaderLine is the transcript's first line, worded identically by
-// every frontend.
-func sessionHeaderLine(modelName, baseURL, configName, sessionID string) string {
-	suffix := ""
-	if sessionID != "" {
-		suffix = " · session " + sessionID
+// every frontend. contextNote is the resolved context window and who reported
+// it, so a screenshot of a session says which extent it was run against.
+func sessionHeaderLine(modelName, baseURL, configName, sessionID, contextNote string) string {
+	parts := []string{fmt.Sprintf("mini-go %s · %s @ %s · config %s",
+		agent.Version, modelName, baseURL, configName)}
+	if contextNote != "" {
+		parts = append(parts, contextNote)
 	}
-	return fmt.Sprintf("mini-go %s · %s @ %s · config %s%s",
-		agent.Version, modelName, baseURL, configName, suffix)
+	if sessionID != "" {
+		parts = append(parts, "session "+sessionID)
+	}
+	return strings.Join(parts, " · ")
 }
 
 // The confirm prompt shows at most this many actions; the rest is elided with

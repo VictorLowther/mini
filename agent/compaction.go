@@ -75,6 +75,27 @@ func (c *Config) compactThreshold() int {
 	return int(float64(c.ContextWindow) * ratio)
 }
 
+// checkWindowParams says once, at the start of a run, what the parameters
+// already say about each other: the tail budget plus the summary budget have to
+// fit under the trigger, or no compaction can ever land back under it (pi's
+// defaults were broken exactly this way on 32k models, per
+// docs/compaction-research.md). The loop's own guards catch this at the moment
+// of the attempt; the check exists because the window now usually arrives from
+// the server, so the config file a human set compact_keep_tokens in no longer
+// shows the number it has to fit - a warning at startup beats a compaction that
+// silently never happens.
+func (l *Loop) checkWindowParams() {
+	threshold := l.Cfg.compactThreshold()
+	if threshold <= 0 {
+		return
+	}
+	if need := l.Cfg.CompactKeepTokens + l.Cfg.CompactSummaryMaxTokens; threshold <= need {
+		l.logger().Warn("the context window leaves compaction no headroom; lower compact_keep_tokens, lower compact_summary_max_tokens, or raise compact_threshold_ratio",
+			"context_window", l.Cfg.ContextWindow, "trigger_tokens", threshold,
+			"keep_tokens", l.Cfg.CompactKeepTokens, "summary_max_tokens", l.Cfg.CompactSummaryMaxTokens)
+	}
+}
+
 // RequestCompaction asks the loop to compact before the next model call no
 // matter what the estimate says. Safe from any goroutine; the GUI wires it
 // to /compact. A second request while one is pending is a no-op, and a
@@ -204,7 +225,11 @@ func (l *Loop) compact(ctx context.Context, proj []model.Message, estBefore int,
 	if threshold := l.Cfg.compactThreshold(); threshold > 0 && estAfterTrue >= threshold {
 		l.autoCompactOff = true
 		l.logger().Error("compaction would not fit the context under its trigger; automatic compaction stopped - check context_window, compact_threshold_ratio, compact_keep_tokens",
-			"estimated_after", estAfterTrue, "threshold", threshold)
+			"estimated_after", estAfterTrue, "threshold", threshold,
+			// Named because context_window is now usually the server's answer
+			// rather than the number in the config file being read: on a
+			// small-window server the shipped tail budget is simply too fat.
+			"context_window", l.Cfg.ContextWindow)
 		return false
 	}
 
@@ -240,7 +265,8 @@ func (l *Loop) rejectCompaction(manual bool, estBefore, estAfter, kept int) {
 	}
 	l.autoCompactOff = true
 	l.logger().Error("compaction would not shrink the context; automatic compaction stopped - check compact_keep_tokens against context_window",
-		"estimated_before", estBefore, "estimated_after", estAfter, "kept_turns", kept)
+		"estimated_before", estBefore, "estimated_after", estAfter, "kept_turns", kept,
+		"context_window", l.Cfg.ContextWindow)
 }
 
 // pickCut chooses the first kept turn: walk backwards accumulating estimated

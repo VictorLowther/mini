@@ -431,7 +431,10 @@ knobs worth exposing because they are judgment calls, not engineering calls:
 * **effective window = native vs YaRN.** Compacting at 262k instead of 1M is a
   *model-quality* lever (beyond native extent, YaRN-degraded attention and
   quadratic-cost decode), not a capacity one. It should be configuration, not
-  code.
+  code. mini splits the two: the *capacity* is asked of the server at startup
+  (`GET /v1/models`, falling back to `agent.context_window` and then to a
+  built-in default, so a shipped config can never silently compact a 1M session
+  at 262k), and the lever stays `compact_threshold_ratio`.
 * The whole scheme presumes sushi can *hold* the warmed prefix of a ~1M-token
   session (quantized-KV work pending). If cache capacity ever makes the prefix
   re-prefill anyway, the calculus flips back toward compacting early and

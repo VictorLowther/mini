@@ -4,15 +4,19 @@
 //
 //	go run ./testdata/fakesushi :8009
 //
-// It answers GET /health and /v1/models like sushi, and serves one recorded
-// stream per POST /v1/chat/completions in sequence, looping back to the last
-// body once the script runs out (so an unexpected extra turn is visible in the
-// trajectory rather than hanging).
+// It answers GET /health and /v1/models like sushi - including the
+// context_length fields mini reads at startup to decide its compaction trigger
+// - and serves one recorded stream per POST /v1/chat/completions in sequence,
+// looping back to the last body once the script runs out (so an unexpected
+// extra turn is visible in the trajectory rather than hanging).
 //
 // Flags:
 //
 //	-delay 250ms   pause between SSE frames, to prove the client tolerates stalls
 //	-scripts a.sse,b.sse   override the script (default: every testdata/sushi/*.sse in name order)
+//	-context-length 131072   what /v1/models reports; 0 leaves the field out,
+//	                          which is a plain OpenAI list and makes mini fall
+//	                          back to its config for the window
 package main
 
 import (
@@ -33,6 +37,7 @@ func main() {
 	scripts := flag.String("scripts", "", "comma-separated .sse files")
 	delay := flag.Duration("delay", 0, "pause between frames")
 	keepalive := flag.Bool("keepalive", false, "send a ': keepalive' comment before the first frame")
+	contextLength := flag.Int("context-length", 131072, "what /v1/models reports as context_length; 0 omits the field")
 	flag.Parse()
 
 	listen := *addr
@@ -80,7 +85,13 @@ func main() {
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"object": "list", "data": []any{
-			map[string]any{"id": "fakesushi", "object": "model", "owned_by": "testdata"},
+			// Several models, only one resident: enough to prove a client
+			// picks the right entry instead of the first one. Both ids in
+			// use are here - "fakesushi" and the "test-model" the README's
+			// invocation passes to -m.
+			modelEntry("fakesushi", true, *contextLength),
+			modelEntry("test-model", true, *contextLength),
+			modelEntry("fakesushi-unloaded", false, *contextLength),
 		}})
 	})
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +189,30 @@ func splitCSV(s string) []string {
 }
 
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// modelEntry is one /v1/models item in sushi's shape: the window both at the
+// top level and inside the meta block, plus the residency flags a client needs
+// to tell several served models apart. A zero contextLength omits the fields,
+// which is what a plain OpenAI-compatible server sends.
+func modelEntry(id string, loaded bool, contextLength int) map[string]any {
+	state := "unloaded"
+	if loaded {
+		state = "ready"
+	}
+	entry := map[string]any{
+		"id":       id,
+		"object":   "model",
+		"owned_by": "testdata",
+		"loaded":   loaded,
+		"state":    state,
+	}
+	if contextLength > 0 {
+		entry["context_length"] = contextLength
+		entry["max_model_len"] = contextLength
+		entry["meta"] = map[string]any{"context_length": contextLength}
+	}
+	return entry
+}
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

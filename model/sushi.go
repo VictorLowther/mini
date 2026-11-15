@@ -48,6 +48,17 @@ type Sushi struct {
 	ObsTemplate string
 	ErrTemplate string
 
+	// InfoTimeout bounds the startup GET /v1/models (default 3s). The client
+	// itself has no Timeout because streams stall legitimately; a model-list
+	// read is a question with a known-good default answer, so it can.
+	InfoTimeout time.Duration
+	// ContextWindow is the window the session runs against, resolved once at
+	// startup by DiscoverContextWindow; ContextWindowSource names which of the
+	// three it came from (ContextFromServer/Config/Default). Zero until
+	// discovery has run - the loop reads its own copy off agent.Config.
+	ContextWindow       int
+	ContextWindowSource string
+
 	// backoff converts a zero-based attempt index into a wait. Exponential
 	// with min 4s and cap 60s by default; replaceable so tests stay fast.
 	backoff func(attempt int) time.Duration
@@ -419,6 +430,14 @@ func (s *Sushi) configDump() map[string]any {
 			"input_per_mtok":  s.Pricing.InputPerMtok,
 			"output_per_mtok": s.Pricing.OutputPerMtok,
 		}
+	}
+	// What the window turned out to be, and who said so: a trajectory whose
+	// compaction timing is being second-guessed three weeks later needs to say
+	// whether the number came from the server, the config, or the built-in
+	// default.
+	if s.ContextWindow > 0 {
+		m["context_window"] = s.ContextWindow
+		m["context_window_source"] = s.ContextWindowSource
 	}
 	return m
 }
