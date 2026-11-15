@@ -933,9 +933,11 @@ its cost.
    `running ⇒ orphaned` sweep at open, and reap-on-quit. Foundation everything
    else reads, and safe to ship half-finished precisely because the sweep and
    the reap are live before any job can be started.
-2. **Promotion.** `bash` gains `background` and optional unbounded `timeout_s`;
-   the 30 s auto-background with fast-failure grace; `jobs` **with
-   `output_path` and log size**; `job_kill`; `MAX_JOBS`. After this step a job is
+2. **Promotion.** ⏳ *half built* — `bash` has `background` and optional
+   unbounded `timeout_s`, and `MAX_JOBS` is enforced in the manager. Still owed:
+   the 30 s auto-background with fast-failure grace and the tool-description
+   rewrite that follows from it; `jobs` **with
+   `output_path`, log size and total line count**; `job_kill`. After this step a job is
    spawnable, listable, readable, and killable, the feature already pays for
    itself, and it changes nothing for a model that never hits the wall. There is
    deliberately no read-tool step: the first thing to instrument here is whether
@@ -971,6 +973,24 @@ Step 1 is in the tree:
 - `cmd/mini` — one manager per run over the session's own `env.Local`, the
   sweep with the warnings surfaced, and the reap folded into the cleanup path
   both front ends already share.
+- Step 2, **partly**: `bash` takes `timeout_s` (uncapped, parsed permissively)
+  and `background: true`, and the loop starts the job and answers with a handoff
+  naming the job id, its output path, and a `tail -n 100` recipe. What is *not*
+  built is the 30-second auto-background, so an overrun is still interrupted and
+  reported as a timeout. The tool description says exactly that today, and it
+  must be rewritten the moment promotion lands: it is the only place the model
+  learns the wall, and a description promising a handoff the code cannot perform
+  is precisely the failure §2.1 documents mini started with.
+
+  Two decisions fell out of wiring `timeout_s` and are worth keeping. The
+  per-call budget travels **on the context**, because `Environment.Execute` has
+  no timeout argument and a container environment should not have to imitate one
+  it cannot implement; a caller deadline now beats `Local.Timeout` in both
+  directions, so a model can ask for an hour or for one second. And an expired
+  deadline is an **observation, not an interruption** — Execute's
+  `ctx.Err() != nil` branch used to swallow it, which would have reported a
+  model-set timeout as a Ctrl-C that never happened and discarded the partial
+  output that makes a timed-out build worth reading about.
 
 Nothing starts a job yet, which is the point of building the registry first:
 the guarantees that are easy to get wrong — ownership after a crash, reaping,
