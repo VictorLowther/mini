@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -234,49 +235,105 @@ func (l *Loop) runForeground(ctx context.Context, action model.Action, sink io.W
 	return l.Env.Execute(cctx, action.Command, "", sink)
 }
 
-// startJob hands the command to the job registry and writes the handoff into the
-// tool call's own result file.
+// runCommand executes one action, deciding what happens when it outruns its
+// budget: the command becomes a job rather than a corpse.
 //
-// Two files, deliberately: the call's file keeps the harness's note and is
-// finished here like any other observation, while the job appends to its own
-// for as long as it lives. Rewriting the call's file when the job ended would
-// break the append-at-EOF rule that keeps every stored tcr_offset true, and a
-// model reading the transcript later sees the handoff exactly as it was told it.
-func (l *Loop) startJob(action model.Action, tc model.ToolCall, sink io.Writer) (env.Result, error) {
+// Both cases go through the job manager, and that is the load-bearing part.
+// Waiting and running have to be separate things before the deadline arrives,
+// because env's handler kills the process group when its context expires - so a
+// design that ran the command normally and "promoted" it afterwards would be
+// promoting something it had already killed. With the manager holding the run,
+// expiring the wait means stopping the wait and keeping the run.
+//
+// detached reports that the caller handed off, which means the result file is
+// still open for writing and the observation is the handoff note, not a tail.
+func (l *Loop) runCommand(ctx context.Context, action model.Action, tc model.ToolCall, sink io.Writer) (res env.Result, detached bool, err error) {
 	if l.Jobs == nil {
-		return env.Result{
-			ReturnCode:    -1,
-			ExceptionInfo: "this run has no job registry: run the command without background, or restart mini with sessions enabled",
-			Extra:         map[string]any{"exception_type": "JobsUnavailable"},
-		}, nil
+		if action.Background {
+			// Refuse rather than obey the letter of the request and break its
+			// intent: running a 30-second command in the foreground after being
+			// told not to wait for it is worse than an error, because the model
+			// would have no way to tell the two apart.
+			return refusedObservation(errors.New(
+				"this run has no job registry: run the command without background, or restart mini with sessions enabled")), false, nil
+		}
+		// No registry, so nothing can be promoted: the environment's own
+		// deadline is the only bound, and it still ends the command.
+		r, err := l.runForeground(ctx, action, sink)
+		return r, false, err
 	}
-	r, err := l.Jobs.Start(job.Spec{Command: action.Command, TCNO: tc.Number})
+	run, err := l.Jobs.Launch(job.Spec{
+		Command: action.Command, TCNO: tc.Number, File: tc.File, Path: tc.Path,
+	})
 	if err != nil {
-		// A refusal is an observation, not a crash: the cap error names the
-		// remedy, and the model can act on it in the next turn.
-		return env.Result{
-			ReturnCode:    -1,
-			ExceptionInfo: err.Error(),
-			Extra:         map[string]any{"exception_type": "JobRefused"},
-		}, nil
+		return refusedObservation(err), false, nil
 	}
-	path := r.OutputPath()
-	res := env.Result{ReturnCode: 0, Extra: map[string]any{
-		"job_id":          r.ID(),
-		"job_output_path": path,
-	}}
-	if sink == nil {
-		return res, nil
+
+	if action.Background {
+		return l.handoff(run, action, "started in the background")
 	}
-	// The handoff is the only place the model learns where the bytes are going,
-	// so it states the path twice: once as a fact, once inside a command it can
-	// copy. The window in the recipe is the one the prompt already teaches, so a
-	// first read of a job log cannot waste a turn re-truncating.
-	fmt.Fprintf(sink, "started in the background as job %s; the command is running in its own process group.\n", r.ID())
-	fmt.Fprintf(sink, "output is appended to %s\n", path)
-	fmt.Fprintf(sink, "read it with: tail -n %d %s   (or grep -n PATTERN %s; prefer narrowing to cat)\n", model.MaxViewLines, path, path)
-	fmt.Fprintf(sink, "the job keeps running when this turn ends, and is killed when the session closes.\n")
-	return res, nil
+
+	budget := env.DefaultTimeout
+	if action.TimeoutS > 0 {
+		budget = time.Duration(action.TimeoutS) * time.Second
+	}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-run.Done():
+		return run.Result(), false, nil
+	case <-ctx.Done():
+		// A user interruption ends the run too: the command was asked for by a
+		// turn that the human just cancelled, and leaving it burning would be
+		// the abandoned-job failure this design exists to prevent. Promotion is
+		// for a budget running out, not for a person running out of patience.
+		_ = run.Kill()
+		return env.Result{}, false, ctx.Err()
+	case <-timer.C:
+		return l.handoff(run, action, fmt.Sprintf(
+			"still running after %s", budget.Truncate(time.Second)))
+	}
+}
+
+// handoff detaches a run and composes what the model reads instead of output:
+// the job id, the path its bytes are accumulating at, and a recipe that fits the
+// observation window - so the first read of a job log cannot waste a turn on a
+// re-truncation.
+func (l *Loop) handoff(run *job.Run, action model.Action, why string) (env.Result, bool, error) {
+	if _, err := l.Jobs.Detach(run, why); err != nil {
+		// The cap refused a run that is already burning: ending it is the only
+		// answer that does not leave a job the model cannot see or list.
+		_ = run.Kill()
+		return refusedObservation(err), false, nil
+	}
+	path := run.OutputPath()
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s as job %s and is still running in its own process group.\n", why, run.ID())
+	fmt.Fprintf(&b, "output is appended to %s\n", path)
+	fmt.Fprintf(&b, "read it with: tail -n %d %s   (or grep -n PATTERN %s; prefer narrowing to cat)\n",
+		model.MaxViewLines, path, path)
+	fmt.Fprintf(&b, "the job keeps running when this turn ends, and is killed when the session closes.\n")
+	if action.Background {
+		b.WriteString("do not wait on it: continue, and it will be here when you look.")
+	} else {
+		b.WriteString("This is not a timeout - nothing was killed and the command does not need re-running.")
+	}
+	// No OutputPath or OutputBytes on the result: the observation template only
+	// offers a spill pointer when the call's file was measured, and a file that
+	// is still growing has no final size to name.
+	return env.Result{ReturnCode: 0, View: b.String(),
+		Extra: map[string]any{"job_id": run.ID(), "job_output_path": path}}, true, nil
+}
+
+// refusedObservation is a job the registry would not start. It comes back as an
+// observation rather than an error because the cap refusal names the remedy, and
+// a model that receives it as a crash learns nothing it can act on.
+func refusedObservation(err error) env.Result {
+	return env.Result{
+		ReturnCode:    -1,
+		ExceptionInfo: err.Error(),
+		Extra:         map[string]any{"exception_type": "JobRefused"},
+	}
 }
 
 // QueueMessage appends a user message to the history before the next model
@@ -769,18 +826,17 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		if tc.File != nil {
 			sink = tc.File
 		}
-		var res env.Result
-		var err error
-		if action.Background {
-			res, err = l.startJob(action, tc, sink)
-		} else {
-			res, err = l.runForeground(ctx, action, sink)
-		}
+		res, detached, err := l.runCommand(ctx, action, tc, sink)
 		// Stop the shell's writes and measure the file once, before any
 		// branch returns: this is the only place tail arithmetic happens.
 		// Closing first keeps the fd from leaking on the cancellation path;
 		// res is returned by value, so these fields survive an early return.
-		if tc.File != nil {
+		//
+		// A detached run skips all of it. The job is still appending to that
+		// file, so the loop must not close it, and the observation is the
+		// handoff rather than a tail of a log that has no end yet - the model
+		// is told the path and how to read it, and reads it when it wants.
+		if tc.File != nil && !detached {
 			_ = tc.File.Sync()
 			_ = tc.File.Close()
 			res.OutputPath = tc.Path
@@ -803,7 +859,11 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 			l.addMessages(l.Model.FormatObservations(msg, results, l.TemplateVars())...)
 			return l.interrupted(err)
 		}
-		if l.Recorder != nil {
+		// A detached run leaves its call row 'started', which is the truth: the
+		// call did not complete, it handed off. The job's own row carries the
+		// outcome, and closing the call row with a return code the command has
+		// not produced yet would put a number in the ledger that nobody measured.
+		if l.Recorder != nil && !detached {
 			if err := l.Recorder.CompleteToolCall(tc, model.ToolOutcome{
 				Bytes:      res.OutputBytes,
 				ViewOffset: res.ViewOffset,

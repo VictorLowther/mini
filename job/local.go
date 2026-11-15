@@ -38,6 +38,12 @@ type Spec struct {
 	// ParentID links this run to the job that spawned it, for trees and for
 	// reaping a parent's children.
 	ParentID string
+	// File and Path redirect the run's output into a writer the caller owns -
+	// a foreground call's result file, which a promoted run must keep writing
+	// to after the tool call has been answered. The watcher closes it, so a
+	// caller that hands one over must not close it itself.
+	File *os.File
+	Path string
 }
 
 // ErrStillRunning is what a kill reports when the cancel landed but the run has
@@ -66,6 +72,33 @@ var ErrStillRunning = errors.New("job: run has not exited after the kill")
 // its own process-group leader, so cancelling reaches the whole subtree that
 // actually holds the GPU without mini having to track a shell pid that owns it.
 func (m *Manager) Start(s Spec) (*Run, error) {
+	r, err := m.Launch(s)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := m.Detach(r, "started in the background"); err != nil {
+		// The cap is the only reason this fails, and the run has not been
+		// launched yet when it does - Launch has already returned by then, so
+		// end what we started rather than leave an uncapped job running.
+		_ = r.Kill()
+		return nil, err
+	}
+	return r, nil
+}
+
+// Launch begins a run without registering it as a job. This is the foreground
+// path: a command that finishes inside its budget was never a job, and the
+// registry should not have to forget ten thousand rows a day that only ever
+// said "ls". The run lives in the live set while it burns, so it can be waited
+// on and cancelled, and Detach turns it into a job if it outlives the waiting.
+//
+// The reason a run must be launched this way rather than started by the caller
+// and "promoted" afterwards is that the deadline is what kills it: once
+// env.Local has signalled the process group there is nothing left to hand over.
+// Promotion only works if the wait and the run are separate things from the
+// start, which is also crush's shape (bash.go:386-451 starts under a detached
+// context so it can survive being moved to background).
+func (m *Manager) Launch(s Spec) (*Run, error) {
 	if s.Command == "" {
 		return nil, errors.New("job: a command is required")
 	}
@@ -74,53 +107,85 @@ func (m *Manager) Start(s Spec) (*Run, error) {
 		return nil, fmt.Errorf("job: id %q is not path-safe", id)
 	}
 
-	// Adopt the handle before anything is written: the cap and the duplicate
-	// check are the two refusals that cost nothing when they fire first, and a
-	// refusal must not leave a row describing a run that never existed.
+	// Adopt the handle before anything is written: the duplicate check costs
+	// nothing when it fires first, and a refusal must not leave a file or a row
+	// describing a run that never existed.
 	r := &Run{id: id, kind: session.KindBash, output: m.Session.JobPath(id),
 		dir: m.dir(s.Dir), started: time.Now().UnixMilli(), mgr: m, done: make(chan struct{})}
+	if s.Path != "" {
+		r.output = s.Path
+	}
 	if err := m.register(r); err != nil {
 		return nil, err
 	}
 
-	// Append, never truncate: docs/jobs-research.md §4's one invariant is that a
-	// file a transcript row points at is only ever written at EOF, so every
-	// stored tcr_offset keeps describing the bytes it was computed against.
-	if err := os.MkdirAll(filepath.Dir(r.output), 0o700); err != nil {
-		return nil, r.abandon(fmt.Errorf("job: create result directory: %w", err))
+	file := s.File
+	if file == nil {
+		// Append, never truncate: docs/jobs-research.md §4's one invariant is
+		// that a file a transcript row points at is only ever written at EOF,
+		// so every stored tcr_offset keeps describing the bytes it was computed
+		// against.
+		if err := os.MkdirAll(filepath.Dir(r.output), 0o700); err != nil {
+			return nil, r.abandon(fmt.Errorf("job: create result directory: %w", err))
+		}
+		f, err := os.OpenFile(r.output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return nil, r.abandon(fmt.Errorf("job: open %s: %w", r.output, err))
+		}
+		file = f
 	}
-	file, err := os.OpenFile(r.output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, r.abandon(fmt.Errorf("job: open %s: %w", r.output, err))
-	}
-
-	row, err := m.Session.CreateJob(session.JobRow{
-		ID: id, Kind: session.KindBash, ParentID: s.ParentID, TCNO: intPtr(s.TCNO),
-		Label: s.Label, Command: s.Command, Description: s.Description,
-		OutputPath: r.output, StartedAt: r.started,
-	})
-	if err != nil {
-		file.Close()
-		return nil, r.abandon(err)
-	}
-	// The row is authoritative from here: its timestamps are what the listing
-	// and the elapsed arithmetic report, not the ones guessed above.
-	r.output, r.started = row.OutputPath, row.StartedAt
-
-	ctx, cancel := context.WithCancel(m.background())
-	run := &interpRun{run: r, cancel: cancel}
-	r.stop = run
 
 	// Malformed pairs are dropped rather than guessed at: a job that starts with
 	// nine of its ten variables is worth more than a job that refuses to start.
+	r.file, r.spec = file, s
 	envs := make(map[string]string, len(s.Env))
 	for _, kv := range s.Env {
 		if k, v, ok := strings.Cut(kv, "="); ok {
 			envs[k] = v
 		}
 	}
+	ctx, cancel := context.WithCancel(m.background())
+	run := &interpRun{run: r, cancel: cancel}
+	r.stop = run
 	go run.watch(ctx, file, s, envs)
 	return r, nil
+}
+
+// Detach registers a running launch as a job: from here it has a row, counts
+// against the session's cap, survives the turn, and can be listed and killed by
+// id. Doing this lazily is what keeps the registry about jobs - a command that
+// finished in 40ms was never one - and it is why a promoted run's row stores the
+// path it has been writing to all along instead of inventing a second file the
+// model would have to be told about.
+func (m *Manager) Detach(r *Run, reason string) (*session.JobRow, error) {
+	if max := m.maxJobs(); max > 0 {
+		if n, err := m.Session.CountRunningJobs(); err == nil && n >= max {
+			return nil, fmt.Errorf("%w: %d live, stop one with job_kill first", ErrCap, n)
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.detached {
+		// Already a job: a second handoff must not invent a second row, and the
+		// caller's answer is the row that exists.
+		return m.Session.GetJob(r.id)
+	}
+	row, err := m.Session.CreateJob(session.JobRow{
+		ID: r.id, Kind: r.kind, ParentID: r.spec.ParentID, TCNO: intPtr(r.spec.TCNO),
+		Label: r.spec.Label, Command: r.spec.Command, Description: r.spec.Description,
+		OutputPath: r.output, StartedAt: r.started,
+	})
+	if err != nil {
+		return nil, err
+	}
+	r.detached, r.reason = true, reason
+	// The run may already have ended while this call was in flight, which is
+	// the race r.mu exists to close: settle the row in the same critical
+	// section that marks it a job.
+	if r.end != nil {
+		m.recordEndLocked(r, *r.end)
+	}
+	return row, nil
 }
 
 // interpRun is the bash kind's hold on a run. It is the only thing in the
@@ -178,42 +243,72 @@ func (i *interpRun) watch(ctx context.Context, file *os.File, s Spec, envs map[s
 	// sees.
 
 	res, err := local.Execute(ctx, s.Command, r.dir, file)
+	oc := classify(res, err)
 
-	var code *int
-	state, reason := session.JobCompleted, ""
-	switch {
-	case err != nil:
-		// Execute returns a Go error for exactly one thing: the caller's
-		// context ended. That is our cancel, so this is a kill, and the partial
-		// output is already in the file. No exit code is claimed, because
-		// reporting 0 for a run we interrupted would say it succeeded.
-		state, reason = session.JobKilled, "killed on request: "+err.Error()
-	case exceptionType(res) == "TimeoutExpired":
-		// Unreachable for a job of its own, which has no deadline: it means a
-		// promotion handed a foreground timer to a run that outlived it.
-		state, reason = session.JobFailed, "timed out after the deadline it was given"
-	case exceptionType(res) != "":
-		// A parse error, a panic in the runner, or an exec failure: the command
-		// never ran to completion, and ExceptionInfo says why in prose the model
-		// can act on.
-		state, reason = session.JobFailed, res.ExceptionInfo
-	default:
-		c := res.ReturnCode
-		code = &c
-		if c != 0 {
-			state, reason = session.JobFailed, fmt.Sprintf("exited %d", c)
-		}
+	// The row and the outcome have to agree, and either can arrive first: the
+	// watcher only writes when the run is detached, and Detach writes when the
+	// run has already ended. mu covers both, so a command that finishes in the
+	// same instant its budget expires cannot leave a row claiming it is running.
+	r.mu.Lock()
+	r.result, r.end = res, &oc
+	detached := r.detached
+	var row *session.JobRow
+	if detached {
+		row = m.recordEndLocked(r, oc)
 	}
+	r.mu.Unlock()
+	if detached {
+		logEnd(m, row, r.id, oc)
+	}
+}
 
-	row, ferr := m.Session.FinishJob(r.id, state, code, reason)
-	if ferr != nil && !errors.Is(ferr, session.ErrUnknownJob) {
-		m.logger().Error("job: could not record outcome", "id", r.id, "err", ferr)
-		return
+// classify turns what the interpreter reported into a state, and is the only
+// place that decision lives. It takes the error separately because
+// env.Local.Execute reserves the Go error for one thing - the caller's context
+// ending - which is precisely the shape of a kill.
+func classify(res env.Result, err error) outcome {
+	if err != nil {
+		// No exit code is claimed: reporting 0 for a run we interrupted would
+		// say it succeeded, and -1 is already the timeout shape.
+		return outcome{state: session.JobKilled, reason: "killed on request: " + err.Error()}
 	}
+	switch exceptionType(res) {
+	case "TimeoutExpired":
+		// Unreachable for a run of its own, which has no deadline: it means a
+		// promotion handed a foreground timer to something that outlived it.
+		return outcome{state: session.JobFailed, reason: "timed out after the deadline it was given"}
+	case "ParserError", "Panic":
+		// A parse error or a panic in the runner: the command never ran to
+		// completion, and ExceptionInfo says why in prose the model can act on.
+		return outcome{state: session.JobFailed, reason: res.ExceptionInfo}
+	}
+	code := res.ReturnCode
+	if code != 0 {
+		return outcome{state: session.JobFailed, code: &code,
+			reason: fmt.Sprintf("exited %d", code)}
+	}
+	return outcome{state: session.JobCompleted, code: &code}
+}
+
+// recordEndLocked writes the terminal state. The caller holds r.mu; the store
+// serialises its own writes, so holding a mutex across one costs nothing and
+// keeps the two racing writers ordered.
+func (m *Manager) recordEndLocked(r *Run, oc outcome) *session.JobRow {
+	row, err := m.Session.FinishJob(r.id, oc.state, oc.code, oc.reason)
+	if err != nil && !errors.Is(err, session.ErrUnknownJob) {
+		m.logger().Error("job: could not record outcome", "id", r.id, "err", err)
+		return nil
+	}
+	return row
+}
+
+func logEnd(m *Manager, row *session.JobRow, id string, oc outcome) {
 	if row != nil {
 		m.logger().Info("job finished", "id", row.ID, "state", row.State,
 			"elapsed_ms", elapsedSince(row).Milliseconds())
+		return
 	}
+	m.logger().Info("job finished", "id", id, "state", oc.state)
 }
 
 // exceptionType reads the mirror of Python's subprocess exception that

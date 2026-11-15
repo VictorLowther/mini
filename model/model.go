@@ -108,11 +108,12 @@ var BASH_TOOL = map[string]any{
 	"function": map[string]any{
 		"name": "bash",
 		"description": "Execute a bash command. Output is merged stdout+stderr. " +
-			"A command that is still running after 30 seconds is interrupted and " +
-			"comes back as a timeout observation, so for anything longer ask for " +
-			"the time it needs with timeout_s, or set background: true to get a " +
-			"job id and an output path back immediately and keep working. A job " +
-			"outlives a turn, never a session.",
+			"A command still running after 30 seconds is moved to the " +
+			"background: nothing is killed, it keeps running, and you get its " +
+			"job id and output path instead of a result - so a long command " +
+			"costs a turn, not a re-run. Set background: true to skip the wait " +
+			"when you already know, and timeout_s to wait longer on purpose. A " +
+			"job outlives a turn, never a session.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -122,7 +123,7 @@ var BASH_TOOL = map[string]any{
 				},
 				"timeout_s": map[string]any{
 					"type":        "integer",
-					"description": "Seconds to wait for this command before giving up on it. Optional and uncapped: set it to what the command actually needs, such as a build or a training run. 0 or omitted means the default of 30 seconds. On expiry the command is interrupted and its output so far comes back as a timeout observation, so ask for more time rather than re-running something that was half done.",
+					"description": "Seconds to wait for this command before it is moved to the background. Optional and uncapped: set it to what the command actually needs, such as a build or a training run. 0 or omitted means the default of 30 seconds. The deadline ends the wait and never the command, so nothing is killed at it and a half-finished run must not be re-started - ask for the time instead, or background it on purpose.",
 				},
 				"background": map[string]any{
 					"type":        "boolean",

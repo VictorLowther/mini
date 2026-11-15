@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -134,6 +135,28 @@ type Run struct {
 	started int64
 	mgr     *Manager
 
+	// file is where the run's merged output goes, and the watcher closes it
+	// when the command ends - including a file a foreground call handed over,
+	// which is why the loop must not close one that got promoted.
+	file *os.File
+	// spec is kept so Detach can fill the row honestly, long after the caller
+	// that launched the run has thrown its copy away.
+	spec Spec
+
+	// mu guards the three fields below, all of which change while a waiter is
+	// looking: the run detaches when the foreground budget expires, ends when
+	// the watcher returns, and records its Result in between.
+	mu       sync.Mutex
+	detached bool
+	reason   string
+	result   env.Result
+	// end is the outcome once the watcher has classified one, and is nil while
+	// the run is burning. It exists so Detach and the watcher cannot lose a
+	// race: a command finishing at the instant its budget expires is exactly the
+	// moment a row could be created already-finished and then never updated,
+	// leaving a job listed as running forever. Both paths settle it under mu.
+	end *outcome
+
 	// done closes when the run reaches a terminal state. It is closed exactly
 	// once, by the watcher that finished the row, so Wait and any future
 	// monitor engine can both hang off it without racing for the state.
@@ -161,6 +184,42 @@ func (r *Run) Kind() string          { return r.kind }
 func (r *Run) OutputPath() string    { return r.output }
 func (r *Run) StartedAt() int64      { return r.started }
 func (r *Run) Done() <-chan struct{} { return r.done }
+
+// outcome is what a run became, decided by the kind that ran it and written to
+// the registry only if the run turned out to be a job.
+type outcome struct {
+	state  string
+	code   *int
+	reason string
+}
+
+// Detached reports whether this run is a job: registered in the registry,
+// counted against the cap, and expected to outlive the turn that started it.
+func (r *Run) Detached() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.detached
+}
+
+// Reason is why the run became a job - "started in the background" or the
+// auto-background handoff - which is the difference between a model choosing
+// this and a command outrunning its budget. Worth keeping because a job the
+// model cannot explain to itself is a job it will kill by accident.
+func (r *Run) Reason() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reason
+}
+
+// Result is the env.Result of a finished run, valid once Done has closed. A
+// run still burning returns the zero Result, which is honest: there is no
+// return code for a command that has not exited, and inventing one is how a
+// training run gets reported as succeeding.
+func (r *Run) Result() env.Result {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.result
+}
 
 // Row reads the authoritative record.
 func (r *Run) Row() (*session.JobRow, error) { return r.mgr.Session.GetJob(r.id) }

@@ -933,10 +933,11 @@ its cost.
    `running ⇒ orphaned` sweep at open, and reap-on-quit. Foundation everything
    else reads, and safe to ship half-finished precisely because the sweep and
    the reap are live before any job can be started.
-2. **Promotion.** ⏳ *half built* — `bash` has `background` and optional
-   unbounded `timeout_s`, and `MAX_JOBS` is enforced in the manager. Still owed:
-   the 30 s auto-background with fast-failure grace and the tool-description
-   rewrite that follows from it; `jobs` **with
+2. **Promotion.** ✅ *built except the tools* — `bash` has `background` and
+   optional unbounded `timeout_s`; the 30 s auto-background promotes rather than
+   kills, and the tool description says so. The fast-failure grace needs no code
+   here: a command that dies before the budget is simply `<-run.Done()` winning
+   the select. `MAX_JOBS` is enforced at `Detach`. Still owed: `jobs` **with
    `output_path`, log size and total line count**; `job_kill`. After this step a job is
    spawnable, listable, readable, and killable, the feature already pays for
    itself, and it changes nothing for a model that never hits the wall. There is
@@ -973,14 +974,38 @@ Step 1 is in the tree:
 - `cmd/mini` — one manager per run over the session's own `env.Local`, the
   sweep with the warnings surfaced, and the reap folded into the cleanup path
   both front ends already share.
-- Step 2, **partly**: `bash` takes `timeout_s` (uncapped, parsed permissively)
-  and `background: true`, and the loop starts the job and answers with a handoff
-  naming the job id, its output path, and a `tail -n 100` recipe. What is *not*
-  built is the 30-second auto-background, so an overrun is still interrupted and
-  reported as a timeout. The tool description says exactly that today, and it
-  must be rewritten the moment promotion lands: it is the only place the model
-  learns the wall, and a description promising a handoff the code cannot perform
-  is precisely the failure §2.1 documents mini started with.
+- Step 2, **minus the two tools**: `bash` has `timeout_s` (uncapped, parsed
+  permissively) and `background: true`, the 30 s auto-background is live, and the
+  handoff names the job id, its path, and a `tail -n 100` recipe. Still owed:
+  `jobs` and `job_kill`, which need the parser to dispatch a second tool name and
+  the confirm gate to cover it.
+
+  Three things the wiring settled that the spec left open:
+
+  - **Promotion requires the run to outlive the wait from the start.** Every
+    foreground command now launches through the job manager and is *waited on*
+    with a budget; when the budget expires the wait ends and the run does not.
+    A design that ran the command normally and promoted it afterwards would be
+    promoting a process `env` had already signalled, which is the mistake the
+    shape of `env/exec_unix.go` makes unforgivable.
+  - **Open question 1 is answered: the call row stays `started`.** The call did
+    not complete, it handed off, and the store already models an unfinished call
+    (that is the cancellation case). Closing the row with a return code nobody
+    measured would put a number in the ledger that the job later contradicts.
+  - **A promoted run keeps the call's file**, because the row stores the path it
+    has been writing to rather than a new one. So the transcript's `tcr_path` for
+    a long command *is* the live job log, `append-at-EOF` keeps every stored
+    offset valid, and the model is never told about a second path. Rows are
+    created lazily by `Detach`, which is also what keeps the registry about jobs
+    instead of a row per `ls` and the cap honest.
+
+  Known gap: *why* a run became a job (backgrounded vs outran its budget) lives
+  in the live handle and the log, not the row. The `jobs` listing will read it
+  from the handle; persisting it means a new column, and the schema has no
+  version tracking yet (`session/store.go:26-29` defers `PRAGMA user_version` to
+  the first breaking change). Adding a column to a table already shipped to a
+  live database is exactly that first breaking change, so the decision is
+  recorded rather than taken quietly.
 
   Two decisions fell out of wiring `timeout_s` and are worth keeping. The
   per-call budget travels **on the context**, because `Environment.Execute` has
