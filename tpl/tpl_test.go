@@ -103,6 +103,12 @@ func TestShippedTemplatesRender(t *testing.T) {
 		"actions":        []any{},
 		"has_tool_calls": false,
 		"finish_reason":  "stop",
+		// The observation window. The shipped prompts quote these numbers, so
+		// they must resolve here; agent.TemplateVars supplies the real values
+		// from model.MaxViewLines/MaxViewChars, and tpl cannot import model
+		// (model imports tpl), hence the literals. agent's
+		// TestShippedPromptsStateTheWindow keeps them honest.
+		"view_lines": 100, "view_chars": 10000,
 	}
 	for _, spec := range []string{"mini"} {
 		m, err := config.FromSpec(spec)

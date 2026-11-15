@@ -55,6 +55,8 @@ agent:
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
     - Every command's complete output is saved to a file. When a result reports `output_path`, the text you were shown is only its last lines: read `output_path` with `sed -n`, `tail`, or `grep` before concluding anything about the omitted part.
+    - What you can see of any command is capped: the last {{ .view_lines }} lines, or the last {{ .view_chars }} characters, whichever comes first. Asking for more does not get you more - the result is truncated to the same window, so a read that overshot is a wasted turn. Read at most {{ .view_lines }} short lines at a time (`sed -n '1,{{ .view_lines }}p' <path>`, then `'{{ add .view_lines 1 }},{{ mul .view_lines 2 }}p'` for the next window), and prefer narrowing to paging: `grep`, `head`, `awk`, `sort | uniq -c`.
+    - When you are not sure how many lines a file has, `wc -l <path>` gives you the exact answer for one short line of output. Count first, then read only the window you need; `grep -c <pattern> <path>` counts matches instead of listing them.
 
     Example of a CORRECT response:
     <example_response>
@@ -140,7 +142,7 @@ model:
       "output_bytes": {{ .output.bytes }},
       "output_path": {{ .output.path | tojson }}
       {{- if .output.path }},
-      "warning": "Output truncated to its last lines. output_path holds the complete, untruncated output: read it with sed -n '1,200p' <path>, tail <path>, or grep <pattern> <path>."
+      "warning": "Output truncated to its last {{ .view_lines }} lines / {{ .view_chars }} characters; a bigger read comes back truncated to the same window. output_path holds the complete, untruncated output: wc -l <path> for the exact line count, sed -n '1,{{ .view_lines }}p' <path> for a window that fits, grep <pattern> <path> to narrow instead of paging."
       {{- end }}
       {{- if .output.output_error }}, "output_error": {{ .output.output_error | tojson }}{{ end }}
       {{- if .output.exception_info }}, "exception_info": {{ .output.exception_info | tojson }}{{ end }}

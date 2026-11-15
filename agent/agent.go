@@ -307,6 +307,14 @@ func (l *Loop) TemplateVars(kwargs ...map[string]any) map[string]any {
 			"model_cost":      l.Cost,
 			"elapsed_seconds": int(time.Since(l.start).Seconds()),
 			"total_tokens":    0,
+			// The observation window, handed to the prompts. Both the system
+			// prompt and the observation template state how much of a command's
+			// output the model can ever see, and a number written down twice is
+			// a number that drifts: the shipped example advertised reading 200
+			// lines through a 100-line window, which guarantees the re-read
+			// comes back truncated again. Interpolate the consts instead.
+			"view_lines": model.MaxViewLines,
+			"view_chars": model.MaxViewChars,
 		},
 		l.extraVars,
 	)
