@@ -308,6 +308,8 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 
 	if o.printMode {
 		p := ui.NewPrint(stdout, stdin, r.AgentCfg, r.Store)
+		p.Jobs = jobReader(r.Jobs)
+		p.Jobs = jobReader(r.Jobs)
 		p.Loop = r.Loop
 		h, err := ui.New(p, r.AgentCfg, r.Loop)
 		if err != nil {
@@ -339,6 +341,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		Cfg: r.AgentCfg, Loop: r.Loop, Model: r.Model,
 		ConfigName: r.ConfigName, LogWriter: logTarget, App: a,
 		Settings: r.Store,
+		Jobs:     jobReader(r.Jobs),
 	})
 	// A stalled window with no explanation is indistinguishable from a crash,
 	// so the retry schedule goes into the transcript.

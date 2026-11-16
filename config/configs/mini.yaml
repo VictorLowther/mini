@@ -134,7 +134,15 @@ environment:
     TQDM_DISABLE: '1'
 model:
   observation_template: |
-    {{- if .output.truncated -}}
+    {{- if .output.pending -}}
+    {
+      "status": "running",
+      "job_id": {{ .output.extra.job_id | tojson }},
+      "output": {{ .output.output | tojson }},
+      "output_path": {{ .output.extra.job_output_path | tojson }}
+      {{- if .output.exception_info }}, "exception_info": {{ .output.exception_info | tojson }}{{ end }}
+    }
+    {{- else if .output.truncated -}}
     {
       "returncode": {{ .output.returncode }},
       "output_tail": {{ .output.output | tojson }},

@@ -152,7 +152,8 @@ func TestGUIRestoresThinkingAndSize(t *testing.T) {
 		settingWindowHeight, "800",
 	)
 	g := NewGUI(GUIOptions{
-		Cfg: c, Loop: l, ConfigName: "mini", App: test.NewApp(), Settings: s,
+		Post: newTestQueue(t).add,
+		Cfg:  c, Loop: l, ConfigName: "mini", App: test.NewApp(), Settings: s,
 		Model: &model.Sushi{Model: "m", BaseURL: "http://127.0.0.1:1"},
 	})
 	if !g.showReasoning() {
@@ -181,7 +182,7 @@ func TestGUIRestoresThinkingAndSize(t *testing.T) {
 // TestGUINoStore: the GUI must still open with no database behind it.
 func TestGUINoStore(t *testing.T) {
 	c := newConfig("confirm")
-	g := NewGUI(GUIOptions{Cfg: c, ConfigName: "mini", App: test.NewApp()})
+	g := NewGUI(GUIOptions{Cfg: c, ConfigName: "mini", App: test.NewApp(), Post: newTestQueue(t).add})
 	if g.showReasoning() {
 		t.Error("a window with no store opens collapsed")
 	}
@@ -197,7 +198,7 @@ func TestSettingsWriteFailureIsOnlyALog(t *testing.T) {
 	s := newMemSettings()
 	s.writeErr = errors.New("database is locked")
 	c := newConfig("confirm")
-	g := NewGUI(GUIOptions{Cfg: c, ConfigName: "mini", App: test.NewApp(), Settings: s})
+	g := NewGUI(GUIOptions{Cfg: c, ConfigName: "mini", App: test.NewApp(), Settings: s, Post: newTestQueue(t).add})
 	if on := g.ToggleReasoning(); !on {
 		t.Error("a failed write must not lie about the in-memory state")
 	}

@@ -48,6 +48,9 @@ type block struct {
 	// feedback the harness authored (rejections, interruption records,
 	// format-error prompts, new-task wrappers).
 	subtype string
+	// job is the id this card is tracking for a call that handed off, and ""
+	// for every other block. The view refreshes cards that carry one.
+	job string
 }
 
 // messageBlock is the message→block mapping every frontend shares (GUI live,
@@ -56,7 +59,7 @@ type block struct {
 // and tool results render from the stored observation. The caller supplies
 // the header (it is per-frontend state), reads task for the note, and owns
 // the stream reset that committing an assistant turn performs.
-func messageBlock(m model.Message, header, task string, clearStream func()) (b block, show, taskNote bool) {
+func messageBlock(m model.Message, header, task string, clearStream func(), jobs JobReader) (b block, show, taskNote bool) {
 	role, _ := m["role"].(string)
 	content, _ := m["content"].(string)
 	if _, built := m["extra"]; !built {
@@ -82,7 +85,14 @@ func messageBlock(m model.Message, header, task string, clearStream func()) (b b
 			b.subtype, _ = extra["interrupt_type"].(string)
 		}
 		if obs, ok := observationOf(m); ok {
-			b.transcript = obs.lines()
+			if obs.Pending && obs.JobID != "" {
+				// A call that handed off is not finished, so the card tracks
+				// the job instead of printing an exit status it never got.
+				b.job = obs.JobID
+				b.transcript = pendingCardLines(obs, jobs)
+			} else {
+				b.transcript = obs.lines()
+			}
 		}
 	case "exit":
 		extra, _ := m["extra"].(map[string]any)

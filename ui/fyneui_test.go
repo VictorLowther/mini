@@ -31,6 +31,10 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
+		// The deferred work a test is waiting for arrives through the queue, so
+		// polling without draining it would only ever see the state as of the
+		// last synchronization point.
+		drainPosts()
 		if cond() {
 			return
 		}
@@ -106,21 +110,100 @@ type guiPane struct {
 	*GUI
 	v  *guiView
 	mu *sync.Mutex
+	q  *postQueue
+}
+
+// postQueue is the harness's stand-in for the toolkit event loop.
+//
+// Fyne's real driver marshals fyne.Do onto the one thread that owns the canvas;
+// the software test driver documents the same rule and then runs the closure
+// wherever it was called from (test/driver.go:53-56). So a `post` that simply
+// invokes fn hands the view's state to whatever goroutine posted it - and every
+// deferred pass in the view is scheduled by time.AfterFunc, whose callbacks run
+// on the Go timer goroutine. That is the whole race: not a production bug, but a
+// test double that kept the ordering guarantee and silently dropped the thread
+// affinity the code depends on. All 166 reports in this package had a timer
+// goroutine on one side and the test goroutine on the other.
+//
+// So posts are queued rather than executed, and the test goroutine - the one the
+// driver says owns the canvas - drains the queue at every synchronization point.
+type postQueue struct {
+	mu    sync.Mutex
+	items []func()
+}
+
+func (q *postQueue) add(fn func()) {
+	q.mu.Lock()
+	q.items = append(q.items, fn)
+	q.mu.Unlock()
+}
+
+// drain runs everything queued, in order, on the calling goroutine - including
+// anything a queued closure posts itself, which is why this loops rather than
+// popping a snapshot.
+func (q *postQueue) drain() {
+	for {
+		q.mu.Lock()
+		if len(q.items) == 0 {
+			q.mu.Unlock()
+			return
+		}
+		fn := q.items[0]
+		q.items = q.items[1:]
+		q.mu.Unlock()
+		fn()
+	}
+}
+
+// activeQueue is the pane under test. One GUI per test, and this package runs no
+// test in parallel, so the queue a timer posts into is never ambiguous.
+var activeQueue *postQueue
+
+func drainPosts() {
+	if q := activeQueue; q != nil {
+		q.drain()
+	}
 }
 
 func (p *guiPane) do(fn func()) {
+	// Anything already deferred happened before this call, so it runs first;
+	// anything this call posts runs before it returns, so a test can assert on
+	// the result immediately, as it always could.
+	drainPosts()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	fn()
+	p.mu.Unlock()
+	drainPosts()
+}
+
+// attachPane wraps a GUI in the test pane. Any GUI built directly by a test
+// needs one, and it must share the queue that was injected at construction -
+// assigning g.post afterwards is the race the Post option exists to remove.
+func attachPane(g *GUI, q *postQueue) *guiPane {
+	return &guiPane{GUI: g, v: g.v, mu: new(sync.Mutex), q: q}
+}
+
+// newTestQueue returns the harness's stand-in event loop and makes it current
+// for the duration of the test, so a deferred pass lands on the goroutine that
+// owns the canvas instead of the timer that scheduled it.
+func newTestQueue(t *testing.T) *postQueue {
+	t.Helper()
+	q := &postQueue{}
+	previous := activeQueue
+	activeQueue = q
+	t.Cleanup(func() { activeQueue = previous })
+	return q
 }
 
 func newGUIForTest(t *testing.T, c *agent.Config, l *agent.Loop) *guiPane {
 	t.Helper()
+	q := newTestQueue(t)
 	g := NewGUI(GUIOptions{
 		Cfg: c, Loop: l,
 		Model:      &model.Sushi{Model: "test-model", BaseURL: "http://127.0.0.1:1"},
 		ConfigName: "mini",
 		App:        test.NewApp(),
+		Post:       q.add,
 	})
 	if l != nil {
 		h, err := New(g, c, l)
@@ -129,8 +212,7 @@ func newGUIForTest(t *testing.T, c *agent.Config, l *agent.Loop) *guiPane {
 		}
 		l.Hooks = h
 	}
-	p := &guiPane{GUI: g, v: g.v, mu: new(sync.Mutex)}
-	g.post = func(fn func()) { p.do(fn) }
+	p := attachPane(g, q)
 	g.v.paintGap = 0 // tests read the live area right after each chunk
 	return p
 }
@@ -1384,9 +1466,9 @@ func (p *guiPane) firstArea(label string) *area {
 // TestGUIShowErrorPresentsTheFailure: a setup failure still gets a window -
 // the only surface the user chose - instead of an unexplained exit.
 func TestGUIShowErrorPresentsTheFailure(t *testing.T) {
-	g := NewGUI(GUIOptions{App: test.NewApp()})
-	p := &guiPane{GUI: g, v: g.v, mu: new(sync.Mutex)}
-	g.post = func(fn func()) { p.do(fn) }
+	q := newTestQueue(t)
+	g := NewGUI(GUIOptions{App: test.NewApp(), Post: q.add})
+	p := attachPane(g, q)
 	if code := g.ShowError(errors.New("no model set. Pass -m NAME or run `mini config setup`.")); code != 1 {
 		t.Errorf("code = %d, want 1", code)
 	}

@@ -30,8 +30,15 @@ type Result struct {
 	Truncated   bool
 	// ViewError is set by the loop when the view could not be read from the
 	// file; the observation reports it instead of silently showing nothing.
-	ViewError     string
-	ReturnCode    int
+	ViewError  string
+	ReturnCode int
+	// Pending marks a command that handed off instead of finishing: a job is
+	// running and has no outcome yet, so there is no return code to report.
+	// Callers must not read the zero value of ReturnCode as success for a
+	// pending result, and the observation template omits the field entirely
+	// when it is set - which is what keeps a tool card from claiming "exit 0"
+	// for work that is still burning.
+	Pending       bool
 	ExceptionInfo string
 	Extra         map[string]any
 	// CWD is the directory the command actually ran in, resolved by Execute.
@@ -51,6 +58,7 @@ func (r Result) AsMap() map[string]any {
 		"path":           r.OutputPath,
 		"truncated":      r.Truncated,
 		"returncode":     r.ReturnCode,
+		"pending":        r.Pending,
 		"output_error":   r.ViewError,
 		"exception_info": r.ExceptionInfo,
 	}

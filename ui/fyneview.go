@@ -609,6 +609,69 @@ func (v *guiView) appendBlock(b block) {
 	v.afterContentChange()
 }
 
+// refreshJobCards re-renders every card that tracks a job and reports whether any
+// of them is still running. A card is rebuilt from the registry rather than from
+// stored state, so the view holds nothing that can go stale: the elapsed time,
+// the exit status and the tail of the log all come from the same two reads a
+// freshly-built card would do.
+func (v *guiView) refreshJobCards() (stillRunning bool) {
+	if v.gui == nil || v.gui.jobs == nil {
+		return false
+	}
+	changed := false
+	for i := range v.committed {
+		id := v.committed[i].job
+		if id == "" {
+			continue
+		}
+		card, found := v.gui.jobs.JobCard(id)
+		if card.ID == "" {
+			card.ID = id
+		}
+		lines := jobCardLines(card, found)
+		if !equalLines(lines, v.committed[i].transcript) {
+			v.committed[i].transcript = lines
+			v.blockH[i] = estimateBlockHeight(v.committed[i])
+			changed = true
+		}
+		if found && card.Running {
+			stillRunning = true
+		}
+	}
+	if changed {
+		v.refreshCommitted()
+	}
+	return stillRunning
+}
+
+// refreshCommitted re-materializes the visible rows after committed content
+// changed in place. It is rebuildAll without the detach of the streaming area and
+// without resetting heights that did not change: the live turn must survive a
+// card refresh in the middle of a run, because the job a card watches is usually
+// the reason the next turn is being written.
+func (v *guiView) refreshCommitted() {
+	for _, ref := range v.winRows {
+		v.body.Remove(ref.c)
+	}
+	v.winRows = nil
+	v.winFirst, v.winLast = -1, -1 // defeat setWindow's no-change shortcut
+	v.recomputeWindow()
+	v.layoutCenter()
+	v.repaint(v.scroll)
+}
+
+func equalLines(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // commitBlock places a finished block in the transcript, replacing the
 // in-flight turn's live area when it is the committed form of that same turn -
 // the live-block rule, so a turn is rendered once and already carries its

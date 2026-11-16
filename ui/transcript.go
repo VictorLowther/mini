@@ -26,6 +26,11 @@ type observation struct {
 	Elided    int    // lines that came before Output
 	Err       string // Path could not be read
 	Exception string
+	// JobID and Pending mark a call that handed off to the registry instead of
+	// completing. Pending is what keeps the card honest: there is no exit status
+	// yet, so HasExit stays false and nothing may print "exit 0".
+	JobID   string
+	Pending bool
 }
 
 func observationOf(m model.Message) (observation, bool) {
@@ -42,7 +47,11 @@ func observationOf(m model.Message) (observation, bool) {
 		Offset:    int64(asIntDefault(extra["tcr_offset"])),
 		End:       int64(asIntDefault(extra["tcr_bytes"])),
 	}
-	if code, ok := extra["returncode"]; ok {
+	o.JobID = str(extra["job_id"])
+	o.Pending, _ = extra["pending"].(bool)
+	// A pending observation carries no returncode in the model-facing text, so
+	// the card must not manufacture one from the zero value sitting in extra.
+	if code, ok := extra["returncode"]; ok && !o.Pending {
 		o.Exit, o.HasExit = asInt(code)
 	}
 	if o.Path != "" {

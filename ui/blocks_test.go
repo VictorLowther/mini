@@ -2,7 +2,7 @@ package ui
 
 import (
 	"strings"
-	"sync"
+
 	"testing"
 
 	"fyne.io/fyne/v2/test"
@@ -40,15 +40,15 @@ func TestSessionHeaderLineStatesTheWindow(t *testing.T) {
 func TestGUIHeaderCarriesTheResolvedWindow(t *testing.T) {
 	c := newConfig("confirm")
 	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
+	q := newTestQueue(t)
 	g := NewGUI(GUIOptions{
-		Cfg: c, Loop: l, ConfigName: "mini", App: test.NewApp(),
+		Cfg: c, Loop: l, ConfigName: "mini", App: test.NewApp(), Post: q.add,
 		Model: &model.Sushi{
 			Model: "test-model", BaseURL: "http://127.0.0.1:1",
 			ContextWindow: 1048576, ContextWindowSource: model.ContextFromServer,
 		},
 	})
-	p := &guiPane{GUI: g, v: g.v, mu: new(sync.Mutex)}
-	g.post = func(fn func()) { p.do(fn) }
+	p := attachPane(g, q)
 
 	p.do(func() { p.prepareTranscript() })
 	all := p.transcript()

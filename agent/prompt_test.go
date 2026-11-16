@@ -52,6 +52,30 @@ func TestShippedPromptsStateTheWindow(t *testing.T) {
 		}
 	}
 
+	// A handed-off call must be reported as a job that is running, with no
+	// returncode in the observation at all: 0 would read as success for work
+	// that has not finished, and that number is what a tool card would then
+	// print as "exit 0".
+	l.extraVars = map[string]any{"output": map[string]any{
+		"pending": true, "returncode": 0, "output": "started in the background as job j1",
+		"job_id": "j1", "job_output_path": "/tmp/job-j1.log",
+		"exception_info": "", "output_error": "",
+		"extra": map[string]any{"job_id": "j1", "job_output_path": "/tmp/job-j1.log"},
+	}}
+	pendSrc := config.String(m, "model.observation_template", "")
+	pending, perr := l.render("observation_template", pendSrc)
+	if perr != nil {
+		t.Fatalf("render pending observation: %v", perr)
+	}
+	for _, want := range []string{`"status": "running"`, `"job_id": "j1"`, "/tmp/job-j1.log", "started in the background"} {
+		if !strings.Contains(pending, want) {
+			t.Errorf("pending observation missing %q: %s", want, pending)
+		}
+	}
+	if strings.Contains(pending, "returncode") {
+		t.Errorf("a running job was given a return code: %s", pending)
+	}
+
 	obsSrc := config.String(m, "model.observation_template", "")
 	if obsSrc == "" {
 		t.Fatal("no observation_template in the shipped config")

@@ -20,7 +20,7 @@ func TestMessageBlockCompaction(t *testing.T) {
 			"compaction_model": "qwen-local",
 		},
 	}
-	b, show, taskNote := messageBlock(m, "hdr", "task", func() {})
+	b, show, taskNote := messageBlock(m, "hdr", "task", func() {}, nil)
 	if !show || taskNote {
 		t.Fatalf("show=%v taskNote=%v, want the row displayed", show, taskNote)
 	}

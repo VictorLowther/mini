@@ -205,7 +205,10 @@ func formatObservations(actions []Action, results []env.Result, obsTemplate stri
 			content = fmt.Sprintf("[observation_template failed to render: %v]\noutput_path: %s", err, result.OutputPath)
 		}
 		extra := map[string]any{
-			"returncode":     result.ReturnCode,
+			"returncode": result.ReturnCode,
+			// Pending travels with the observation so a front end can tell
+			// "exit 0" from "no exit yet" without parsing the rendered text.
+			"pending":        result.Pending,
 			"timestamp":      float64(time.Now().UnixMilli()) / 1000,
 			"exception_info": result.ExceptionInfo,
 			// Transcript metadata: the UI shows what ran and where without

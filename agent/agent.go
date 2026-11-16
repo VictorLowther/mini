@@ -639,8 +639,10 @@ func (l *Loop) handoff(run *job.Run, action model.Action, why string) (env.Resul
 	}
 	// No OutputPath or OutputBytes on the result: the observation template only
 	// offers a spill pointer when the call's file was measured, and a file that
-	// is still growing has no final size to name.
-	return env.Result{ReturnCode: 0, View: b.String(),
+	// is still growing has no final size to name. Pending, not returncode 0:
+	// the command has not finished, and a 0 here is what made a handed-off call
+	// look like a succeeded one in every front end that reads it.
+	return env.Result{Pending: true, View: b.String(),
 		Extra: map[string]any{"job_id": run.ID(), "job_output_path": path}}, true, nil
 }
 

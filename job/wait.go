@@ -111,6 +111,24 @@ func (m *Manager) PendingFirings() int {
 	return len(events)
 }
 
+// HasUndeliveredExit reports whether a job's own ending is still sitting in the
+// queue undelivered. The card uses it for "finished, not yet reported" - the
+// state a human needs to see in the gap between a job ending and the next turn
+// boundary - and it reads the same queue job_wait claims from, so the two
+// consumers agree on what "reported" means without talking to each other.
+func (m *Manager) HasUndeliveredExit(id string) bool {
+	events, err := m.Session.PendingJobEvents(32)
+	if err != nil {
+		return false
+	}
+	for _, e := range events {
+		if e.JobID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // StillRunning counts the jobs that are burning right now, which is what lets a
 // wait report "one finished, two still going" rather than leaving the model to
 // work out whether the set it asked about was bigger than the answer.

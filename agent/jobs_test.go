@@ -123,6 +123,21 @@ func TestBackgroundReturnsAHandoffInsteadOfWaiting(t *testing.T) {
 	if list[0].TCNO == nil || *list[0].TCNO != 1 {
 		t.Errorf("job did not record the call that started it: %+v", list[0])
 	}
+	// The observation says running and nothing else: a model that read
+	// "returncode: 0" here would believe its command had already finished, and
+	// the whole point of the handoff is that it has not.
+	if len(rec.seen) == 0 {
+		t.Fatal("no messages recorded")
+	}
+	pending := false
+	for _, msg := range rec.seen {
+		if e, ok := msg["extra"].(map[string]any); ok && e["job_id"] == "j1" {
+			pending, _ = e["pending"].(bool)
+		}
+	}
+	if !pending {
+		t.Error("the handed-off observation did not carry pending, so no front end can keep its card live")
+	}
 	// One file, not two. The job appends to the very result file the call
 	// already points at, so the transcript's tcr_path for the call IS the live
 	// job log and a promoted run needs no second path explained to the model.

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,18 @@ type GUIOptions struct {
 	// and the window's size - and is read once, at construction. nil is a
 	// valid value (a GUI with no store opens collapsed at the default size).
 	Settings Settings
+	// Jobs reads the registry for the cards of calls that handed off, so the
+	// window can keep them live until the job ends. nil leaves the cards
+	// truthful but static.
+	Jobs JobReader
+	// Post delivers a closure to the thread that owns the canvas. Production
+	// leaves it nil and gets fyne.Do; a test replaces it because the software
+	// driver runs fyne.Do on whichever goroutine called it (test/driver.go:53),
+	// while this package defers work from time.AfterFunc callbacks. It is
+	// installed here rather than assigned afterwards because building the window
+	// already schedules a deferred recompute, and that callback reads the field -
+	// which made the assignment itself a data race.
+	Post func(fn func())
 }
 
 // GUI is the Fyne desktop front end, the interactive face of mini. It is both
@@ -54,10 +67,16 @@ type GUI struct {
 	window    fyne.Window
 	logWriter *LogTarget
 	v         *guiView
+	// jobs backs the live cards for calls that handed off. See GUIOptions.Jobs.
+	jobs JobReader
 
-	// post delivers a closure to the toolkit goroutine. Production is
-	// fyne.Do; tests replace it with a serialized direct call so deliveries
-	// land in order.
+	// post delivers a closure to the thread that owns the canvas, and it is the
+	// only way anything here may reach the view: the deferred passes are
+	// scheduled from time.AfterFunc callbacks, which run on the Go timer
+	// goroutine, and from the run and status goroutines. Production is fyne.Do.
+	// Tests inject a queue drained by the test goroutine, because the software
+	// driver runs Do inline on the calling goroutine and would otherwise let a
+	// timer mutate view state beside the canvas pass that is measuring it.
 	post func(fn func())
 
 	mu       sync.Mutex
@@ -99,15 +118,20 @@ func NewGUI(o GUIOptions) *GUI {
 	if a == nil {
 		a = app.New()
 	}
+	post := o.Post
+	if post == nil {
+		post = fyne.Do
+	}
 	g := &GUI{
 		cfg:        cfg,
+		post:       post,
 		loop:       o.Loop,
 		configName: o.ConfigName,
 		logWriter:  o.LogWriter,
 		app:        a,
 		runDone:    make(chan struct{}),
-		post:       fyne.Do,
 		settings:   o.Settings,
+		jobs:       o.Jobs,
 		// The thinking toggle comes back from the store; with nothing stored
 		// the window opens collapsed, as it always did.
 		reasoningVisible: loadThinkingShown(o.Settings),
@@ -207,7 +231,14 @@ func (g *GUI) prepareTranscript() {
 	g.v.refreshStatus()
 }
 
-// tickStatus refreshes the footer while a command runs and the loop is quiet.
+// tickStatus refreshes the footer once a second while a command runs, and keeps
+// going after the turn ends for as long as the registry has anything running.
+//
+// The extension is the point: a call that handed off is not finished, and the
+// card that tracks it has to keep following the job through the idle window
+// between turns - which is where a training run spends nearly all of its life.
+// The lifetime stays the run's own (this goroutine is stopped by the same defer
+// that closes stopTicker), so the view never gains a timer outliving its window.
 func (g *GUI) tickStatus(stop <-chan struct{}) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -215,10 +246,23 @@ func (g *GUI) tickStatus(stop <-chan struct{}) {
 		select {
 		case <-stop:
 			return
-		case <-g.runDone:
-			return
 		case <-t.C:
-			g.post(func() { g.v.refreshStatus() })
+		}
+		g.post(func() {
+			g.v.refreshStatus()
+			if g.jobs != nil {
+				g.v.refreshJobCards()
+			}
+		})
+		select {
+		case <-g.runDone:
+			// The turn is over. Stop only once nothing is running: quitting the
+			// watch here would freeze every handed-off card at "still running"
+			// and never show the outcome the wait is for.
+			if g.liveJobs() == 0 {
+				return
+			}
+		default:
 		}
 	}
 }
@@ -345,7 +389,7 @@ func (g *GUI) blockFor(m model.Message) (block, bool, bool) {
 		g.mu.Lock()
 		g.stream = streamState{}
 		g.mu.Unlock()
-	})
+	}, g.jobs)
 }
 
 // Resume queues a stored transcript for replay, with a note naming where it
@@ -479,9 +523,37 @@ func (g *GUI) AssistantHeader() string {
 	return assistantHeader(snap.Calls, snap.Cost)
 }
 
-// RunStats renders the footer.
+// RunStats renders the footer, with the live job count appended. The count is
+// the cheapest possible answer to "is anything still running", and it is the one
+// piece of this feature that stays true even when the transcript is scrolled up
+// through history and the cards themselves are not being repainted.
 func (g *GUI) RunStats() string {
-	return runStatsText(g.snapshot(), g.cfg.Mode, g.showReasoning(), g.cfg.ContextWindow)
+	text := runStatsText(g.snapshot(), g.cfg.Mode, g.showReasoning(), g.cfg.ContextWindow)
+	if n := g.liveJobs(); n > 0 {
+		text += fmt.Sprintf(" \u00b7 %d %s", n, map[bool]string{true: "job", false: "jobs"}[n == 1])
+	}
+	return text
+}
+
+// liveJobs asks the registry how many runs are still burning. An unreadable or
+// unattached registry reports 0: a footer that silently dropped the count is a
+// worse outcome than one that never showed it, but never a count that lies the
+// other way, so a reader of the footer can trust "no jobs" only when a registry
+// is wired up - which is why this reports through the same reader the cards use.
+func (g *GUI) liveJobs() int {
+	lister, ok := g.jobs.(jobCounter)
+	if !ok {
+		return 0
+	}
+	n, _ := lister.LiveJobs()
+	return n
+}
+
+// jobCounter is the second half of what the footer needs. JobReader answers one
+// card; a count needs the whole set, and asking for it separately keeps the card
+// interface small.
+type jobCounter interface {
+	LiveJobs() (int, error)
 }
 
 func (g *GUI) snapshot() agent.Snapshot {

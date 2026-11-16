@@ -23,6 +23,11 @@ type Print struct {
 	Cfg *agent.Config
 	// Loop supplies the step/cost figures for the message headers.
 	Loop *agent.Loop
+	// Jobs reads the registry so a card for a handed-off call can report the
+	// job's state instead of an exit status the command never produced. nil is
+	// a front end with no registry: the card then says what the observation
+	// knows and nothing more.
+	Jobs JobReader
 	// settings is where /t writes the thinking toggle so the next launch -
 	// this one or the window's - starts where the user left it. nil (tests,
 	// no store) keeps the toggle for the session only.
@@ -165,7 +170,12 @@ func (p *Print) Message(m model.Message) {
 		// What ran, where, how it ended, what it printed. The message content is
 		// the JSON the model was promised; nobody reads that in a transcript.
 		fmt.Fprintf(p.Out, "\n%s:\n", capitalize(role))
-		for _, line := range obs.lines() {
+		lines := obs.lines()
+		if obs.Pending && obs.JobID != "" {
+			// Handed off: the job's state, not an exit status it does not have.
+			lines = pendingCardLines(obs, p.Jobs)
+		}
+		for _, line := range lines {
 			fmt.Fprintln(p.Out, line)
 		}
 		return

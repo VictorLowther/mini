@@ -1000,9 +1000,19 @@ its cost.
    finished while the model was busy elsewhere, then blocks on the next run
    instead of reporting the event it exists to report. Watching the queue makes an
    unseen ending wake the wait immediately, and exactly once.
-5. **GUI.** Footer count off `Snapshot`/`runStatsText` (`agent/agent.go:253`,
-   `ui/blocks.go:126`) — `2 jobs` is the whole change — then a job card carrying
-   the digest a wake produced.
+5. **GUI.** ⏳ partly: the footer count is live, and the tool card of a call that
+   handed off now tracks its job instead of claiming completion. What remains is
+   a card carrying the digest a wake produced.
+
+   The card rule, because it is the one a reader will otherwise undo: **a call
+   that backgrounded did not finish**, so its observation carries `pending` and
+   no return code, and the card renders the registry's state - running with an
+   elapsed time and the live tail of the log, then the real outcome when the job
+   ends. `env.Result.ReturnCode` is never fabricated for a run still going, and
+   the same field is what makes print mode say "still running when this call
+   returned" rather than "exit 0". The refresh runs on the driver's own thread
+   from the existing status tick and continues after the turn ends, because a job
+   spends almost all of its life in the idle window between turns.
 6. **Subagents**, when they arrive, as a second `kind` behind the same
    interface. If that step needs a new monitor, a new injection path, or a
    kind-specific output reader, steps 1–5 were built wrong.
@@ -1045,6 +1055,11 @@ Step 1 is in the tree:
     there is nothing running and nothing owed. `job_events` is therefore not a
     monitor-only table: every terminal state writes a row, which is what lets a
     wait be correct about events it did not witness.
+  - ✅ the handed-off call's card stays live: `ui.JobReader`/`JobCard` is the
+    whole surface the front end sees, `jobCards` in `cmd/mini` adapts the manager
+    to it, and the observation reports `"status": "running"` with no return code
+    (`env.Result.Pending`). Building it exposed 159 data races in the GUI test
+    harness that predate this feature - see the note in `ui/fyneui_test.go`.
   - `bash` also gained `description`, a few words from the model that becomes the
     job's label - the thing `jobs` prints and a wake will quote, which is what
     turns "j3" into "quantise 70b" in anything read later.
