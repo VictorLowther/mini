@@ -7,12 +7,12 @@ import (
 // This file is the wake queue: the durable record of things that happened to
 // jobs, and the two operations anyone needs on it - look, and claim.
 //
-// There is deliberately no blocking call here. job_wait existed for one commit:
-// with results delivered at every step boundary (agent.Loop.jobWake) a tool that
-// asked the model to name what it was waiting for became a second way to do the
-// same thing, and the worse one - it charged the model for patience. The
-// primitive that would reinstate a wait is in git history if the monitor engine
-// ever needs the run to block again.
+// Nothing here blocks, and there is no wait tool. job_wait existed for one
+// commit; the parked run that replaced it existed for one more. Both were
+// discarded once the job's state machine was written down: a job that has
+// finished without reaching the conversation is an obligation, and an obligation
+// is met by taking the step that discharges it, not by waiting to be told the
+// step is allowed.
 
 // Firing is a claimed event together with the job it happened to, which is all
 // either consumer of the queue needs: the wait reports one, the step-boundary
@@ -99,4 +99,16 @@ func (m *Manager) PendingFirings() int {
 		return 0
 	}
 	return len(events)
+}
+
+// OwedDeliveries counts results that have happened but not been said. It is the
+// last state of the machine expressed as a question: finished jobs with no
+// delivered firing are exactly what the run still owes, and whether any exist is
+// the only thing the loop needs to know to decide if the conversation is over.
+func (m *Manager) OwedDeliveries() int {
+	n, err := m.Session.UndeliveredFirings()
+	if err != nil {
+		return 0
+	}
+	return n
 }

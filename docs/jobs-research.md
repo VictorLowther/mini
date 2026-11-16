@@ -485,6 +485,54 @@ rather than the decision.
    injected at the next point the harness can append to the conversation — the
    tool-loop boundary, which mini already has.
 
+### The job state machine
+
+Everything about waiting, delivery, and session lifetime falls out of one
+sequence, which is the model this design now treats as primary:
+
+```
+started -> running -> finished -> delivered
+```
+
+The four states live in two places. `jobs.state` carries the first three -
+`running`, then one of `completed|failed|killed|orphaned` for `finished`, with
+whoever decided it recorded in `exit_reason` - and `job_events.delivered_at`
+carries the fourth, because what becomes delivered is the *result*, not the job.
+`UndeliveredFirings()` is therefore the authoritative question: **what does the
+conversation still owe?**
+
+Backgrounded and foreground jobs are the same machine. They differ in exactly one
+respect:
+
+| | tool result returns at | the `delivered` transition is |
+|---|---|---|
+| foreground | `delivered` | the return value of the call itself |
+| backgrounded | `running` | a harness-authored user message at a step boundary |
+
+Three consequences, each of which removed a mechanism:
+
+1. **Nothing needs to wait.** A wake is not a thing to block on; it is an input,
+   and the loop already accepts inputs that start a step. So a submission with an
+   undelivered result simply continues until the debt is discharged -
+   `Loop.deliverOwed` - and the model cannot lose a result by being finished
+   first.
+2. **A running job is not a debt.** Only `finished && !delivered` obliges
+   anything. So a run can end beside a server that will never exit, which is the
+   case that made every waiting design untenable, and no timeout, warning, or
+   cancel path is needed to make progress possible. Termination is structural:
+   firings are claimed when delivered, so each continuation retires one debt and
+   cannot repeat.
+3. **The card was already showing this state.** "Finished, not yet reported" is
+   the `running -> finished` edge without the `finished -> delivered` edge - which
+   is why `ui.JobCard.Notified` exists and needed no new plumbing.
+
+The front end still owns one genuine policy question, and it is no longer
+entangled with the loop: closing a session reaps what is running. That is the
+right default for a tool that must not leak memory across a GPU box, and it is
+why the tool description says plainly that a job outlives a turn, never a
+session, and that something you started to last - a server, a watcher - is yours
+to stop with `job_kill`.
+
 ### The deployment facts behind them
 
 1. **The interesting commands are hours long, and the box is the bottleneck.**
@@ -1008,15 +1056,15 @@ its cost.
 
    The directive that replaced the tool - *results are delivered automatically,
    never poll for them* - is in the system prompt and in the `bash` and `jobs`
-   descriptions, and a prompt test guards the wording. It needed one guard to be
-   honest: in a headless run "end your turn" ends the *session*, and the reap stops
-   the jobs the model just backgrounded. So submitting with live jobs is **warned
-   about exactly once** and the run takes one more step; the model's second answer
-   stands. That is a confirmation, not a wait - it cannot hang, cannot hold a run
-   open for a server that never exits, and cannot loop. Which is the property that
-   killed the first attempt here: an unbounded hold made a backgrounded
-   `llama.cpp server` impossible to finish a session around, and it stalled the
-   test suite for a minute before the reason was obvious.
+   descriptions, with a prompt test guarding the wording, and it rests on the
+   state machine below rather than on any exception. Two earlier attempts to make
+   it safe are worth recording because both were wrong in the same direction: an
+   unbounded hold at submission (which made a backgrounded `llama.cpp server`
+   impossible to finish a session around - it stalled the test suite for a minute
+   before the cause was obvious), and then a one-shot warning that let the model
+   submit anyway. Both were waiting wearing different clothes, and both treated a
+   *front-end* question - when may this process exit? - as if it belonged in the
+   loop.
 5. **GUI.** ⏳ partly: the footer count is live, and the tool card of a call that
    handed off now tracks its job instead of claiming completion. What remains is
    a card carrying the digest a wake produced.
@@ -1073,8 +1121,8 @@ Step 1 is in the tree:
     only on delivery. `job_events` is therefore not a monitor-only table - it is
     how the feature is correct about endings nobody witnessed.
   - ✅ the directive that replaces `job_wait`, in the system prompt and the tool
-    descriptions, plus the one-shot "submitting now stops your jobs" warning that
-    makes ending a turn safe in a headless run.
+    descriptions, resting on the state machine above: an owed result buys a step,
+    a running job buys nothing, and no code path waits for either.
   - ✅ the handed-off call's card stays live: `ui.JobReader`/`JobCard` is the
     whole surface the front end sees, `jobCards` in `cmd/mini` adapts the manager
     to it, and the observation reports `"status": "running"` with no return code
@@ -1121,12 +1169,16 @@ ask for a job. Step 2 (promotion) is where the tool surface appears.
    prefix, but it means the last *synchronous* observation of a long command is
    "moved to background" — so `jobs` must be discoverable from the summary text
    if compaction eats the wake (durable-state list above).
-2. **Should a wake be able to resume a run that has already submitted?** Today
-   an undelivered firing survives to the next run's first boundary, which is
-   honest but slow. A monitor engine that wants to bring the agent back for a
-   matching line needs the loop to be re-enterable from outside - the
-   `nextTurn` lane with a driver, which is the piece the deleted hold almost
-   was.
+2. ~~Should a wake be able to resume a run that has already submitted?~~
+   **Answered by the state machine: a finished-but-undelivered result continues
+   the run, and nothing else does.** What remains genuinely open is narrower and
+   belongs to the monitor engine: a *match* wake for a job that keeps running
+   (a training run logging `val_loss=nan`) is not a `finished` transition, so
+   under the rule above it owes nothing and would not re-enter the loop. Either
+   match firings count as owed results - in which case "delivered" is about the
+   event, not the job's end, which the schema already supports - or long-lived
+   jobs need an explicit "watch and stop" affordance. Cheap reading is that any
+   queued firing is a debt, which the current query already expresses.
 3. ~~Confirm mode and `all`.~~ **Settled: no prompt, for `all` included.** This
    doc originally said a kill is still a shell side effect and should inherit the
    gate, by way of zero's `TaskStop`. That is wrong, and the mistake is

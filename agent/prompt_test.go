@@ -51,8 +51,8 @@ func TestShippedPromptsStateTheWindow(t *testing.T) {
 	// it is about turn discipline, and it is asserted here because a model that
 	// is not told results arrive on their own will poll logs in a loop - the
 	// exact behaviour the delivery path exists to remove.
-	for _, want := range []string{"Background jobs report themselves", "delivered to you automatically",
-		"Never poll a log", "stops its jobs"} {
+	for _, want := range []string{"Background jobs report themselves", "the run continues until it has been delivered",
+		"never poll a log", "not a result owed", "end it with job_kill"} {
 		if !strings.Contains(sys, want) {
 			t.Errorf("the system prompt is missing %q", want)
 		}
@@ -61,7 +61,8 @@ func TestShippedPromptsStateTheWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"delivered to you automatically", "never poll a log", "outlives a turn"} {
+	for _, want := range []string{"result reaches you automatically", "never poll a log",
+		"outlives a turn", "job_kill when"} {
 		if !strings.Contains(string(tool), want) {
 			t.Errorf("the bash description is missing %q", want)
 		}

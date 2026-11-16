@@ -18,6 +18,25 @@ const (
 	KindSubagent = "subagent"
 )
 
+// A job moves through four states, and the last of them is not in the state
+// column:
+//
+//	started -> running -> finished -> delivered
+//
+// started and running are both JobRunning here (the distinction only matters to
+// a kind that can fail to spawn, which records the reason in the row); finished
+// is one of the four terminal states below, whoever decided it; and delivered is
+// carried by the firing in job_events, because the thing that becomes delivered
+// is the *result*, not the job. PendingJobEvents / UndeliveredFirings is the
+// authoritative question - what does the conversation still owe - and that is
+// what lets a run end without waiting for anything: an unfinished job is not a
+// debt, an unsaid result is.
+//
+// The four states are the same for backgrounded and foreground jobs. They differ
+// only in where the delivery lands: a foreground call's tool result is the
+// delivered transition, while a backgrounded one answers during running and is
+// delivered later, as a message the harness authors at a step boundary.
+//
 // Job states. A job is Running until something ends it, and the four terminal
 // states differ in who decided: the command (Completed/Failed), the harness or
 // the model (Killed), or the loss of the process that owned it (Orphaned).
@@ -366,6 +385,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) RETURNING id`,
 		return 0, fmt.Errorf("session store: record job event: %w", err)
 	}
 	return id, nil
+}
+
+// UndeliveredFirings counts results that happened but have not been reported.
+// The loop asks this at every exit boundary: a nonzero answer is a step waiting
+// to be taken, not a thing to wait for.
+func (s *Session) UndeliveredFirings() (int, error) {
+	var n int
+	if err := s.store.db.QueryRow(`SELECT count(*) FROM job_events
+WHERE session_id = ? AND delivered_at IS NULL`, s.ID.String()).Scan(&n); err != nil {
+		return 0, fmt.Errorf("session store: count owed firings: %w", err)
+	}
+	return n, nil
 }
 
 // PendingJobEvents returns firings nobody has delivered, oldest first.

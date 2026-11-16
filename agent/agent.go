@@ -163,10 +163,6 @@ type Loop struct {
 	// interface has no timeout to expose, and a container environment's idea of
 	// a sane wait should not have to widen the contract.
 	CommandBudget time.Duration
-	// jobsWarnedAtSubmit keeps the submit-with-live-jobs warning to one extra
-	// step per run, so it can never become a loop between a model that wants to
-	// stop and a job that will not end.
-	jobsWarnedAtSubmit bool
 	// Jobs is the registry backgrounded commands are handed to. nil means this
 	// run cannot background anything - a test harness, or a front end that has
 	// not wired one up - and `background: true` then comes back as a reported
@@ -842,9 +838,6 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	// Compaction state is per run: the breaker and the reactive budget
 	// restart, and a stale /compact request from a previous run must not
 	// fire.
-	// The submit-with-live-jobs warning is per run: a resumed or second task in
-	// the same window deserves its own chance to reconsider.
-	l.jobsWarnedAtSubmit = false
 	l.compactFails = 0
 	l.autoCompactOff = false
 	l.overflowBudget = maxOverflowCompactions
@@ -921,14 +914,13 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 		}
 		l.save()
 		if l.lastRole() == "exit" {
-			// Anything still undelivered is reported before the exit row (see
-			// the boundary above). A job that is still *running* here is left
-			// running: the session's reap ends it and records a firing, which
-			// the next run of this session delivers at its first boundary.
-			// Holding the run open instead would be wrong in the case that
-			// matters most on this hardware - a server started with
-			// background: true never exits, so the agent could never finish.
-			if l.warnPendingJobsAtSubmit(ctx) {
+			// Ending a turn is the model saying *it* has nothing to do, not
+			// that nothing remains to be done. Those were conflated, and the
+			// conflation is what made a wait tool look necessary - and made
+			// submitting with live jobs destroy them. A job that has finished
+			// without its result reaching the conversation is an obligation of
+			// the harness, and discharging it is what drives the next step.
+			if l.deliverOwed() {
 				continue
 			}
 			if n := l.liveJobCount(); n > 0 {
@@ -949,63 +941,38 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	return extra, nil
 }
 
-// warnPendingJobsAtSubmit gives a run that is about to end with work still
-// burning exactly one chance to reconsider, and returns true when the loop
-// should take another step.
+// deliverOwed discharges the harness's side of the job state machine and reports
+// whether the run should take another step.
 //
-// It exists because the directive that replaced job_wait - "results are
-// delivered automatically, so stop when the only thing left is waiting" - is
-// only safe when stopping is not the same as leaving. In an interactive session
-// it is not: the human is still there, the jobs keep running, and the wake is
-// delivered at whatever step boundary comes next. In a headless run the
-// submission ends the process, and the session's reap takes the jobs with it, so
-// obeying the directive would silently destroy the very work the model
-// backgrounded on purpose.
+// A job moves started -> running -> finished -> delivered. Backgrounded and
+// foreground jobs differ in only one respect: a foreground call returns its tool
+// result *at* the delivered transition, because the waiting call is the
+// delivery; a backgrounded call returns during running, and reaches delivered
+// later, as a user message the harness authors at a step boundary. "Later" can
+// mean after the model has stopped talking, which is the whole reason this
+// function exists: the conversation is not finished while a result is owed, and
+// nothing about that requires waiting. Undelivered work is not a thing to block
+// on, it is a thing to say - so the loop takes the step that says it.
 //
-// One warning, once per run, then the model's decision stands. That is the whole
-// design: it is a confirmation, not a wait, so it cannot hang, cannot hold the
-// run open for a server that never exits, and cannot loop - while still turning
-// "the soak will be done in ninety seconds" from a silent kill into a step the
-// model can spend on something else.
-func (l *Loop) warnPendingJobsAtSubmit(ctx context.Context) bool {
-	if l.jobsWarnedAtSubmit || ctx.Err() != nil {
+// Termination is structural rather than a timeout. Firings are claimed as they
+// are delivered, so each continuation retires one obligation and cannot repeat
+// itself; jobs only finish a finite number of times; and a job that is still
+// *running* is not an owed result at all. That last case is why the run can end
+// beside a server that never exits: the model stopped working, nothing is
+// outstanding, and the session keeps the job - with its card live and its
+// result queued for the next run - until a human closes it or the model stops it
+// with job_kill.
+func (l *Loop) deliverOwed() bool {
+	if l.Jobs == nil {
 		return false
 	}
-	n := l.liveJobCount()
-	if n == 0 {
+	w := l.jobWake()
+	if len(w) == 0 {
 		return false
 	}
-	// A human holding the confirm-exit prompt is already being asked. Asking
-	// twice, in two different voices, is how a session gets a question nobody
-	// can tell the difference between.
-	if l.Hooks != nil && l.Cfg.ConfirmExit {
-		return false
-	}
-	l.jobsWarnedAtSubmit = true
-	l.logger().Info("the task submitted while jobs are still running; warning once and continuing",
-		"running", n)
-	l.addMessages(model.Message{
-		"role": "user",
-		"content": fmt.Sprintf("%s still running. Ending now closes the session and stops them; "+
-			"their results cannot be delivered afterwards.\nIf you have other work to do, do it now - a job that ends "+
-			"will be reported to you automatically at your next step. If you really are finished, submit again and "+
-			"the run will end.", jobsRunning(n)),
-		"extra": map[string]any{
-			"interrupt_type": "JobsPendingAtSubmit",
-			"jobs_running":   n,
-		},
-	})
+	l.addMessages(w...)
+	l.save()
 	return true
-}
-
-// jobsRunning phrases the count together with the verb it needs, because "1
-// background jobs are" is the sort of slip that makes harness text feel
-// generated - and this is the one message in the feature a model may act on.
-func jobsRunning(n int) string {
-	if n == 1 {
-		return "1 background job is"
-	}
-	return fmt.Sprintf("%d background jobs are", n)
 }
 
 // liveJobCount is the run's view of the registry, and nil-safe: a Loop without

@@ -596,73 +596,153 @@ func TestNoWakeWhenNothingHappened(t *testing.T) {
 	}
 }
 
-func submitWarnings(l *Loop) []string {
-	var out []string
-	for _, m := range l.Messages {
-		if e, _ := m["extra"].(map[string]any); e["interrupt_type"] == "JobsPendingAtSubmit" {
-			out = append(out, fmt.Sprint(m["content"]))
-		}
-	}
-	return out
-}
-
-// "End your turn if the only thing left is waiting" is only safe when ending a
-// turn does not end the jobs. In a headless run it does - submission closes the
-// process and the session's reap stops the work - so the model gets exactly one
-// chance to reconsider, and its second decision stands.
-func TestSubmitWithLiveJobsWarnsOnce(t *testing.T) {
+// A result the model never received is a debt, and a debt is what drives the
+// next step - no waiting, no warning, no tool for the model to remember to call.
+// Here the job finishes while the model is busy on the next command, so the debt
+// is settled at the top of the following step and the premature submission is
+// informed by the time it happens.
+func TestOwedResultIsDeliveredBeforeTheRunEnds(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("start a soak", model.Action{Command: "sleep 25", Background: true, Description: "soak"}),
-		turnActions("premature submit", model.Action{}),
-		done("submitting anyway"),
+		turnActions("start it", model.Action{Command: "echo the-answer", Background: true, Description: "quick"}),
+		// Time for the background job to finish while the model has its
+		// attention elsewhere - this is the whole scenario.
+		turnActions("unrelated work", model.Action{Command: "sleep 1.5; echo busy", TimeoutS: 10}),
+		done("submitting"),
 	}}
-	m.Outputs[1] = done("I think I am done")
 	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
-	l.Cfg.ConfirmExit = false // no human is asked; the warning is the only gate
+	l.Cfg.ConfirmExit = false
 
-	info, err := run(t, l, "start a soak then submit")
+	info, err := run(t, l, "start a quick job, do other work, submit")
 	if err != nil {
 		t.Fatal(err)
-	}
-	warns := submitWarnings(l)
-	if len(warns) != 1 {
-		t.Fatalf("warnings = %d, want exactly one (it must not become a loop):\n%s", len(warns), dumpHistory(l))
-	}
-	for _, want := range []string{"1 background job is still running",
-		"Ending now closes the session and stops them", "submit again"} {
-		if !strings.Contains(warns[0], want) {
-			t.Errorf("warning missing %q:\n%s", want, warns[0])
-		}
 	}
 	if got := info["exit_status"]; got != model.KindSubmitted {
 		t.Errorf("exit_status = %v", got)
 	}
-	// The model's second answer wins: the run ends, and the job is left for the
-	// reap rather than held hostage by the harness.
-	if list, _ := jm.List(); len(list) != 1 || list[0].State != session.JobRunning {
-		t.Errorf("registry = %+v", list)
+	wakes := jobWakes(l)
+	if len(wakes) != 1 {
+		t.Fatalf("wake messages = %d, want exactly one:\n%s", len(wakes), dumpHistory(l))
 	}
-	// And the warning never outlives the run it was raised in.
-	if l.jobsWarnedAtSubmit != true {
-		t.Error("the per-run flag was not set")
+	for _, want := range []string{"job j1 ended: completed", "the-answer", "exit 0", "quick"} {
+		if !strings.Contains(wakes[0], want) {
+			t.Errorf("wake missing %q:\n%s", want, wakes[0])
+		}
+	}
+	if !isExit(l.Messages[len(l.Messages)-1]) {
+		t.Errorf("history must end with the exit row:\n%s", dumpHistory(l))
+	}
+	if n := jm.OwedDeliveries(); n != 0 {
+		t.Errorf("owed deliveries at the end of the run = %d", n)
 	}
 }
 
-// A human with confirm_exit already gets asked whether the run really ends. A
-// second, differently-worded no from the harness would be a question nobody can
-// tell the difference between.
-func TestNoSubmitWarningWhenAHumanIsAsked(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("start a soak", model.Action{Command: "sleep 25", Background: true}),
-		done("submitting"),
-	}}
-	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
-	l.Hooks = &stubHooks{}
-	l.Cfg.ConfirmExit = true
-	if _, err := run(t, l, "start a soak then submit"); err != nil {
+// The rule itself, without depending on which boundary happens to be first: an
+// owed result buys exactly one more step, and claiming it is what clears the
+// debt, so the continuation cannot loop.
+func TestDeliverOwedBuysOneStepPerResult(t *testing.T) {
+	l, jm, _ := newJobLoop(t, &model.Deterministic{CostPerCall: 1}, &env.Local{Timeout: 5 * time.Second})
+
+	if l.deliverOwed() {
+		t.Error("nothing was owed, yet the run was told to continue")
+	}
+	r, err := jm.Start(job.Spec{Command: "echo one", TCNO: 1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(submitWarnings(l)); n != 0 {
-		t.Errorf("warnings = %d with a human holding confirm_exit", n)
+	select {
+	case <-r.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("the job never finished")
+	}
+	if n := jm.OwedDeliveries(); n != 1 {
+		t.Fatalf("owed = %d, want 1", n)
+	}
+	if !l.deliverOwed() {
+		t.Fatal("a finished, undelivered job did not earn a step")
+	}
+	if n := jm.OwedDeliveries(); n != 0 {
+		t.Errorf("delivering left %d owed", n)
+	}
+	if l.deliverOwed() {
+		t.Error("the same result bought a second step")
+	}
+	if n := len(jobWakes(l)); n != 1 {
+		t.Errorf("wake messages = %d, want 1", n)
 	}
 }
+
+// The other half of the state machine, and the reason this needs no timeout: a
+// job that is still *running* is not a result owed. The model stopped working,
+// nothing is outstanding, so the run ends beside a job that may run for days -
+// which is exactly the `background: true` server case that made waiting
+// untenable. The job keeps its card, its log, and its place in the session until
+// a human closes it or the model stops it.
+func TestRunningJobDoesNotHoldTheRunOpen(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("start the server", model.Action{Command: "sleep 60", Background: true, Description: "server"}),
+		done("ready to go, submitting"),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	l.Cfg.ConfirmExit = false
+
+	start := time.Now()
+	info, err := run(t, l, "start a server and submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("the run waited on a job that owed it nothing (%v)", d)
+	}
+	if got := info["exit_status"]; got != model.KindSubmitted {
+		t.Errorf("exit_status = %v", got)
+	}
+	if n := len(jobWakes(l)); n != 0 {
+		t.Errorf("a run with nothing owed produced %d wake message(s):\n%s", n, dumpHistory(l))
+	}
+	list, err := jm.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].State != session.JobRunning {
+		t.Fatalf("registry = %+v, want the job left running", list)
+	}
+	// Undelivered work stays undelivered rather than being invented: the result
+	// will be reported if it ever arrives, in this session or the next one.
+	if n := jm.OwedDeliveries(); n != 0 {
+		t.Errorf("a running job owes %d deliveries", n)
+	}
+}
+
+// A resumed session picks up what the last one never got to say, which is the
+// only reason it is safe for a run to end beside a running job.
+func TestOwedDeliveriesSurviveIntoTheNextRun(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("start it", model.Action{Command: "echo late-news", Background: true}),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	r, err := jm.Start(job.Spec{Command: "echo late-news", TCNO: 9, Label: "orphan-of-a-run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-r.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("the job never finished")
+	}
+	if n := jm.OwedDeliveries(); n != 1 {
+		t.Fatalf("owed after the job ended = %d, want 1", n)
+	}
+	// The run that started it never took a step to say so; the wake is still
+	// there, unclaimed, for whatever comes next.
+	if got := l.jobWake(); len(got) != 1 {
+		t.Fatalf("jobWake = %d messages", len(got))
+	}
+	if n := jm.OwedDeliveries(); n != 0 {
+		t.Errorf("delivering did not clear the debt: %d", n)
+	}
+	if again := l.jobWake(); again != nil {
+		t.Error("the same result was delivered twice")
+	}
+}
+
+func isExit(m model.Message) bool { return m["role"] == "exit" }

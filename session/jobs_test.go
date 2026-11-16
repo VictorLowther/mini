@@ -406,3 +406,61 @@ CREATE TABLE IF NOT EXISTS jobs (
 		t.Error("a second open changed the shape again: the rebuild is not idempotent")
 	}
 }
+
+// The fourth state of the machine is not in the jobs table, and this is the
+// query that expresses it: what does the conversation still owe? A finished job
+// with no undelivered firing is the only thing that can make a run continue after
+// its model has stopped talking, and a *running* job never appears here - which is
+// why ending a run beside a server costs nothing.
+func TestUndeliveredFiringsIsTheDebtQuestion(t *testing.T) {
+	st, _ := openStore(t)
+	s := newSession(t, st)
+
+	if n, err := s.UndeliveredFirings(); err != nil || n != 0 {
+		t.Fatalf("fresh session: %d, %v", n, err)
+	}
+	mkJob(t, s, "j1")
+	// Running, and nothing said: not a debt yet.
+	if n, _ := s.UndeliveredFirings(); n != 0 {
+		t.Errorf("a running job owes %d deliveries", n)
+	}
+
+	code := 0
+	if _, err := s.FinishJob("j1", JobCompleted, &code, "exited 0"); err != nil {
+		t.Fatal(err)
+	}
+	// Finished, unreported: the debt exists only once a firing is written, which
+	// is the manager's job - the store cannot know a result is owed until
+	// something recorded it.
+	if n, _ := s.UndeliveredFirings(); n != 0 {
+		t.Errorf("finished job with no firing recorded %d owed", n)
+	}
+	id, err := s.RecordJobEvent(JobEventRow{JobID: "j1", Reason: JobCompleted, ExitCode: &code})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UndeliveredFirings(); n != 1 {
+		t.Fatalf("after the firing: %d owed, want 1", n)
+	}
+	if err := s.MarkJobEventsDelivered([]int64{id}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UndeliveredFirings(); n != 0 {
+		t.Errorf("after delivery: %d owed, want 0", n)
+	}
+
+	// Scoped to the session, like every other question here.
+	b := newSession(t, st)
+	if _, err := b.CreateJob(JobRow{ID: "j1", Command: "make"}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := b.UndeliveredFirings(); n != 0 {
+		t.Errorf("the other session owes %d", n)
+	}
+	if _, err := b.RecordJobEvent(JobEventRow{JobID: "j1", Reason: JobFailed}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UndeliveredFirings(); n != 0 {
+		t.Errorf("session b's firing showed up in a's debt: %d", n)
+	}
+}

@@ -210,10 +210,12 @@ var BASH_TOOL = map[string]any{
 			"job id and output path instead of a result - so a long command " +
 			"costs a turn, not a re-run. Set background: true to skip the wait " +
 			"when you already know, and timeout_s to wait longer on purpose. A " +
-			"job's result is delivered to you automatically at your next step, " +
-			"so never poll a log or sleep to wait for one - if the only thing " +
-			"left is waiting, say so or turn to other work. A job outlives a " +
-			"turn, never a session.",
+			"job's result reaches you automatically once it finishes: if your " +
+			"turn has already ended, the run continues until it has been " +
+			"reported, so never poll a log or sleep to wait for one. A job still " +
+			"*running* is not a result owed - the run can end beside it, and " +
+			"closing the session stops it, so end it yourself with job_kill when " +
+			"you are done with it. A job outlives a turn, never a session.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
