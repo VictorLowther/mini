@@ -81,6 +81,11 @@ type Session struct {
 	// while a child of a confirm-mode session is refused until step 7 gives a
 	// parent a way to answer on its child's behalf.
 	unattended bool
+	// parked says a wrapper for this session is waiting in waitQuiet, so a send
+	// can tell "somebody will re-drive this" from "nobody is left to". Cleared
+	// before the wrapper acts on a wake, so a send that arrives during a live
+	// turn takes the running path instead of starting a second run beside it.
+	parked bool
 }
 
 func (s *Session) Logger() *slog.Logger { return s.log }
@@ -224,6 +229,12 @@ func (s *Session) LiveJobs() int { return s.Jobs.StillRunning() }
 // supported way to reach a live loop; a second Run is refused. `job_send` (step
 // 6) delivers through here for a running child.
 func (s *Session) QueueMessage(m model.Message) { s.Loop.QueueMessage(m) }
+
+func (s *Session) setParked(v bool) {
+	s.mu.Lock()
+	s.parked = v
+	s.mu.Unlock()
+}
 
 func (s *Session) claim() bool {
 	s.mu.Lock()

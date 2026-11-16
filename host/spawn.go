@@ -163,15 +163,26 @@ func (s *Session) childRunner(child *Session, prompt string) func(context.Contex
 			// Not an ending. The child has work in flight whose result will
 			// drive it, so wait for the registry to empty - or for a send, or
 			// for the parent to stop us - and then run it again.
-			if !waitQuiet(ctx, child) {
+			child.setParked(true)
+			quiet := waitQuiet(ctx, child)
+			child.setParked(false)
+			if !quiet {
 				fmt.Fprintf(out, "subagent %s was stopped with %d job(s) still running\n", child.Name, child.LiveJobs())
 				return job.Result{Reason: "cancelled with jobs still running"}
 			}
 		}
 
+		// §9.9's promise, which the first version of this broke: a child that
+		// ended any other way than by submitting still owes a report naming what
+		// happened, and "(ended without a report)" is a summary of nothing. A
+		// subagent stopped by its own cost limit is the common case - the limit is
+		// the session's, so it is spent cumulatively across every run of it,
+		// including the one a revival added - and the parent cannot act on a
+		// silent blank when the truth is "your helper ran out of budget on pass
+		// two".
 		report := submissionOf(lastInfo)
 		if strings.TrimSpace(report) == "" {
-			report = "(the subagent ended without a report)"
+			report = endingOf(child, lastInfo)
 		}
 		// The full report goes in the job's own file, where `jobs` already points
 		// and nothing truncates it; the parent's wake carries the capped body.
@@ -229,11 +240,17 @@ func (s *Session) Send(ctx context.Context, jobID, text string) error {
 	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(text) == "" {
 		return errors.New("job_send needs an 'id' and the 'text' to send")
 	}
-	run, err := s.Jobs.Get(jobID)
+	// Asked of the store rather than of the live handles, because that is the
+	// rule this package is built on - the database is the source of truth about
+	// what a job is, and a handle is only the mechanism for signalling one
+	// (job.go:12-16). It is also the only version that can answer at all for the
+	// case that matters most here: a finished subagent has no handle left, so a
+	// handle-based lookup cannot see the very job a revival is addressed to.
+	row, err := s.Sess.GetJob(jobID)
 	if err != nil {
 		return err
 	}
-	if run.Kind() != session.KindSubagent {
+	if row.Kind != session.KindSubagent {
 		// §9.11: the refusal is flat, because there is nothing for the model to
 		// do differently - a bash job's stdin is /dev/null, and making it
 		// accept input is an interpreter change, not a branch in this tool.
@@ -248,14 +265,63 @@ func (s *Session) Send(ctx context.Context, jobID, text string) error {
 		"content": text,
 		"extra":   map[string]any{"interrupt_type": "ParentMessage", "from_session": s.ID.String()},
 	}
-	if child.Running() {
-		child.QueueMessage(msg) // the path typed input already takes
-		return nil
-	}
-	// A finished or waiting child: queue the message and wake whoever is
-	// holding the row, so the re-drive carries it.
+	// Three states, and the middle one is the reason this is not simply a
+	// queue-and-hope. A child that is *waiting* on its own background work has a
+	// wrapper parked in waitQuiet, so a nudge reaches it. A child that has
+	// **finished** has no wrapper at all - its row is terminal and its goroutine
+	// is gone - and delivering a message there would park it in the queue
+	// forever, with the parent waiting on a second report that nothing was left
+	// alive to write. That is §9.3's revival, and it needs a new run, not a
+	// notification.
 	child.Loop.QueueMessage(msg)
-	child.notify()
+	if child.Running() {
+		return nil // the next step boundary drains it
+	}
+	if child.wakeUp() {
+		return nil // a parked wrapper will re-drive and pick it up
+	}
+	return s.revive(child, child.Name)
+}
+
+// wakeUp nudges a parked wrapper and reports whether one exists. The distinction
+// is held in memory rather than inferred from the registry: a row can be
+// non-terminal because the wrapper is still waiting on the child's own jobs, or
+// because the child is mid-turn, and only the first is a parked wrapper.
+func (s *Session) wakeUp() bool {
+	s.mu.Lock()
+	parked := s.parked
+	s.mu.Unlock()
+	if !parked {
+		return false
+	}
+	s.notify()
+	return true
+}
+
+// revive starts a second agent row over the same child session - §9.3's answer to
+// "is a follow-up a reopened job or a new one", taken because the state machine
+// has no legal trip from delivered back to running and inventing one would forfeit
+// the structural termination the jobs design leans on. The transcript is the
+// durable thing; the row is one run of it.
+//
+// The name carries over and the label says so, because the parent will otherwise
+// see two rows for what it thinks of as one helper, and the honest reading is that
+// the second one is a continuation rather than a second worker.
+func (s *Session) revive(child *Session, label string) error {
+	if strings.TrimSpace(label) == "" {
+		label = child.ID.String()[:8] // a child opened without a name still needs one in the row
+	}
+	run, err := s.Jobs.Start(job.Spec{
+		Kind:        session.KindSubagent,
+		Label:       label,
+		Description: "resumed subagent: " + label,
+		Command:     "subagent " + label,
+		Run:         s.childRunner(child, ""),
+	})
+	if err != nil {
+		return err
+	}
+	s.proc.registerAgentJob(s.ID.String(), run.ID(), child)
 	return nil
 }
 
@@ -280,6 +346,24 @@ func reportOf(report string) string {
 		return "reported nothing"
 	}
 	return r
+}
+
+// endingOf is the report for a child that stopped without submitting: which
+// ending, how far it got, and where its transcript is, because all three change
+// what the parent does next. A child that hit its cost limit is a child to
+// re-delegate more narrowly; a child that hit a step limit is one whose task was
+// too vague; and "it stopped" distinguishes neither.
+func endingOf(child *Session, info map[string]any) string {
+	status := "without a report"
+	if info != nil {
+		if s, _ := info["exit_status"].(string); s != "" {
+			status = strings.ToLower(s)
+		}
+	}
+	return fmt.Sprintf(
+		"subagent %q ended %s after %d model calls and $%.2f of its own spend, with no submission to report. "+
+			"Its transcript is at %s.",
+		child.Name, status, child.Loop.NCalls, child.Loop.Cost, child.Sess.Workdir)
 }
 
 func submissionOf(info map[string]any) string {

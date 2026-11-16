@@ -1474,6 +1474,45 @@ shown. A parent with no hooks spawns an unattended child whose prompts then
 *reject* rather than hang, which is omp's posture from §3.7 and the case the guard
 used to refuse outright.
 
+**§9.3's revival also landed**, found by reading the send path rather than by a
+failure: a send to a *finished* child queued a message behind a wrapper
+goroutine that no longer existed. No error, no crash - a dead letter, and a parent
+waiting on a second report nothing was left alive to write, which is the worst
+shape a bug can take in a system whose whole promise is that results arrive
+unprompted. A child now has three states a send can meet, and they are
+distinguished by a flag rather than inferred, because a non-terminal row means
+either "parked, somebody will re-drive this" or "mid-turn" and only the first wants
+a nudge: running → queue it, parked → queue and wake, finished → **start a new
+agent row over the same transcript** - a revival, not a reopening, since the state
+machine has no legal trip from `delivered` back to running and inventing one would
+cost the structural termination the jobs design leans on.
+
+Two findings from making that work, both kept because they change behaviour
+rather than cosmetics:
+
+- **The lookup was asking memory.** `Manager.Get` sees live handles, so a
+  finished job cannot be found by id at all - the send resolved to "unknown job"
+  for exactly the case it exists to serve. Sent to the store instead, which is
+  what the package doc already says is the source of truth about what a job *is*;
+  a handle is only the mechanism for signalling one.
+- **A child's budget is per session, not per run, and revivals spend it.** The
+  cost limit belongs to the config and the spend to the loop, and `Run` does not
+  reset the ledger, so a child re-driven for a second pass is refused partway
+  through on the strength of what its first pass already cost. That is the right
+  rule - a subagent that could clear its own ledger by being re-asked has no
+  ledger - but it is invisible until someone hits it, so `withCost` says so at its
+  definition, and the spawned report below now names the spend out loud.
+
+**§9.9's table became code**, because the revival test tripped over the empty
+cell: a child stopped by its cost limit ended with `LimitsExceeded` and no
+submission, and the wrapper wrote "(the subagent ended without a report)". That is
+a summary of nothing - it cannot distinguish a helper that ran out of money from
+one that ran out of turns from one that had nothing to say - so an ending that did
+not submit now reports which ending it was, how many calls and what spend it took
+to get there, and where the transcript is. A parent that knows its child ran out
+of budget re-delegates more narrowly; one that knows it ran out of *turns* knows
+the task was too vague.
+
 Three tests: the gate forwards with the right name attached while the parent's
 run-shaping hooks stay untouched; an unattended parent gives its child no route to
 a human who does not exist; and two queued asks do not arrive wearing each

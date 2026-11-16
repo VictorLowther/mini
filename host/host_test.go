@@ -74,6 +74,19 @@ func yolo(t *testing.T, merged map[string]any) map[string]any {
 	return config.Merge(merged, map[string]any{"agent": map[string]any{"mode": "yolo"}})
 }
 
+// withCost raises the cost budget and sets yolo. It matters for subagents
+// specifically because the limit belongs to the session and the spend to the
+// loop, so a child's cost accumulates across every run of it - including the one
+// a revival adds - and the shipped budget covers only a couple of turns. That is
+// the right rule: a subagent that could reset its own ledger by being re-driven
+// has no ledger. It is also why a test that delegates twice has to say so.
+func withCost(t *testing.T, merged map[string]any, limit float64) map[string]any {
+	t.Helper()
+	return config.Merge(merged, map[string]any{"agent": map[string]any{
+		"mode": "yolo", "cost_limit": limit,
+	}})
+}
+
 func openSession(t *testing.T, p *Process, merged map[string]any, dir string, i int, spec func(*Spec)) *Session {
 	t.Helper()
 	s := Spec{Config: merged, Workdir: dir, Project: dir, Model: scripted(i)}
@@ -860,4 +873,188 @@ func spawnTurn(name, prompt string) model.Message {
 		"actions": []model.Action{{Tool: model.ToolAgent, Args: map[string]any{"name": name, "prompt": prompt}}},
 		"cost":    1.0,
 	}}
+}
+
+// TestSendRevivesAFinishedSubagent is §9.3's whole claim - "reviving an agent that
+// has already delivered results is restoring it like any other session, then
+// sending it a message" - tested as the failure it prevents. Before this, a send
+// to a finished child queued a message behind a goroutine that no longer existed:
+// no error, no crash, and a parent waiting forever on a second report that nothing
+// was left alive to write. A silent dead letter is the worst shape a bug can take
+// in a system whose entire design is that results arrive unprompted.
+func TestSendRevivesAFinishedSubagent(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	// One child, two runs' worth of script: the second run continues the same
+	// transcript, which is the point of reviving rather than respawning.
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+			turn("echo one > pass1.txt"),
+			done("REPORT-1: first pass done"),
+			turn("echo two > pass2.txt"),
+			done("REPORT-2: second pass done"),
+		}}
+	}
+	parent, err := p.Open(Spec{Config: withCost(t, merged, 20), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "worker", Prompt: "first pass"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	first := waitJobDone(t, parent, reply.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(first.OutputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "REPORT-1") {
+		t.Fatalf("first run reported %.80q", body)
+	}
+	if _, err := os.Stat(filepath.Join(base, "pass2.txt")); err == nil {
+		t.Fatal("the second pass ran before it was asked for")
+	}
+
+	if err := parent.Send(ctx, reply.JobID, "second pass, please"); err != nil {
+		t.Fatalf("send to a finished subagent: %v", err)
+	}
+
+	// A second row, not the first one reopened: the state machine has no legal
+	// trip from delivered back to running, and inventing one would cost the
+	// structural termination the jobs design relies on.
+	waitForHost(t, "the revival to register a second row", func() bool {
+		rows, err := parent.Sess.ListJobs()
+		return err == nil && len(rows) == 2
+	})
+	rows, _ := parent.Sess.ListJobs()
+	var secondID string
+	for _, r := range rows {
+		if r.ID != reply.JobID {
+			secondID = r.ID
+		}
+	}
+	if secondID == "" {
+		t.Fatal("no second row")
+	}
+	probe, err := parent.Sess.GetJob(secondID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.Label != "worker" {
+		t.Errorf("the revived row is labelled %q, want the same name the parent gave", probe.Label)
+	}
+	if !strings.Contains(probe.Description, "resumed") {
+		t.Errorf("the revived row does not say it is a continuation: %q", probe.Description)
+	}
+
+	secondRow := waitJobDone(t, parent, secondID)
+	body, err = os.ReadFile(secondRow.OutputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "REPORT-2") {
+		t.Errorf("the revived run reported %.120q, want REPORT-2", body)
+	}
+	if _, err := os.Stat(filepath.Join(base, "pass2.txt")); err != nil {
+		t.Error("the revived run did not do its work")
+	}
+
+	// The revival continued the transcript rather than starting fresh - that is
+	// what makes it a revival and not a second delegation.
+	kid, ok := p.childOfJob(parent.ID.String(), secondID)
+	if !ok {
+		t.Fatal("the revived row is not mapped to a child")
+	}
+	var userTurns int
+	for _, m := range kid.Loop.Messages {
+		if m["role"] == "user" && !model.IsToolResult(m) {
+			userTurns++
+		}
+	}
+	if userTurns < 2 {
+		t.Errorf("the revived child has %d non-observation user turns; a revival should carry the first pass's", userTurns)
+	}
+	// And it is still one child session, not two.
+	if n := len(p.Children(parent.ID)); n != 1 {
+		t.Errorf("children after revival = %d, want 1", n)
+	}
+}
+
+// waitJobDone polls one of a session's job rows until it leaves the running
+// state, and returns the settled row. Deliberately a poll in the test rather than
+// a Wait method on Session: the runtime's own contract is that results are pushed
+// at step boundaries, and a production API that invited callers to block on a job
+// would be the polling the design exists to remove, with a nicer name.
+func waitJobDone(t *testing.T, s *Session, id string) *session.JobRow {
+	t.Helper()
+	var row *session.JobRow
+	waitForHost(t, "job "+id+" to settle", func() bool {
+		r, err := s.Sess.GetJob(id)
+		if err != nil {
+			return false
+		}
+		row = r
+		return r.State != session.JobRunning
+	})
+	if row.State == session.JobRunning {
+		t.Fatalf("job %s never settled", id)
+	}
+	return row
+}
+
+// TestLimitEndedSubagentReportsWhereItStopped holds §9.9's promise that a child
+// which did not submit still produces a report naming what happened. The first
+// version of the wrapper wrote "(the subagent ended without a report)" for every
+// such ending, which is a summary of nothing: a parent cannot tell a helper that
+// ran out of money from one that ran out of turns, and both look identical to one
+// that simply had nothing to say.
+func TestLimitEndedSubagentReportsWhereItStopped(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	// A budget the child cannot finish inside: $1 is under the two turns its
+	// script needs, so it ends on LimitsExceeded rather than by submitting.
+	parent, err := p.Open(Spec{Config: withCost(t, merged, 1), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+			turn("echo a > a.txt"), done("never reached"),
+		}}
+	}
+	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "cheap", Prompt: "do a little"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_ = ctx
+	row := waitJobDone(t, parent, reply.JobID)
+	if row.State == session.JobRunning {
+		t.Fatal("still running")
+	}
+	body := string(mustRead(t, row.OutputPath))
+	for _, want := range []string{"limitsexceeded", "model calls", "$"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the report does not name %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, "ended without a report") {
+		t.Errorf("the empty-summary path is back: %q", body)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
