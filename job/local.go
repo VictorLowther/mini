@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -31,6 +32,19 @@ type Spec struct {
 	Dir string
 	// Env is extra KEY=VALUE pairs for this run only.
 	Env []string
+	// Kind is session.KindBash (the default) or session.KindSubagent. It is
+	// display metadata and the cap-exemption key, never a control path - the
+	// control path is Run below.
+	Kind string
+	// Run is the work for a kind the interpreter cannot perform: an agent job
+	// runs a session, not a shell. When it is set, Launch executes it on the
+	// same context, the same output file and the same state machine as a bash
+	// run, and nothing else in the package branches on the kind - which is what
+	// the package doc means by "a job is a run and not a tool call", and why the
+	// registry, the wake path and the wait/kill API never learned that a job has
+	// a pid (job.go:5-11). The run owns its own ending: it returns when the work
+	// is over, and the manager only records what it says.
+	Run func(ctx context.Context, out io.Writer) Result
 	// TCNO is the tool call that started the run, when there was one. It is a
 	// display join, never a lookup path; the reason ids are derived from it is
 	// that it is already unique per session.
@@ -44,6 +58,39 @@ type Spec struct {
 	// caller that hands one over must not close it itself.
 	File *os.File
 	Path string
+}
+
+// kindOrDefault is the spec's kind, or bash when unset - so every existing
+// call site keeps producing the rows it always did.
+func (s Spec) kindOrDefault() string {
+	if s.Kind != "" {
+		return s.Kind
+	}
+	return session.KindBash
+}
+
+// Result is what a custom Run reports when it ends. ExitCode is a pointer
+// because "no code" and "code 0" are different statements: a run that ended
+// because it was cancelled has no exit code, and claiming 0 would tell the
+// parent that its own kill was a success.
+type Result struct {
+	ExitCode *int
+	Reason   string
+}
+
+// outcomeFor turns a custom run's report into the internal shape the bash path
+// produces, so recordEndLocked and the firing have one thing to consume.
+func outcomeFor(res Result, err error) outcome {
+	if err != nil {
+		return outcome{state: session.JobKilled, reason: "killed on request: " + err.Error()}
+	}
+	if res.Reason != "" && res.ExitCode == nil {
+		return outcome{state: session.JobFailed, reason: res.Reason}
+	}
+	if res.ExitCode != nil && *res.ExitCode != 0 {
+		return outcome{state: session.JobFailed, code: res.ExitCode, reason: res.Reason}
+	}
+	return outcome{state: session.JobCompleted, code: res.ExitCode}
 }
 
 // ErrStillRunning is what a kill reports when the cancel landed but the run has
@@ -110,7 +157,7 @@ func (m *Manager) Launch(s Spec) (*Run, error) {
 	// Adopt the handle before anything is written: the duplicate check costs
 	// nothing when it fires first, and a refusal must not leave a file or a row
 	// describing a run that never existed.
-	r := &Run{id: id, kind: session.KindBash, output: m.Session.JobPath(id),
+	r := &Run{id: id, kind: s.kindOrDefault(), output: m.Session.JobPath(id),
 		dir: m.dir(s.Dir), started: time.Now().UnixMilli(), mgr: m, done: make(chan struct{})}
 	if s.Path != "" {
 		r.output = s.Path
@@ -145,10 +192,74 @@ func (m *Manager) Launch(s Spec) (*Run, error) {
 		}
 	}
 	ctx, cancel := context.WithCancel(m.background())
+	if s.Run != nil {
+		// A run that is not a process. Same handle, same done channel, same
+		// watcher contract - and the stopper is cancellation, with no
+		// SIGINT-to-SIGKILL window to wait through, because there is nothing to
+		// signal. That is the package doc's "a kind whose ending is not a process
+		// exit simply has none", made real.
+		agent := &funcRun{run: r, cancel: cancel, fn: s.Run}
+		r.stop = agent
+		go agent.watch(ctx, file, s)
+		return r, nil
+	}
 	run := &interpRun{run: r, cancel: cancel}
 	r.stop = run
 	go run.watch(ctx, file, s, envs)
 	return r, nil
+}
+
+// funcRun is a non-process kind's hold on a run: it ends by cancelling the
+// context it was given, and trusts the work to notice.
+type funcRun struct {
+	run    *Run
+	cancel context.CancelFunc
+	fn     func(context.Context, io.Writer) Result
+}
+
+// hurry requests the end and returns at once, mirroring interpRun: a session
+// with several live agent jobs is torn down in the time one takes, not per job
+// (the reap is on every exit path of the app, §9.2's batched unwind).
+func (f *funcRun) hurry() { f.cancel() }
+
+func (f *funcRun) stop(grace time.Duration) error {
+	select {
+	case <-f.run.done:
+		return nil
+	default:
+	}
+	f.cancel()
+	select {
+	case <-f.run.done:
+		return nil
+	case <-time.After(grace):
+		return ErrStillRunning
+	}
+}
+
+// watch mirrors interpRun.watch, including the deferral order: close(done)
+// happens last, so a caller woken by it is entitled to a recorded row and a
+// closed file.
+func (f *funcRun) watch(ctx context.Context, file *os.File, s Spec) {
+	r, m := f.run, f.run.mgr
+	defer close(r.done)
+	defer file.Close()
+
+	res := f.fn(ctx, file)
+	oc := outcomeFor(res, ctx.Err())
+
+	r.mu.Lock()
+	r.end = &oc
+	detached := r.detached
+	var row *session.JobRow
+	if detached {
+		row = m.recordEndLocked(r, oc)
+	}
+	r.mu.Unlock()
+	if detached {
+		logEnd(m, row, r.id, oc)
+		m.noteQuiescent()
+	}
 }
 
 // Detach registers a running launch as a job: from here it has a row, counts
@@ -158,7 +269,14 @@ func (m *Manager) Launch(s Spec) (*Run, error) {
 // path it has been writing to all along instead of inventing a second file the
 // model would have to be told about.
 func (m *Manager) Detach(r *Run, reason string) (*session.JobRow, error) {
-	if max := m.maxJobs(); max > 0 {
+	// The cap guards against a model multiplying GPU-heavy *processes* - two
+	// training runs on one box is already one too many (job.go:42-45). An agent
+	// job is not a process: it holds no pid, needs no stopper, and while its
+	// child waits between turns it consumes no slot either, so applying the
+	// process cap to it would bound the wrong thing and refuse a parent for a
+	// reason it cannot act on. Over-fanning-out is still checked, one level
+	// down: each child's own bash jobs count against their own session's cap.
+	if max := m.maxJobsFor(r.kind); max > 0 {
 		if n, err := m.Session.CountRunningJobs(); err == nil && n >= max {
 			return nil, fmt.Errorf("%w: %d live, stop one with job_kill first", ErrCap, n)
 		}
@@ -259,6 +377,7 @@ func (i *interpRun) watch(ctx context.Context, file *os.File, s Spec, envs map[s
 	r.mu.Unlock()
 	if detached {
 		logEnd(m, row, r.id, oc)
+		m.noteQuiescent()
 	}
 }
 

@@ -88,12 +88,30 @@ type Manager struct {
 	Local *env.Local
 	// Env is the environment override for every job; Spec.Env wins over it.
 	Env map[string]string
+	// OnQuiescent, when set, is called from the watcher goroutine after a
+	// detached run has ended and no job this session started is still running.
+	// It is how a parent that owns this session as a *job* learns the child can
+	// finally be finished (docs/parallel-sessions.md §9.10): the report is only
+	// true once nothing the child started may still report, and the alternative
+	// to a push here is a poller, which is the thing this entire delivery design
+	// exists to avoid.
+	//
+	// It fires on the run's own goroutine, after the row is recorded and the
+	// firing written, so a handler that reads the registry sees a settled
+	// picture. It fires at most once per transition into quiescence, and a
+	// session that never had a job is never quiescent-by-this-path: the caller
+	// that ends a run with no jobs outstanding handles that directly.
+	OnQuiescent func()
 
 	mu      sync.Mutex
 	handles map[string]*Run
 	// ctx is the parent of every job, so no turn, tool call, or model deadline
 	// can end a run. nil means context.Background().
 	ctx context.Context
+	// quiescent records whether the last noteQuiescent already reported an empty
+	// registry, so the hook is an edge rather than a level. Starting a job
+	// clears it.
+	quiescent bool
 }
 
 // WithContext ties every job this manager starts to ctx, which is how an
@@ -110,6 +128,17 @@ func (m *Manager) logger() *slog.Logger {
 		return m.Logger
 	}
 	return slog.Default()
+}
+
+// maxJobsFor is the cap for one kind. Agent-kind jobs are exempt, because the
+// number exists to bound processes and an agent job is not one (§5.7, and the
+// comment on Detach). A negative value means "no cap", which is what
+// maxJobs()'s own convention already understands.
+func (m *Manager) maxJobsFor(kind string) int {
+	if kind == session.KindSubagent {
+		return -1
+	}
+	return m.maxJobs()
 }
 
 func (m *Manager) maxJobs() int {
@@ -295,6 +324,33 @@ func (r *Run) abandon(err error) error {
 
 // forget drops the live handle. The row stays: a terminal job is still a job
 // the model can list, read, and quote.
+// noteQuiescent fires the OnQuiescent hook when this session has just become
+// the kind of idle that a waiting parent can act on: a run ended, and nothing it
+// started is still running. The count is asked of the store rather than of the
+// live handles because the store is the source of truth for liveness - a job
+// that ended while nobody was looking is still ended - and because a hook driven
+// by memory would miss exactly the transition that matters after a restart.
+//
+// The flag makes it edge-triggered rather than level-triggered: a session with
+// nothing running that ends a second job has not become quiescent again, and a
+// parent woken twice for one quiet would ask twice.
+func (m *Manager) noteQuiescent() {
+	if m.OnQuiescent == nil {
+		return
+	}
+	n, err := m.Session.CountRunningJobs()
+	if err != nil || n > 0 {
+		return
+	}
+	m.mu.Lock()
+	fresh := !m.quiescent
+	m.quiescent = true
+	m.mu.Unlock()
+	if fresh {
+		m.OnQuiescent()
+	}
+}
+
 func (m *Manager) forget(id string) {
 	m.mu.Lock()
 	delete(m.handles, id)
@@ -322,6 +378,10 @@ func (m *Manager) List() ([]session.JobRow, error) { return m.Session.ListJobs()
 func (m *Manager) register(r *Run) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Starting work un-quiets the session, so the next emptying is a real edge
+	// and a parent waiting on the transition is woken once per quiet spell
+	// rather than once per process lifetime.
+	m.quiescent = false
 	// The map is created on first use so a zero-value Manager works: every
 	// other type in mini is built as a struct literal with the fields it needs
 	// (env.Local, agent.Loop), and a Manager wired up that way must not have to
@@ -330,7 +390,11 @@ func (m *Manager) register(r *Run) error {
 	if m.handles == nil {
 		m.handles = make(map[string]*Run)
 	}
-	if max := m.maxJobs(); max > 0 && len(m.handles) >= max {
+	// The handle cap is the same rule as Detach's row cap and has to carry the
+	// same exemption, or the second one silently wins: an agent kind is exempt
+	// because it holds no process (§5.7), and a parent at the cap that can
+	// register a row but not a handle is a parent that got refused anyway.
+	if max := m.maxJobsFor(r.kind); max > 0 && len(m.handles) >= max {
 		return fmt.Errorf("%w: %d live, stop one with job_kill first", ErrCap, len(m.handles))
 	}
 	if _, dup := m.handles[r.id]; dup {
