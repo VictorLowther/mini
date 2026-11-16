@@ -21,9 +21,16 @@ type Message = map[string]any
 // because ending a run is something only the harness can do - see Needs-
 // Confirmation for why the kill among them asks for nothing.
 const (
+	// ToolAgent is the name step 6 gives the spawn tool. It is declared with the
+	// others now because the tool set and the prompt gates reference it today:
+	// TopLevelTools will include it and SubagentTools will drop it, and the
+	// distinction has to exist before the capability does, or the first
+	// implementation of spawning ships with subagents able to spawn.
+	ToolAgent   = "agent"
 	ToolBash    = "bash"
 	ToolJobs    = "jobs"
 	ToolJobKill = "job_kill"
+	ToolJobSend = "job_send"
 )
 
 // Action is one parsed tool call.

@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -16,7 +17,7 @@ func parseOne(t *testing.T, arguments string) Action {
 			"id":       "call-1",
 			"function": map[string]any{"name": "bash", "arguments": arguments},
 		}},
-		"{{ .error }}", map[string]any{"finish_reason": "tool_calls"})
+		"{{ .error }}", TopLevelTools(), map[string]any{"finish_reason": "tool_calls"})
 	if err != nil {
 		t.Fatalf("arguments %s: %v", arguments, err)
 	}
@@ -88,7 +89,7 @@ func TestParseStillRejectsBrokenCalls(t *testing.T) {
 		t.Helper()
 		_, err := parseToolCallActions(
 			[]map[string]any{{"function": map[string]any{"name": name, "arguments": arguments}}},
-			"{{ .error }}", map[string]any{"finish_reason": "tool_calls"})
+			"{{ .error }}", TopLevelTools(), map[string]any{"finish_reason": "tool_calls"})
 		if err == nil {
 			return ""
 		}
@@ -121,7 +122,7 @@ func TestParseJobToolCalls(t *testing.T) {
 	parse := func(name, arguments string) (Action, error) {
 		actions, err := parseToolCallActions(
 			[]map[string]any{{"id": "c1", "function": map[string]any{"name": name, "arguments": arguments}}},
-			"{{ .error }}", map[string]any{"finish_reason": "tool_calls"})
+			"{{ .error }}", TopLevelTools(), map[string]any{"finish_reason": "tool_calls"})
 		if err != nil || len(actions) == 0 {
 			return Action{}, err
 		}
@@ -209,5 +210,75 @@ func TestNeedsConfirmationIsOnlyAboutStartingWork(t *testing.T) {
 	}
 	if got := (Action{Tool: ToolJobs}).Display(); got != "jobs" {
 		t.Errorf("jobs Display = %q", got)
+	}
+}
+
+// TestParseHonoursTheAdvertisedSet is the third rendering of the tool set: the
+// parser accepts what the request offered and refuses the rest (§5.6). The
+// hazard it guards is asymmetric - a tool in the array but not the parser is a
+// tool that cannot be used, and a tool in the parser but not the array is a
+// capability a session was quietly given - so both directions are asserted.
+func TestParseHonoursTheAdvertisedSet(t *testing.T) {
+	call := func(set ToolSet, name, arguments string) string {
+		t.Helper()
+		_, err := parseToolCallActions(
+			[]map[string]any{{"id": "c1", "function": map[string]any{"name": name, "arguments": arguments}}},
+			"{{ .error }}", set, map[string]any{"finish_reason": "tool_calls"})
+		if err == nil {
+			return ""
+		}
+		var in *Interrupt
+		if errors.As(err, &in) {
+			return fmt.Sprint(in.Messages[0]["content"])
+		}
+		return err.Error()
+	}
+
+	if got := call(SubagentTools(), "bash", `{"command":"ls"}`); got != "" {
+		t.Errorf("a subagent could not use bash: %s", got)
+	}
+	if got := call(SubagentTools(), ToolAgent, `{}`); !strings.Contains(got, "Unknown tool") {
+		t.Errorf("subagent set accepted the spawn tool: %q", got)
+	}
+	// A set that omits a tool must refuse it even though the schema exists in the
+	// package - the advertised set is the authority, not the registry.
+	if got := call(ToolSet{{Name: ToolBash, Schema: BASH_TOOL}}, "jobs", `{}`); !strings.Contains(got, "Unknown tool") {
+		t.Errorf("a minimal set accepted jobs: %q", got)
+	}
+	// And the empty set is the default rather than "nothing is allowed", so a
+	// client built without thinking about kinds keeps working.
+	if got := call(nil, "jobs", `{}`); got != "" {
+		t.Errorf("the zero ToolSet refused jobs: %q", got)
+	}
+}
+
+func TestToolSetRenderingsAgree(t *testing.T) {
+	for name, set := range map[string]ToolSet{"top": TopLevelTools(), "subagent": SubagentTools()} {
+		listing := set.Listing()
+		for _, tool := range set.Names() {
+			if !strings.Contains(listing, "`"+tool+"`") {
+				t.Errorf("%s listing omits %q", name, tool)
+			}
+			if !set.accepts(tool) {
+				t.Errorf("%s: %q is listed but not accepted", name, tool)
+			}
+		}
+		// The listing is derived from the schemas, so the two can never be a
+		// different length - the whole point of one value with three renderings.
+		if len(set.schemas()) != len(set.Names()) {
+			t.Errorf("%s: %d schemas for %d names", name, len(set.schemas()), len(set.Names()))
+		}
+	}
+	// The spawn tool and its send partner belong to a top-level session only:
+	// a subagent cannot recurse, and cannot send either because the agent jobs a
+	// send targets are exactly the things a subagent cannot create (§5.6, §9.11).
+	if !TopLevelTools().Has(ToolAgent) || !TopLevelTools().Has(ToolJobSend) {
+		t.Error("a top-level session is missing the subagent tools")
+	}
+	if SubagentTools().Has(ToolAgent) || SubagentTools().Has(ToolJobSend) {
+		t.Error("a subagent was offered a tool that only makes sense for a parent")
+	}
+	if !SubagentTools().Has(ToolJobs) || !SubagentTools().Has(ToolJobKill) {
+		t.Error("a subagent lost the job tools it needs for its own background work")
 	}
 }

@@ -43,7 +43,21 @@ type Sushi struct {
 	RetryMax int
 	// OnRetry, when set, is told about each retry so a UI can show progress
 	// instead of appearing to hang.
-	OnRetry     func(attempt, maxAttempts int, err error, wait time.Duration)
+	OnRetry func(attempt, maxAttempts int, err error, wait time.Duration)
+	// Gate bounds this client's in-flight requests. Nil means DefaultGate, and
+	// that is the point: the bound is opt-out-free, so a subagent that builds
+	// its own Sushi cannot quietly step around the box's one real limit.
+	Gate *Gate
+	// OnGateWait, when set, is told about a request that had to queue for a
+	// slot, so a front end can say so. A stalled window with no explanation is
+	// indistinguishable from a crash, which is the same reason OnRetry exists and
+	// reaches the transcript (cmd/mini/main.go:346-348).
+	OnGateWait func(GateWait)
+	// Tools is this session's advertised set. Zero means TopLevelTools, so a
+	// client that never thought about kinds behaves as it always has; host sets
+	// it from the session's kind, which makes one value drive the request array,
+	// the parser's acceptance, and the prompt listing (§5.6).
+	Tools       ToolSet
 	HTTPClient  *http.Client
 	ObsTemplate string
 	ErrTemplate string
@@ -170,7 +184,7 @@ func (s *Sushi) Query(ctx context.Context, msgs []Message, h *Handler) (Message,
 	if u, ok := stream.response["usage"]; ok {
 		extra["model_stats"] = u
 	}
-	actions, err := parseToolCallActions(stream.toolCalls, s.ErrTemplate, map[string]any{
+	actions, err := parseToolCallActions(stream.toolCalls, s.ErrTemplate, s.tools(), map[string]any{
 		"finish_reason": stream.finishReason,
 	})
 	if err != nil {
@@ -289,7 +303,7 @@ func (s *Sushi) requestBody(msgs []Message) map[string]any {
 	body := map[string]any{
 		"model":          s.Model,
 		"messages":       prepared,
-		"tools":          []any{BASH_TOOL, JOBS_TOOL, JOB_KILL_TOOL},
+		"tools":          s.tools().schemas(),
 		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
 	}
@@ -308,7 +322,44 @@ func (s *Sushi) requestBody(msgs []Message) map[string]any {
 	return body
 }
 
+// tools is the advertised set, defaulting to the top-level one.
+func (s *Sushi) tools() ToolSet {
+	if len(s.Tools) > 0 {
+		return s.Tools
+	}
+	return TopLevelTools()
+}
+
+// gate is the bound this client obeys. Defaulting to the package-level Gate is
+// what makes the limit unskippable rather than a courtesy.
+func (s *Sushi) gate() *Gate {
+	if s.Gate != nil {
+		return s.Gate
+	}
+	return DefaultGate
+}
+
+// attempt makes one HTTP request and reads its whole streamed response before
+// returning, which is why the slot is taken here and nowhere else: this function
+// is the request *and* the response, so holding across it is exactly the
+// "entire request/response, streaming included" the knob promises
+// (docs/parallel-sessions.md §5.7). Holding one level up, in retryStream, would
+// instead hold a slot through the exponential backoff - minutes of sleeping that
+// have nothing to do with the GPU and everything to do with starving the
+// sessions queued behind this one.
 func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (*stream, error) {
+	g := s.gate()
+	asked := time.Now()
+	release, err := g.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if waited := time.Since(asked); waited > time.Millisecond && s.OnGateWait != nil {
+		busy, waiting, limit := g.Stats()
+		s.OnGateWait(GateWait{Waited: waited, Busy: busy, Waiting: waiting, Limit: limit})
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.BaseURL+"/v1/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err

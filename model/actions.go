@@ -74,7 +74,12 @@ func optionalBool(v any) bool {
 // costs a turn to rediscover what the message already said. All of them arrive
 // concatenated in order through the FormatError template with the
 // {error, actions, has_tool_calls, finish_reason} context.
-func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx map[string]any) ([]Action, error) {
+//
+// `allowed` is the same ToolSet the request advertised, and it is a parameter
+// rather than a package-level list on purpose: the array and the acceptance check
+// are one decision made once, so a session can never be told about a tool it will
+// be refused for calling, nor quietly refused a tool it was never offered (§5.6).
+func parseToolCallActions(toolCalls []map[string]any, errTemplate string, allowed ToolSet, ctx map[string]any) ([]Action, error) {
 	if len(toolCalls) == 0 {
 		if fr, _ := ctx["finish_reason"].(string); fr == "stop" {
 			return nil, nil // a valid submission turn: no actions, no error
@@ -97,9 +102,10 @@ func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx ma
 		if name == "" {
 			name = ToolBash
 		}
-		switch name {
-		case ToolBash, ToolJobs, ToolJobKill:
-		default:
+		// Membership in the advertised set rather than a hardcoded list. The
+		// per-tool argument checks below stay keyed on name, because those are
+		// about what a given tool needs, not about what this session was offered.
+		if !allowed.accepts(name) {
 			errMsgs = append(errMsgs, fmt.Sprintf("Unknown tool '%s'.", name))
 		}
 		if name == ToolBash {

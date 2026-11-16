@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -116,12 +117,88 @@ func (s *Sushi) ServerContextWindow(ctx context.Context) (int, error) {
 	return s.matchModel(entries), nil
 }
 
+// windowEntry is one (base URL, model) answer in progress or already had.
+type windowEntry struct {
+	done   chan struct{}
+	window int
+}
+
+// windows is the process-wide cache of what servers have said about their
+// models, and the place where concurrent callers join one lookup instead of
+// each starting its own.
+//
+// A single-session mini asked one question per process and the redundancy was
+// invisible. Assembly is now callable N times (docs/parallel-sessions.md §7 step
+// 3), and each session asking GET /v1/models at startup is wasteful in the
+// ordinary case and actively bad in one specific one: the lookup bypasses the
+// request gate entirely (it is not a chat completion, so it never reaches
+// Sushi.attempt), so a fan-out of subagents would each fire an unbudgeted
+// request at a server that is already busy. The answer cannot change while the
+// process runs, because the thing being asked is which model the server loaded.
+//
+// The entry is created before the fetch and shared, so N simultaneous sessions
+// cost one request rather than N - crush's singleflight on the AWS SSO login
+// (coordinator.go:169-170) for the same reason: expensive startup work that
+// every session needs exactly once.
+var windows = struct {
+	mu sync.Mutex
+	m  map[string]*windowEntry
+}{m: map[string]*windowEntry{}}
+
+func (s *Sushi) windowKey() string { return s.BaseURL + "\x00" + s.Model }
+
+// cachedServerContextWindow is ServerContextWindow with the two properties
+// above. A failed lookup is NOT cached: a server that is still starting, or a
+// model that is not in its list yet, should be asked again by the next session
+// rather than have one early failure decide the whole process's window.
+func (s *Sushi) cachedServerContextWindow(ctx context.Context) (int, error) {
+	key := s.windowKey()
+
+	windows.mu.Lock()
+	if e, ok := windows.m[key]; ok {
+		windows.mu.Unlock()
+		select {
+		case <-e.done:
+			if e.window > 0 {
+				return e.window, nil
+			}
+			return 0, context.Canceled // fetcher failed; treated as "no opinion"
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	e := &windowEntry{done: make(chan struct{})}
+	windows.m[key] = e
+	windows.mu.Unlock()
+
+	window, err := s.ServerContextWindow(ctx)
+	windows.mu.Lock()
+	if err != nil {
+		// Forget it so a later caller retries, but still close the gate: anyone
+		// already waiting must not hang on a lookup that is finished.
+		delete(windows.m, key)
+	} else {
+		e.window = window
+	}
+	windows.mu.Unlock()
+	close(e.done)
+	return window, err
+}
+
+// resetWindowCache empties the startup cache. Test-only; a process wants the
+// answers it already paid for.
+func resetWindowCache() {
+	windows.mu.Lock()
+	windows.m = map[string]*windowEntry{}
+	windows.mu.Unlock()
+}
+
 // DiscoverContextWindow resolves the window the session runs against (the
 // chain documented at the top of this file), remembers it on the client for
 // Serialize and for the front ends, and returns it with its source. Call it
 // once, before the loop and the UI start reading either copy of the number.
 func (s *Sushi) DiscoverContextWindow(ctx context.Context, configured int) (int, string) {
-	server, err := s.ServerContextWindow(ctx)
+	server, err := s.cachedServerContextWindow(ctx)
 	if err != nil {
 		// A server that cannot be reached for its model list is still the
 		// server the run talks to; the query path reports that, not here.

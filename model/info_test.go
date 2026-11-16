@@ -315,3 +315,88 @@ func TestContextWindowNoteBeforeDiscovery(t *testing.T) {
 		t.Errorf("the trajectory invented a window: %v", got)
 	}
 }
+
+// TestContextWindowLookupIsSharedPerModel is the startup cache doing its job:
+// six sessions opening at once ask the server once. It matters beyond efficiency
+// - this lookup is a GET /v1/models, not a chat completion, so it never reaches
+// Sushi.attempt and is therefore not bounded by the request gate. Without the
+// cache, a subagent fan-out would fire N unbudgeted requests at a server that is
+// already busy (docs/parallel-sessions.md §7 step 3).
+func TestContextWindowLookupIsSharedPerModel(t *testing.T) {
+	resetWindowCache()
+	t.Cleanup(resetWindowCache)
+
+	s, _, seen := infoServer(t, "m", list(map[string]any{"id": "m", "context_length": 4096}))
+
+	const n = 6
+	results := make([]int, n)
+	sources := make([]string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// A separate client per session, same base URL and model: that is
+			// what opening a subagent looks like, and sharing one client would
+			// hide whether the cache works at all.
+			c := newSushi(t, s.BaseURL)
+			c.Model = "m"
+			results[i], sources[i] = c.DiscoverContextWindow(context.Background(), 262144)
+		}(i)
+	}
+	wg.Wait()
+
+	if got := seen.count("GET /v1/models"); got != 1 {
+		t.Errorf("the model list was fetched %d times, want 1", got)
+	}
+	for i := 0; i < n; i++ {
+		if results[i] != 4096 || sources[i] != ContextFromServer {
+			t.Errorf("session %d resolved %d/%q, want 4096/%q", i, results[i], sources[i], ContextFromServer)
+		}
+	}
+}
+
+// TestFailedContextWindowLookupIsNotCached keeps the cache from turning one
+// early miss into a permanent answer. "The server would not say" is a reason to
+// fall back for *this* session, not a fact about the model: the common case is a
+// server still loading when the first session starts, and a cached failure would
+// have every later session run against the configured window forever.
+func TestFailedContextWindowLookupIsNotCached(t *testing.T) {
+	resetWindowCache()
+	t.Cleanup(resetWindowCache)
+
+	var mu sync.Mutex
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"loading"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(list(map[string]any{"id": "m", "context_length": 8192}))
+	}))
+	defer srv.Close()
+
+	first := newSushi(t, srv.URL)
+	first.Model = "m"
+	if got, src := first.DiscoverContextWindow(context.Background(), 262144); got != 262144 || src != ContextFromConfig {
+		t.Fatalf("first lookup resolved %d/%q, want the configured fallback", got, src)
+	}
+
+	second := newSushi(t, srv.URL)
+	second.Model = "m"
+	got, src := second.DiscoverContextWindow(context.Background(), 262144)
+	if got != 8192 || src != ContextFromServer {
+		t.Errorf("second lookup resolved %d/%q, want 8192 from the server - a failed lookup was cached", got, src)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Errorf("server calls = %d, want 2", calls)
+	}
+}
