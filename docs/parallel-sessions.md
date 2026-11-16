@@ -1450,14 +1450,35 @@ not spawn", since a negation is still a mention), `session.Create` refuses a
 grandchild, and `Spawn` refuses from a non-top-level session. Three layers that
 agree cannot drift, which is the lesson §3.3 took from qwen.
 
-**One deferral, and it is a security one.** Confirmation bubbling - `ui.Question`'s
-origin field, and a child's prompts reaching the parent's human - is step 7's
-work, and shipping spawning without it would have quietly widened authority: a
-child runs with no `Hooks`, which means no prompts at all, so a `confirm`-mode
-parent that spawned one would hand a second agent more permission than the human
-granted the conversation. So `Spawn` refuses a parent that is neither yolo nor
-already unattended, naming the switch to make. `TestConfirmModeParentCannotSpawnYet`
-holds that, and skips itself the day the guard becomes obsolete.
+**One deferral, since retired.** Confirmation bubbling - `ui.Question`'s origin
+field, and a child's prompts reaching the parent's human - landed in the next
+commit, and it deleted the guard described here rather than weakening it. What
+this section shipped was `Spawn` refusing a parent that was neither yolo nor
+already unattended, because a child running with no `Hooks` meant no prompts at
+all, and a `confirm`-mode parent that spawned one handed a second agent more
+permission than the human had granted the conversation. That was the correct call
+against the code of the moment, and the guard's own test was written to skip
+itself the day it went stale - which is the day the follow-up landed, so the
+refusal went out with its test asserting the better behaviour instead.
+
+A child's `BeforeExecute` now forwards to its parent's hooks, so the human who
+gates the parent gates the child. Its name reaches that prompt through the loop's
+own template variables (`asker`), which `ui.Question.Origin` carries and both
+front ends render - attribution declared by the asker, exactly as §3.7 learned it
+must be, rather than derived from ids that cannot be compared across layers.
+Everything else a hook can be asked deliberately does **not** bubble: whether the
+run is over, whether its limits may rise, what the human would like typed next -
+those are questions about the conversation the parent's human is watching, and
+answering them for a child would have them deciding about a run they were never
+shown. A parent with no hooks spawns an unattended child whose prompts then
+*reject* rather than hang, which is omp's posture from §3.7 and the case the guard
+used to refuse outright.
+
+Three tests: the gate forwards with the right name attached while the parent's
+run-shaping hooks stay untouched; an unattended parent gives its child no route to
+a human who does not exist; and two queued asks do not arrive wearing each
+other's labels, which is the attribution failure that would be found by a human
+approving the wrong thing rather than by a suite.
 
 Agent jobs are exempt from `DefaultMaxJobs` at **both** cap sites - `Detach`'s row
 count and `register`'s live-handle count. The second one is the instructive bug:

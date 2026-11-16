@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -254,4 +255,50 @@ func TestGUIAskHonoursContextKeepsQueueUsable(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the queue was left unusable by a cancelled ask")
 	}
+}
+
+// TestDisplayTitleNamesTheAskingSession covers the attribution half of §5.5:
+// the queue makes one-asker-at-a-time well-defined, and this makes the one on
+// screen say whose it is. A prompt for a subagent's command that reads like the
+// human's own conversation is confirm mode with the safety removed and the
+// friction left in, so the origin is asserted on both paths rather than trusted.
+func TestDisplayTitleNamesTheAskingSession(t *testing.T) {
+	if got := displayTitle(Question{Title: "Execute 1 command?"}); got != "Execute 1 command?" {
+		t.Errorf("an unowned prompt was decorated: %q", got)
+	}
+	got := displayTitle(Question{Title: "Execute 1 command?", Origin: "quantise 70b"})
+	if !strings.Contains(got, "quantise 70b") || !strings.Contains(got, "Execute 1 command?") {
+		t.Errorf("the asking session is not named: %q", got)
+	}
+}
+
+// TestQueuedAsksKeepTheirOwnOrigin is the two mechanisms working together: a
+// queued question must not arrive wearing the previous one's label, which is the
+// concrete way this whole seam could hand a human the wrong attribution.
+func TestQueuedAsksKeepTheirOwnOrigin(t *testing.T) {
+	q := newTestQueue(t)
+	g := NewGUI(GUIOptions{App: test.NewApp(), Post: q.add})
+	attachPane(g, q)
+
+	first := make(chan Answer, 1)
+	second := make(chan Answer, 1)
+	go func() {
+		a, _ := g.Ask(context.Background(), Question{Kind: AskConfirm, Title: "one?", Origin: "alpha"})
+		first <- a
+	}()
+	waitFor(t, "the first question to publish", g.HasQuestion)
+	go func() {
+		a, _ := g.Ask(context.Background(), Question{Kind: AskConfirm, Title: "two?", Origin: "beta"})
+		second <- a
+	}()
+	waitFor(t, "the second caller to queue", func() bool { return g.asks.waiting() == 1 })
+
+	if got := g.PendingQuestion().Origin; got != "alpha" {
+		t.Fatalf("visible origin = %q, want alpha", got)
+	}
+	g.resolve(Answer{})
+	waitFor(t, "the second question to publish", func() bool { return g.PendingQuestion().Origin == "beta" })
+	g.resolve(Answer{})
+	<-first
+	<-second
 }

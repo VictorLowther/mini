@@ -29,6 +29,13 @@ type Question struct {
 	// write config.mode, so the mode a run started in is the mode the footer
 	// reports and the one the next turn obeys.
 	Cfg *agent.Config
+	// Origin names the session that is actually waiting, when it is not the one
+	// the human is looking at - a subagent's confirmation reaching its parent's
+	// front end (docs/parallel-sessions.md §5.5, decision 13). Empty means the
+	// conversation itself. Render it wherever the prompt is shown: a queue that
+	// can hold two askers makes an unattributed prompt the default rather than
+	// the exception.
+	Origin string
 	// Limits echoed back for the AskLimits prompt.
 	StepLimit int
 	CostLimit float64
@@ -49,6 +56,18 @@ type Answer struct {
 	NewLimits bool
 	Steps     int
 	Cost      float64
+}
+
+// displayTitle is the one line a prompt is introduced by, in both front ends.
+// When the question belongs to another session it says whose: the queue of §9.4
+// means a subagent's ask can be the only thing on screen while the human believes
+// they are watching their own conversation, and approving `rm -rf build/` under
+// that belief is confirm mode's safety property quietly voided (§5.5).
+func displayTitle(q Question) string {
+	if q.Origin == "" {
+		return q.Title
+	}
+	return "subagent " + q.Origin + " \u00b7 " + q.Title
 }
 
 // UI renders progress and asks questions. Reasoning and Content are called

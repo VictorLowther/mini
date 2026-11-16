@@ -1386,12 +1386,12 @@ func (v *guiView) showQuestion(q Question) {
 	v.dialog = ""
 	switch q.Kind {
 	case AskConfirm:
-		v.setPanel(plainRT(q.Title), monoBlock(panelActionLines(q.Actions)), dimRT(panelConfirmHint))
+		v.setPanel(plainRT(displayTitle(q)), monoBlock(panelActionLines(q.Actions)), dimRT(panelConfirmHint))
 	case AskLimits:
 		v.openDialog("limits")
 		return
 	default: // new-task, human, interruption, task
-		v.setPanel(plainRT(q.Title))
+		v.setPanel(plainRT(displayTitle(q)))
 	}
 	v.refreshStatus()
 }
@@ -1423,7 +1423,7 @@ func (v *guiView) openDialog(name string) {
 	switch name {
 	case "limits":
 		v.limitsLabel.SetText(limitLabelSteps)
-		v.setPanel(plainRT(v.gui.PendingQuestion().Title), v.limitsLabel)
+		v.setPanel(plainRT(displayTitle(v.gui.PendingQuestion())), v.limitsLabel)
 	}
 	v.focusEditor()
 }

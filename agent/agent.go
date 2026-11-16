@@ -180,6 +180,17 @@ type Loop struct {
 	// capability that is hidden from the array but discussed in the prose is a
 	// capability the model will try to use and be refused for.
 	Tools model.ToolSet
+	// Origin names this session to a human when a question about it is asked
+	// somewhere else. It is empty for a top-level session and the subagent's
+	// chosen name for a child, and it reaches prompts through TemplateVars as
+	// `asker` rather than through a new argument on Hooks, because the seam
+	// already carries the loop's own variables (decision 13).
+	//
+	// Carried rather than derived is the point: qwen's `subagentId` exists because
+	// ids from different layers cannot be compared to tell own work from nested,
+	// and a prompt that cannot say who is waiting is how a human approves a
+	// subagent's command believing it was their own (§5.5).
+	Origin string
 	// Spawner is the host seam the subagent tools need: the loop is not allowed
 	// to know what a session is, in the same way it is not allowed to know what
 	// a store is (Recorder) or what a terminal looks like (Hooks). nil means
@@ -952,6 +963,7 @@ func (l *Loop) TemplateVars(kwargs ...map[string]any) map[string]any {
 			"tool_list": l.tools().Listing(),
 			"has_jobs":  l.tools().Has(model.ToolJobs),
 			"has_agent": l.tools().Has(model.ToolAgent),
+			"asker":     l.Origin,
 			"subagent":  !l.tools().Has(model.ToolAgent),
 		},
 		l.extraVars,

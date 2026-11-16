@@ -251,7 +251,7 @@ func (p *Print) Ask(ctx context.Context, q Question) (Answer, error) {
 		return p.askLimits(ctx, q)
 	}
 	for {
-		fmt.Fprintf(p.Out, "\n%s\n%s", q.Title, promptLine())
+		fmt.Fprintf(p.Out, "\n%s\n%s", displayTitle(q), promptLine())
 		line, err := p.readLine(ctx)
 		if errors.Is(err, errNoInput) {
 			// Nobody is left to answer. The exit prompt no longer quits on an
@@ -297,7 +297,7 @@ func (p *Print) answerFor(q Question, text string) (Answer, error) {
 }
 
 func (p *Print) askLimits(ctx context.Context, q Question) (Answer, error) {
-	fmt.Fprint(p.Out, "\n"+q.Title)
+	fmt.Fprint(p.Out, "\n"+displayTitle(q))
 	stepsText, err := p.readLine(ctx)
 	if err != nil {
 		return Answer{}, err

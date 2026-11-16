@@ -47,7 +47,7 @@ func (h *Interactive) shouldAskConfirmation(command string) bool {
 }
 
 // BeforeExecute implements the confirm mode.
-func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action, _ map[string]any) error {
+func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action, tvars map[string]any) error {
 	ask := false
 	for _, a := range actions {
 		// The job tools never reach the prompt: reading the registry asks
@@ -67,6 +67,11 @@ func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action,
 		Title:   confirmationTitle(len(actions)),
 		Actions: actions,
 		Cfg:     h.Cfg,
+		// Whose commands these are. The child's loop puts its own name in the
+		// template variables it hands to BeforeExecute, so the label travels
+		// with the request instead of being looked up from an id that cannot be
+		// compared across layers (decision 13).
+		Origin: askerOf(tvars),
 	})
 	if err != nil {
 		return err
@@ -186,4 +191,18 @@ func ParseLimitLine(s string) float64 {
 		return 0
 	}
 	return v
+}
+
+// askerOf pulls the origin label out of a loop's template variables. The loop
+// owns that map, so the seam that already carries the prompt context carries the
+// attribution too, rather than Hooks growing a parameter every implementation
+// would have to reason about.
+func askerOf(tvars map[string]any) string {
+	if tvars == nil {
+		return ""
+	}
+	if s, ok := tvars["asker"].(string); ok {
+		return s
+	}
+	return ""
 }

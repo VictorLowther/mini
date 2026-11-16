@@ -36,19 +36,16 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 	if err := s.nameAvailable(req.Name); err != nil {
 		return agent.SpawnReply{}, err
 	}
-	// Authority never widens downward (§5.5), and until confirmations bubble to a
-	// parent's front end - step 7's work, needing ui.Question's origin field and a
-	// queue that can attribute a prompt - a child can only run with the
-	// unattendedness its parent already has. Spawning a no-Hooks session from a
-	// confirm-mode parent would hand the child more permission than the human
-	// granted the conversation that made it, and the widening would be invisible:
-	// the parent's human sees one delegation, and a second agent starts running
-	// shell commands nobody approved. Refusing names the reason; pretending would
-	// not.
-	if s.Cfg.Mode != "yolo" && !s.unattended {
-		return agent.SpawnReply{}, fmt.Errorf(
-			"cannot start a subagent from a %q session: a child answers to nobody, and confirmation bubbling to your human does not exist yet - run with /y to delegate deliberately", s.Cfg.Mode)
-	}
+	// A child's prompts reach the human who owns the parent, through the parent's
+	// own hooks - decision 13. Before that existed this refused outright rather
+	// than spawn an unattended child from a confirm-mode parent, because the
+	// widening was invisible; now the widening is impossible instead, since the
+	// only way a child gets past a confirmation is the same human approval that
+	// gates its parent. Where the parent has no hooks - a batch run, or a parent
+	// whose human already chose yolo - the child is unattended by inheritance and
+	// anything that would prompt rejects with a reason (§3.7, omp's posture)
+	// rather than waiting for a person who will never arrive.
+	// (Built just below, once the child exists to point at.)
 
 	child, err := s.proc.Open(Spec{
 		// A copy, never the parent's map: a child's config is constructed here,
@@ -79,6 +76,16 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 		_ = child.Close()
 		return agent.SpawnReply{}, err
 	}
+	// Wiring the child's own identity and its route to a person. Nothing has run
+	// yet at this point - the job below is what starts the loop - so these two
+	// assignments are race-free by ordering rather than by locking, and that is
+	// worth the comment because a later caller that opened a child and ran it
+	// somewhere else would break both silently.
+	child.Loop.Origin = req.Name
+	if parent := s.Loop.Hooks; parent != nil {
+		child.Loop.Hooks = &bubblingHooks{parent: parent, child: child, label: req.Name}
+	}
+
 	// The child's registry is what decides whether the child is done, so its
 	// quiet has to reach the wrapper - and a send that arrives later uses the
 	// same channel, which is why the wake lives on the session rather than on
@@ -331,3 +338,53 @@ func cloneConfig(m map[string]any) map[string]any {
 	}
 	return out
 }
+
+// bubblingHooks is a child session's route to a person. It forwards exactly one
+// thing - the gate that stands between a model and a command - to the parent's
+// hooks, and answers everything else the way an unattended session must.
+//
+// The asymmetry is deliberate. BeforeExecute is the one hook whose absence
+// silently widens authority, so it bubbles. The rest shape the *parent's* run:
+// asking whether that conversation is over, offering to raise its limits, or
+// taking human-mode commands from a child's turn would all be answering the wrong
+// question with somebody else's state. A child that hits its own limits ends, and
+// the reason reaches its parent as the report - which is a true statement about
+// the child rather than a prompt nobody meant to direct at the parent's human.
+type bubblingHooks struct {
+	parent agent.Hooks
+	child  *Session
+	label  string
+}
+
+func (b *bubblingHooks) BeforeExecute(ctx context.Context, actions []model.Action, tvars map[string]any) error {
+	// The child's own template variables carry its name as `asker`, so the
+	// attribution travels with the request and the parent's front end can say
+	// whose command this is (§5.5). Rebuilding them here would be wrong: the
+	// variables the loop passed in are the child's, which is the point.
+	if tvars == nil {
+		tvars = b.child.Loop.TemplateVars()
+	}
+	return b.parent.BeforeExecute(ctx, actions, tvars)
+}
+
+// OnSubmit ends the child's run: there is no "keep going?" for a conversation
+// whose human is somebody else's.
+func (b *bubblingHooks) OnSubmit(context.Context, model.Message) error { return nil }
+
+// OnLimits does not offer the parent's human a chance to raise a child's budget.
+// Returning the pending interrupt ends the child with its limits named, and that
+// is the report the parent gets.
+func (b *bubblingHooks) OnLimits(_ context.Context, _ *agent.Config, pending *model.Interrupt) error {
+	return pending
+}
+
+func (b *bubblingHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
+
+// OnMessage is ignored: a child's turn-by-turn printing belongs to the roster of
+// step 7, not to the parent's transcript, where it would read as the parent
+// talking to itself.
+func (b *bubblingHooks) OnMessage(model.Message) {}
+
+// OnInterrupt records the interruption in the child's own history through the
+// loop's default, which is nil here - the parent's human pressed nothing.
+func (b *bubblingHooks) OnInterrupt(context.Context) error { return nil }

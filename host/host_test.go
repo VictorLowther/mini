@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -715,46 +716,144 @@ func TestAgentJobsAreExemptFromTheProcessCap(t *testing.T) {
 	}
 }
 
-// TestConfirmModeParentCannotSpawnYet is §5.5 enforced rather than assumed. A
-// child runs with no Hooks, which means no prompts and no confirmations at all;
-// creating one from a session whose human approves every command would hand the
-// child more authority than that human granted, silently, one level down. Until
-// step 7 gives a parent a way to answer on its child's behalf, the honest answer
-// is no - and a refusal that names the switch to make is worth more than a
-// permission that quietly widened.
-func TestConfirmModeParentCannotSpawnYet(t *testing.T) {
+// TestSubagentPromptsBubbleToTheParentsHuman is decision 13 in one test, and it
+// replaces the guard that used to refuse this outright. A confirm-mode parent can
+// now spawn, because the child's gate forwards to the same human who gates the
+// parent - so there is no invisible widening left to refuse. What the child must
+// NOT get is the parent's other hooks: those ask about the parent's run, and
+// answering them on a child's behalf would be the parent's human making decisions
+// about a conversation they were not shown.
+func TestSubagentPromptsBubbleToTheParentsHuman(t *testing.T) {
 	p, base := newProcess(t)
 	merged := testConfig(t)
-	if mode := config.Sub(merged, "agent")["mode"]; mode == "yolo" {
-		t.Skip("the shipped config no longer defaults to confirm; the guard has nothing to refuse")
-	}
-	parent, err := p.Open(Spec{Config: merged, Workdir: base, Project: base, Model: scripted(0)})
+	parentHooks := &recordingHooks{}
+	parent, err := p.Open(Spec{
+		Config: merged, Workdir: base, Project: base, Model: scripted(0), Hooks: parentHooks,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if parent.Cfg.Mode == "yolo" {
-		t.Skip("this session was built yolo anyway")
+		t.Skip("the shipped config no longer defaults to confirm; nothing to bubble")
 	}
-	_, err = parent.Spawn(context.Background(), agent.SpawnRequest{Name: "helper", Prompt: "do it"})
-	if err == nil {
-		t.Fatal("a confirm-mode parent spawned an unattended child")
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("child report")}}
 	}
-	for _, want := range []string{"cannot start a subagent", "confirm", "/y"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal %q does not name %q", err, want)
-		}
-	}
-	// A subagent may still spawn nothing at all, however it was created - the
-	// two-level rule does not depend on the mode guard.
-	child, err := p.Open(Spec{Config: merged, Workdir: base, Kind: session.KindSubagent,
-		ParentID: parent.ID.String(), Name: "leaf", Model: scripted(1)})
+
+	child, err := p.Open(Spec{
+		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
+		Name: "quantise 70b", Model: scripted(1),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := child.Spawn(context.Background(), agent.SpawnRequest{Name: "g", Prompt: "p"}); err == nil {
-		t.Error("a subagent spawned a grandchild")
+	// Spawn wires the route; opening directly (as above) does not, because the
+	// child the human never delegated has no gate to inherit yet.
+	if _, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "worker", Prompt: "go"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = child
+
+	spawned := p.Children(parent.ID)
+	var kid *Session
+	for _, c := range spawned {
+		if c.Name == "worker" {
+			kid = c
+		}
+	}
+	if kid == nil {
+		t.Fatal("the spawned child is not in the parent's live set")
+	}
+	if kid.Loop.Hooks == nil {
+		t.Fatal("a spawned child has no route to a human; it would run unattended")
+	}
+	if kid.Loop.Origin != "worker" {
+		t.Errorf("child origin = %q, want the name its parent gave it", kid.Loop.Origin)
+	}
+
+	// The gate reaches the parent's human, carrying the child's attribution.
+	tv := kid.Loop.TemplateVars()
+	if got := fmt.Sprint(tv["asker"]); got != "worker" {
+		t.Errorf("the child's prompt variables carry asker=%q, want its name", got)
+	}
+	if err := kid.Loop.Hooks.BeforeExecute(context.Background(), []model.Action{{Command: "rm -rf build/"}}, tv); err != nil {
+		t.Fatalf("BeforeExecute: %v", err)
+	}
+	if parentHooks.before != 1 {
+		t.Fatalf("parent hooks saw %d BeforeExecute calls, want 1", parentHooks.before)
+	}
+	if parentHooks.lastAsker != "worker" {
+		t.Errorf("the parent was asked about a command whose asker was %q, want \"worker\" - an unattributed prompt is the §5.5 failure", parentHooks.lastAsker)
+	}
+
+	// The parent's run-shaping hooks are not reachable from a child: a limits
+	// offer would raise the wrong budget, and a submit prompt would end the wrong
+	// conversation.
+	pending := &model.Interrupt{Kind: model.KindLimitsExceeded}
+	if err := kid.Loop.Hooks.OnLimits(context.Background(), kid.Cfg, pending); !errors.Is(err, pending) {
+		t.Errorf("OnLimits returned %v, want the child's own pending interrupt", err)
+	}
+	if err := kid.Loop.Hooks.OnSubmit(context.Background(), model.Message{}); err != nil {
+		t.Errorf("OnSubmit returned %v, want nil: a child ends when it ends", err)
+	}
+	if parentHooks.limits != 0 || parentHooks.submits != 0 {
+		t.Errorf("the parent's human was asked about the child's run: limits=%d submits=%d", parentHooks.limits, parentHooks.submits)
 	}
 }
+
+// TestUnattendedParentSpawnsUnattendedChild is the other half of decision 13:
+// with no human behind the parent there is nobody to bubble to, so the child
+// inherits the unattendedness - which means its prompts reject through the
+// loop's normal no-hooks path rather than hanging waiting for a person who will
+// never arrive.
+func TestUnattendedParentSpawnsUnattendedChild(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("child report")}}
+	}
+	if parent.Loop.Hooks != nil {
+		t.Fatal("this test assumes a hookless parent")
+	}
+	if _, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "solo", Prompt: "go"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range p.Children(parent.ID) {
+		if c.Name == "solo" && c.Loop.Hooks != nil {
+			t.Error("a child was given a route to a human that does not exist")
+		}
+	}
+}
+
+// recordingHooks is a parent's stand-in front end: it records what a child asks
+// on the parent's behalf and approves everything, so the routing is what is
+// under test rather than the answer.
+type recordingHooks struct {
+	before    int
+	submits   int
+	limits    int
+	lastAsker string
+}
+
+func (h *recordingHooks) BeforeExecute(_ context.Context, _ []model.Action, tvars map[string]any) error {
+	h.before++
+	if s, ok := tvars["asker"].(string); ok {
+		h.lastAsker = s
+	}
+	return nil
+}
+func (h *recordingHooks) OnSubmit(context.Context, model.Message) error { h.submits++; return nil }
+func (h *recordingHooks) OnLimits(context.Context, *agent.Config, *model.Interrupt) error {
+	h.limits++
+	return nil
+}
+func (h *recordingHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
+func (h *recordingHooks) OnMessage(model.Message)                         {}
+func (h *recordingHooks) OnInterrupt(context.Context) error               { return nil }
 
 func spawnTurn(name, prompt string) model.Message {
 	return model.Message{"role": "assistant", "content": "delegating", "extra": map[string]any{
