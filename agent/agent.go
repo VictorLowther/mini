@@ -435,6 +435,104 @@ func (l *Loop) killObservation(action model.Action, sink io.Writer) env.Result {
 	return env.Result{ReturnCode: code}
 }
 
+// waitObservation answers job_wait: block until one of the session's jobs ends,
+// then say which and how. A wait that finds nothing running answers immediately,
+// because "there was nothing to wait for" is a fact the model needs now, not a
+// timeout to sit through.
+func (l *Loop) waitObservation(ctx context.Context, sink io.Writer) (env.Result, bool, error) {
+	if l.Jobs == nil {
+		return noRegistryResult(), false, nil
+	}
+	row, ok, err := l.Jobs.WaitAny(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			// The human stopped waiting. Every run is untouched, and that has
+			// to be true: a cancelled wait that read as a killed job would be
+			// the worst possible lie this tool could tell.
+			return env.Result{}, false, err
+		}
+		return env.Result{ReturnCode: 1, ExceptionInfo: err.Error()}, false, nil
+	}
+
+	var b strings.Builder
+	if !ok {
+		b.WriteString("no background jobs are running in this session, so there was nothing to wait for.\n")
+		if list, lerr := l.Jobs.List(); lerr == nil && len(list) > 0 {
+			last, ago := lastJobSummary(list)
+			fmt.Fprintf(&b, "%d job(s) have ended here; the most recent is %s (%s, %s).\n",
+				len(list), last, ago, jobStateOf(list))
+		} else {
+			b.WriteString("No job has been started in this session yet: a command that outlives its wait, or one run with background: true, appears here.\n")
+		}
+		if sink != nil {
+			_, _ = io.WriteString(sink, b.String())
+		}
+		return env.Result{ReturnCode: 0}, false, nil
+	}
+
+	describeEndedJob(&b, row)
+	if still := l.Jobs.StillRunning(); still > 0 {
+		fmt.Fprintf(&b, "%d other job(s) still running; call jobs to list them, job_wait to wait again.\n", still)
+	}
+	if sink != nil {
+		_, _ = io.WriteString(sink, b.String())
+	}
+	// The wait's own outcome is success even when the job it reported failed:
+	// the job's exit code belongs to the job, and conflating them would make a
+	// correctly-reported failure look like the tool call misbehaving.
+	return env.Result{ReturnCode: 0}, false, nil
+}
+
+// describeEndedJob is the salient detail set: what it was, how it ended, how long
+// it ran, and where its bytes are - the four things needed to decide the next
+// move without another call. The monitor wakes will reuse it verbatim, which is
+// why it is a function and not a few lines inside the wait.
+func describeEndedJob(b *strings.Builder, j *session.JobRow) {
+	fmt.Fprintf(b, "job %s ended: %s after %s", j.ID, j.State, jobAge(*j))
+	switch {
+	case j.ExitCode != nil && *j.ExitCode != 0:
+		fmt.Fprintf(b, " (exit %d)", *j.ExitCode)
+	case j.ExitCode != nil:
+		b.WriteString(" (exit 0)")
+	case j.State == session.JobKilled:
+		b.WriteString(" (killed; no exit code - the run was interrupted, not finished)")
+	}
+	if j.ExitReason != "" && j.ExitReason != "killed on request" {
+		fmt.Fprintf(b, "\n  reason=%s", oneLine(j.ExitReason, 120))
+	}
+	if j.Label != "" {
+		fmt.Fprintf(b, "\n  label=%s", j.Label)
+	}
+	if j.Command != "" {
+		fmt.Fprintf(b, "\n  cmd=%s", oneLine(j.Command, 200))
+	}
+	fmt.Fprintf(b, "\n  out=%s", j.OutputPath)
+	if size, age, ok := jobFileStat(j.OutputPath); ok {
+		fmt.Fprintf(b, "  (%s, last write %s)", size, age)
+	}
+	fmt.Fprintf(b, "\n  read it with: tail -n %d %s   (or grep -n PATTERN %s)\n",
+		model.MaxViewLines, j.OutputPath, j.OutputPath)
+}
+
+// lastJobSummary picks out the most recent ended job for the "nothing is
+// running" answer, so a model that waited after its job finished learns the
+// difference between "already done" and "never started".
+func lastJobSummary(list []session.JobRow) (id, ago string) {
+	if len(list) == 0 {
+		return "-", "unknown"
+	}
+	first := list[0]
+	ago = jobAge(first)
+	return first.ID, ago
+}
+
+func jobStateOf(list []session.JobRow) string {
+	if len(list) == 0 {
+		return "none"
+	}
+	return list[0].State
+}
+
 // jobWhy is the answer to "why is this still here". For a live run the manager
 // knows whether the model backgrounded it or it outran its budget; for one that
 // has already ended, or an orphan from before a restart, the row's own reason is
@@ -1055,6 +1153,8 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 			res = l.jobsObservation(action, sink)
 		case model.ToolJobKill:
 			res = l.killObservation(action, sink)
+		case model.ToolJobWait:
+			res, detached, err = l.waitObservation(ctx, sink)
 		default:
 			res, detached, err = l.runCommand(ctx, action, tc, sink)
 		}

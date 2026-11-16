@@ -98,7 +98,7 @@ func parseToolCallActions(toolCalls []map[string]any, errTemplate string, ctx ma
 			name = ToolBash
 		}
 		switch name {
-		case ToolBash, ToolJobs, ToolJobKill:
+		case ToolBash, ToolJobs, ToolJobKill, ToolJobWait:
 		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("Unknown tool '%s'.", name))
 		}

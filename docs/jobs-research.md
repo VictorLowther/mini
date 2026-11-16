@@ -419,7 +419,7 @@ they are.
 | Status is asserted, never inferred from output (status file or DB column) | qwen `statusFilePathFor` + the block-buffering guidance | ~30 | **Yes, and now load-bearing.** With monitors as the push mechanism (§4), a block-buffered program whose output file is empty looks identical to a stalled one — the exit rule still fires, but `match` silently never does. sushi-box commands are exactly the block-buffering kind, so `-u`/`stdbuf -oL` belongs in the tool description. |
 | Bounded wake/read payloads: digest + "last N of M lines" + pointer to the pull tool | little-coder `formatWakePayload`, qwen 8 192-byte tail | ~40 | **Yes.** Without it, a jobs feature undoes the context economy mini just bought with compaction. mini's sizes are already fixed by the observation window (`model/view.go:16-19`: 100 lines / 10 000 characters), so the digest budget is "comfortably under one window", not a new constant invented from nothing — and it is the reason there is no read tool to bound (§4). |
 | Registry that survives restart, with "reloaded as running ⇒ error + warning" | zero `manager.go:475`, `LoadWarnings` | ~120 | **Yes.** mini already has SQLite. "One migration" was too glib: the schema has no version tracking at all yet (`session/store.go:26-28`, deferred until the first breaking change), so a `jobs` table is one more `CREATE TABLE IF NOT EXISTS` in the same const and the ownership sweep must be Go code run at `session.Open` (`session/store.go:94`), not SQL. The ownership rule is what keeps it honest. |
-| `wait`/`block` with deadline that returns latest output instead of failing | crush `job_output`, zero `blockOnOutput` | ~25 | **Yes, promoted to `job_wait`.** Cheapest possible "sleep" primitive, and it never loses the run. §4 decision 5 generalises it from "wait on one job" to "wait on the first *monitor* across a set" — the crush/zero rule that a deadline answers with state rather than an error is what makes that safe to call in a loop-free way. |
+| `wait`/`block` with deadline that returns latest output instead of failing | crush `job_output`, zero `blockOnOutput` | ~25 | **Yes, as `job_wait` - and stripped of the parameters.** Cheapest possible "sleep" primitive, and it never loses the run. mini's version waits on *any* event rather than a named id, and has no timeout: the crush/zero lesson is kept (waiting is normal and answers with facts) while the dial is dropped, because both a target list and a deadline are things the model would have to carry in context to use correctly. |
 | Job cap with an actionable refusal | little-coder `MAX_JOBS = 8`, crush `Start(..., maxJobs)` + `prune()` | ~10 | **Yes.** Local GPU: two `torch` runs are already one too many. |
 | Kill the *group*, with PID-reuse and failed-signal handling | zero `killTarget`/`isRunningPID`/`restoreRunningAfterFailedKill`, little-coder `kill -TERM 0` | ~80 | **Yes.** mini already signals `-pgid`; it has nothing for PID reuse. |
 | Wake-on-event (exit/match/silence) delivered as a queued message | little-coder `wake_on`, `MIN_WAKE_INTERVAL_MS` | ~200 | **Yes — promoted from "second phase" to the core of the design.** §4 decision 4 makes it one always-armed exit rule plus model-managed text matches on a per-job monitor, rather than a launch-time `wake_on` argument, because the model only learns that `val_loss=nan` matters forty minutes into a run. mini's `Loop.QueueMessage` (`agent/agent.go:213`) is already the delivery lane; the throttle is a mandatory companion, the silence rule is deferred. |
@@ -472,8 +472,12 @@ rather than the decision.
    learns that `val_loss=nan` was worth interrupting for, and by then it must be
    able to arm that rule without restarting the job.
 5. **[settled] The model can wait for monitors; the first to fire wins.** The
-   report is causal, not just "done": which job, which rule, whether the job
-   exited and with what status, and for a text match the **line number** plus
+   tool takes **no arguments at all** - not a job id, not a timeout - because
+   asking which job to wait for is asking the model to remember what the registry
+   already knows, and asking how long to wait reintroduces the deadline this
+   design deleted. Nothing running and nothing owed is an immediate answer, not a
+   timeout. The report is causal, not just "done": which job, which rule, whether
+   the job exited and with what status, and for a text match the **line number** plus
    the matched text.
 6. **[settled] When the model is not waiting, firings batch up** and are
    injected at the next point the harness can append to the conversation — the
@@ -550,7 +554,7 @@ kill, none surviving.
 | `bash` *(modified)* | `command`, **`background`** (bool, default false), **`timeout_s`** (int, optional, **unbounded above**) | `timeout_s` bounds the *foreground wait*, not the command's life. Description states the 30 s handoff, says an unbounded command is fine, and warns about buffering (below). |
 | `jobs` | none, or `id` | ✅ built.  id, kind, state, exit code and reason, elapsed, label/command, **`output_path`, the log's current size and the age of its last write** (not a line count: that is a full scan per listing over logs that are routinely hundreds of megabytes, and `wc -l` on the path is exact and only ever run on the one job being asked about), armed monitor rules, **why it is still around**, and how long since last output. Parent shown as an indent so a subagent tree reads as a tree. The listing is where liveness and location come from; `bash` is how the bytes get read. |
 | `job_monitor` | `id`, `add` (patterns), `remove` (patterns), `list` | Add/remove/list text-match rules. `mode` picks `literal` or `regex` (default literal), `every_n_matches` throttle, per-rule min interval. Exit rule is not addressable — it cannot be removed. |
-| `job_wait` | `ids` (list or `all`), `timeout_ms` (optional, default 30 000, unbounded above) | Blocks until the **first** monitor across the set fires; returns *state of the set* on deadline, never an error. |
+| `job_wait` | **none** | ✅ built. Waits until any job of the session ends, or - once monitors exist - any monitor fires; reports which one and why. No ids, no timeout: the model is not asked to keep a list of its own background work in context to be told when any of it finished. Answers immediately when nothing is running or owed. |
 | `job_kill` | `id`, or `all` | Cancels the run's context, which is what ends *every* external command it started; env then does SIGINT → `KillGrace` → SIGKILL per command group. Never prompts, including `all`. An orphaned row from before a restart reports that it is not this process's to signal rather than guessing at a pid. |
 
 Two rules about the parameters that are easy to get wrong later:
@@ -560,9 +564,16 @@ Two rules about the parameters that are easy to get wrong later:
   handle, and a pattern is already unique within one monitor.
 - **The 30 s handoff in decision 3 is a property of running commands, not of
   tool calls.** `job_wait` must not be auto-backgrounded, or waiting on jobs
-  would background a wait on jobs. It gets its own `timeout_ms`, whose default
-  is the same 30 s so the rhythm the model learns is one number: *roughly half a
-  minute, then you are back in control with a pointer to more.*
+  would background a wait on jobs. It is the one tool with no deadline of its own
+  either: it ends when an event ends it, or when the human interrupts the turn,
+  and `TestInterruptedWaitLeavesEveryJobAlone` pins the half of that which
+  matters most - a cancelled wait must never look like a killed job, because a
+  model that believed the wait killed its own training run would start another.
+  The cost is deliberate and worth stating: a wait on a job that never ends holds
+  the turn open until someone intervenes. That is the correct trade on a box where
+  the interesting job is *supposed* to run for hours, and it is the same trade
+  decision 2 made about deadlines - the harness does not get to decide when a run
+  has taken long enough.
 
 ### Why there is no `job_output` tool
 
@@ -975,8 +986,20 @@ its cost.
    `job_monitor` add/remove/list, the new-bytes scan, the throttles, and the
    **batch queue drained at the tool-loop boundary** as one appended message
    (decision 6). Push before wait: this is what saves turns.
-4. **`job_wait`.** First-fire-wins over a set, deadline answers with state
-   (decision 5), and the at-most-once split against the batch queue.
+4. ✅ **`job_wait`.** Built, ahead of monitors: it waits on the **firing queue**
+   rather than a set of handles, so exits already land there (`recordExit` writes
+   a firing for every terminal state) and the monitor engine only has to append
+   match firings to the same queue for "any job ends, or any monitor fires" to
+   become true with no change to the wait, the tool, or the description the model
+   reads. Delivery is a claim - oldest undelivered firing, marked delivered in the
+   same step - which is what makes the at-most-once rule shared with the batch
+   injector a property of the queue instead of a protocol between two callers.
+
+   Building it first also caught a semantics bug no amount of reading would: a
+   wait built on *live handles* reports "nothing to wait for" for a job that
+   finished while the model was busy elsewhere, then blocks on the next run
+   instead of reporting the event it exists to report. Watching the queue makes an
+   unseen ending wake the wait immediately, and exactly once.
 5. **GUI.** Footer count off `Snapshot`/`runStatsText` (`agent/agent.go:253`,
    `ui/blocks.go:126`) — `2 jobs` is the whole change — then a job card carrying
    the digest a wake produced.
@@ -1017,6 +1040,11 @@ Step 1 is in the tree:
     not complete, it handed off, and the store already models an unfinished call
     (that is the cancellation case). Closing the row with a return code nobody
     measured would put a number in the ledger that the job later contradicts.
+  - ✅ `job_wait` - no arguments, waits on the firing queue, wakes on the first
+    ending (and, once monitors exist, the first firing), and answers at once when
+    there is nothing running and nothing owed. `job_events` is therefore not a
+    monitor-only table: every terminal state writes a row, which is what lets a
+    wait be correct about events it did not witness.
   - `bash` also gained `description`, a few words from the model that becomes the
     job's label - the thing `jobs` prints and a wake will quote, which is what
     turns "j3" into "quantise 70b" in anything read later.

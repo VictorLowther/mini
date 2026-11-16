@@ -453,3 +453,119 @@ func TestJobKillReportsWhatItCouldNotDo(t *testing.T) {
 		t.Errorf("observation = %q, want the honest refusal", got)
 	}
 }
+
+// job_wait takes no arguments and wakes on whichever of the session's jobs ends
+// first - the model is not asked to hold a list of its own background work in
+// context to be told when any of it finished.
+func TestJobWaitWakesOnTheFirstJobToEnd(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("start the long one", model.Action{Command: "sleep 40", Background: true, Description: "long"}),
+		turnActions("start the short one", model.Action{Command: "sleep 1; echo finished-fast", Background: true, Description: "short"}),
+		turnActions("block until one ends", model.Action{Tool: model.ToolJobWait}),
+		done("submitted"),
+	}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+
+	start := time.Now()
+	if _, err := run(t, l, "run two soaks and wait for either"); err != nil {
+		t.Fatal(err)
+	}
+	// It woke on the 1-second job, not the 40-second one, and it did not sit
+	// through the slow one to prove a point.
+	if d := time.Since(start); d > 25*time.Second {
+		t.Errorf("the wait took %v; it should have woken on the fast job", d)
+	}
+
+	obs := observations(l)
+	if len(obs) != 3 {
+		t.Fatalf("observations = %d", len(obs))
+	}
+	woke := obs[2]
+	for _, want := range []string{"job j2 ended: completed", "exit 0", "label=short",
+		"finished-fast", "read it with: tail -n 100", "1 other job(s) still running"} {
+		if !strings.Contains(woke, want) {
+			t.Errorf("wait report missing %q:\n%s", want, woke)
+		}
+	}
+	if !strings.Contains(woke, "after 1") {
+		t.Errorf("the report should say how long it ran:\n%s", woke)
+	}
+	// The job that did not end is untouched, and still listed as running.
+	list, err := jm.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("registry = %+v", list)
+	}
+	for _, j := range list {
+		if j.ID == "j1" && j.State != session.JobRunning {
+			t.Errorf("the unwaited-for job ended too: %+v", j)
+		}
+		if j.ID == "j2" && j.State != session.JobCompleted {
+			t.Errorf("j2 = %s", j.State)
+		}
+	}
+}
+
+// Nothing to wait for is an answer, delivered now - not a timeout to sit
+// through, and not an error to retry.
+func TestJobWaitWithNoJobsAnswersImmediately(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("wait for nothing", model.Action{Tool: model.ToolJobWait}),
+		done("submitted"),
+	}}
+	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	start := time.Now()
+	if _, err := run(t, l, "wait"); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("an empty wait blocked for %v", d)
+	}
+	woke := lastObservation(l)
+	for _, want := range []string{"no background jobs are running", "No job has been started in this session yet"} {
+		if !strings.Contains(woke, want) {
+			t.Errorf("empty-wait report missing %q:\n%s", want, woke)
+		}
+	}
+	// Success, because the tool did exactly what it was asked.
+	if strings.Contains(woke, "<returncode>1") || strings.Contains(woke, "-1") {
+		t.Errorf("an empty wait should not read as a failure:\n%s", woke)
+	}
+}
+
+// A job that finished while the model was busy elsewhere must still be there when
+// it asks. This is the case a wait built on live handles gets wrong: the job is
+// gone from the running set, so the wait blocks on the next one instead of
+// reporting the event it exists to report.
+func TestJobWaitReportsAnEndingNobodySaw(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("quick background job", model.Action{Command: "echo bye", Background: true}),
+		// An ordinary foreground turn passes while the job ends.
+		turnActions("busy elsewhere", model.Action{Command: "echo working", TimeoutS: 5}),
+		turnActions("now wait", model.Action{Tool: model.ToolJobWait}),
+		done("submitted"),
+	}}
+	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	if _, err := run(t, l, "start a quick job, do other work, then wait"); err != nil {
+		t.Fatal(err)
+	}
+	obs := observations(l)
+	if len(obs) != 3 {
+		t.Fatalf("observations = %d", len(obs))
+	}
+	if !strings.Contains(obs[2], "job j1 ended: completed") {
+		t.Errorf("the missed ending was not reported:\n%s", obs[2])
+	}
+	// And it is reported once: the next wait has nothing owed to it.
+	m2 := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("wait again", model.Action{Tool: model.ToolJobWait}),
+		done("submitted"),
+	}}
+	l2, jm2, _ := newJobLoop(t, m2, &env.Local{Timeout: 5 * time.Second})
+	l2.Jobs = jm2
+	if _, err := run(t, l2, "wait again"); err != nil {
+		t.Fatal(err)
+	}
+}

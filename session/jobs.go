@@ -242,6 +242,28 @@ RETURNING `+jobColumns,
 	return &row, nil
 }
 
+// RunningJobIDs is the set a wait has to watch: the ids this session believes
+// are still burning. It comes from the store rather than the live handles
+// because the store is the source of truth for liveness, and a wait that asked
+// memory could hang on a job whose row already says otherwise.
+func (s *Session) RunningJobIDs() ([]string, error) {
+	rows, err := s.store.db.Query(`SELECT id FROM jobs WHERE session_id = ? AND state = 'running'`,
+		s.ID.String())
+	if err != nil {
+		return nil, fmt.Errorf("session store: running jobs: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("session store: running jobs: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // SetJobProcess records the pid after the spawn succeeds, which is why the row
 // is created first: a job that never started must still be reportable.
 func (s *Session) SetJobProcess(id string, pid, pgid int) error {

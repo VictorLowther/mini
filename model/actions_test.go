@@ -158,6 +158,17 @@ func TestParseJobToolCalls(t *testing.T) {
 	} else if !strings.Contains(rejectionText(t, err), "job_kill needs an 'id'") {
 		t.Errorf("rejection text = %q", rejectionText(t, err))
 	}
+
+	// job_wait takes nothing at all, so `{}` is the whole call - and an id a
+	// model passes anyway is ignored rather than made into an error, since the
+	// semantics are "any job" whatever the model thought it was narrowing.
+	a, err = parse("job_wait", `{}`)
+	if err != nil || a.ToolName() != ToolJobWait {
+		t.Errorf("action = %+v, %v", a, err)
+	}
+	if a, err = parse("job_wait", `{"id":"j1","timeout_ms":5}`); err != nil || a.ToolName() != ToolJobWait {
+		t.Errorf("job_wait rejected stray arguments: %+v, %v", a, err)
+	}
 }
 
 // rejectionText pulls the message the model would actually read out of a format
@@ -183,6 +194,7 @@ func TestNeedsConfirmationIsOnlyAboutStartingWork(t *testing.T) {
 		{ToolBash, true},     // starts work
 		{ToolJobs, false},    // reads a table
 		{ToolJobKill, false}, // ends work already permitted
+		{ToolJobWait, false}, // reads the registry, blocking on nothing dangerous
 	}
 	for _, c := range cases {
 		a := Action{Tool: c.tool, Command: "anything"}

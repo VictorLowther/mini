@@ -295,11 +295,37 @@ func classify(res env.Result, err error) outcome {
 // keeps the two racing writers ordered.
 func (m *Manager) recordEndLocked(r *Run, oc outcome) *session.JobRow {
 	row, err := m.Session.FinishJob(r.id, oc.state, oc.code, oc.reason)
-	if err != nil && !errors.Is(err, session.ErrUnknownJob) {
-		m.logger().Error("job: could not record outcome", "id", r.id, "err", err)
+	if err != nil {
+		if !errors.Is(err, session.ErrUnknownJob) {
+			m.logger().Error("job: could not record outcome", "id", r.id, "err", err)
+		}
 		return nil
 	}
+	m.recordExit(row)
 	return row
+}
+
+// recordExit turns a terminal state into a firing. This is what makes a wait
+// correct rather than merely fast: a job that ended while the model was doing
+// something else has to still be waiting there when the model asks, because the
+// alternative is a job_wait that ignores the one event it was asked to watch and
+// blocks on a run that may never finish. That bug was found by a test, not by
+// reading.
+//
+// The row is also the queue the batched wake will drain at the tool-loop
+// boundary, so nothing here needs a callback registry, and a delivery is a
+// timestamp rather than the disappearance of an event.
+func (m *Manager) recordExit(row *session.JobRow) {
+	elapsed := row.StartedAt
+	if row.EndedAt != nil {
+		elapsed = *row.EndedAt - row.StartedAt
+	}
+	if _, err := m.Session.RecordJobEvent(session.JobEventRow{
+		JobID: row.ID, MonitorID: "exit", Reason: row.State, Elapsed: elapsed,
+		ExitCode: row.ExitCode, FiredAt: *row.EndedAt,
+	}); err != nil {
+		m.logger().Error("job: could not record the exit firing", "id", row.ID, "err", err)
+	}
 }
 
 func logEnd(m *Manager, row *session.JobRow, id string, oc outcome) {
