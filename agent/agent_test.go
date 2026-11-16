@@ -139,58 +139,6 @@ func roles(msgs []model.Message) string {
 	return strings.Join(out, ",")
 }
 
-func TestStepLimit(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("First command", "echo 'step1'"),
-		turn("Second command", "echo 'step2'"),
-	}}
-	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.StepLimit = 1 })
-	info, _ := run(t, l, "Run multiple commands")
-	if info["exit_status"] != "LimitsExceeded" {
-		t.Fatalf("exit_status = %v", info["exit_status"])
-	}
-	if l.NCalls != 1 {
-		t.Errorf("n_calls = %d, want 1", l.NCalls)
-	}
-	last := l.Messages[len(l.Messages)-1]
-	if last["content"] != "LimitsExceeded" {
-		t.Errorf("last message = %#v", last)
-	}
-}
-
-func TestCostLimit(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{turn("Test", "echo 'test'")}}
-	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.CostLimit = 0.5 })
-	info, _ := run(t, l, "Test cost limit")
-	if info["exit_status"] != "LimitsExceeded" {
-		t.Errorf("exit_status = %v", info["exit_status"])
-	}
-	if l.NCalls != 1 {
-		t.Errorf("the first call is billed, the second must be refused: n_calls = %d", l.NCalls)
-	}
-}
-
-func TestWallTimeLimit(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("slow", "/sleep 1.2"),
-		turn("never", "echo never-reached"),
-	}}
-	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.WallTimeLimitSeconds = 1 })
-	stub := &stubHooks{}
-	l.Hooks = stub
-	info, _ := run(t, l, "Test wall time limit")
-	if info["exit_status"] != "TimeExceeded" {
-		t.Fatalf("exit_status = %v", info["exit_status"])
-	}
-	if stub.limitPrompts != 0 {
-		t.Errorf("a wall-clock limit must never prompt for new limits (it would loop forever)")
-	}
-	vars := l.TemplateVars()
-	if vars["elapsed_seconds"].(int) < 1 {
-		t.Errorf("elapsed_seconds = %v", vars["elapsed_seconds"])
-	}
-}
-
 func TestTimeoutHandling(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("Long sleep", "sleep 5"),
@@ -257,7 +205,7 @@ func TestMultipleStepsBeforeCompletion(t *testing.T) {
 		turn("Step 3", "echo 'third'"),
 		done("completed all steps"),
 	}}
-	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.CostLimit = 5 })
+	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	info, _ := run(t, l, "Multi-step task")
 	if info["exit_status"] != "Submitted" || info["submission"] != "completed all steps" || l.NCalls != 4 {
 		t.Fatalf("info = %#v n_calls = %d", info, l.NCalls)
@@ -269,8 +217,6 @@ func TestCustomTemplates(t *testing.T) {
 	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) {
 		c.SystemTemplate = "You are a test assistant."
 		c.InstanceTemplate = "Task: {{.task}}. Return bash command."
-		c.StepLimit = 2
-		c.CostLimit = 1.0
 	})
 	info, _ := run(t, l, "Test custom config")
 	if info["submission"] != "custom config works" {
@@ -365,22 +311,6 @@ func TestFormatErrorCounterResetsOnSuccess(t *testing.T) {
 	info, _ := run(t, l, "Test counter reset")
 	if info["exit_status"] != "Submitted" || info["submission"] != "ok" {
 		t.Fatalf("info = %#v", info)
-	}
-}
-
-func TestFormatErrorsCountAgainstCostLimit(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: repeatTurn(billedFormatErrorTurn(), 10)}
-	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) {
-		c.CostLimit = 2.5
-		c.StepLimit = 8
-		c.MaxConsecutiveFormatErrors = 0
-	})
-	info, _ := run(t, l, "Test billed format errors")
-	if info["exit_status"] != "LimitsExceeded" {
-		t.Fatalf("exit_status = %v", info["exit_status"])
-	}
-	if l.NCalls != 3 || l.Cost != 3.0 {
-		t.Errorf("n_calls = %d cost = %v, want 3 / 3.0", l.NCalls, l.Cost)
 	}
 }
 
@@ -583,15 +513,6 @@ func (s *stubHooks) OnSubmit(context.Context, model.Message) error {
 	return s.rejectWith
 }
 
-func (s *stubHooks) OnLimits(_ context.Context, cfg *Config, _ *model.Interrupt) error {
-	s.limitPrompts++
-	if s.liftLimits {
-		cfg.CostLimit = 10
-		cfg.StepLimit = 10
-	}
-	return nil
-}
-
 func TestRejectionSkipsExecutionButRecordsObservations(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("a", "echo not-run"),
@@ -639,25 +560,6 @@ func contents(msgs []model.Message) []string {
 		out = append(out, stringOr(m["role"])+": "+c[:min(40, len(c))])
 	}
 	return out
-}
-
-func TestLimitsHookCanLiftTheCeiling(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turn("a", "echo one"), done("two"),
-	}}
-	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second}, func(c *Config) { c.CostLimit = 0.5 })
-	h := &stubHooks{liftLimits: true}
-	l.Hooks = h
-	info, err := run(t, l, "lift limits")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h.limitPrompts != 1 {
-		t.Errorf("limit prompts = %d, want 1", h.limitPrompts)
-	}
-	if info["exit_status"] != "Submitted" {
-		t.Errorf("info = %#v", info)
-	}
 }
 
 func TestOnSubmitCanStartANewTask(t *testing.T) {

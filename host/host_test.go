@@ -2,7 +2,6 @@ package host
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,19 +71,6 @@ func done(text string) model.Message {
 func yolo(t *testing.T, merged map[string]any) map[string]any {
 	t.Helper()
 	return config.Merge(merged, map[string]any{"agent": map[string]any{"mode": "yolo"}})
-}
-
-// withCost raises the cost budget and sets yolo. It matters for subagents
-// specifically because the limit belongs to the session and the spend to the
-// loop, so a child's cost accumulates across every run of it - including the one
-// a revival adds - and the shipped budget covers only a couple of turns. That is
-// the right rule: a subagent that could reset its own ledger by being re-driven
-// has no ledger. It is also why a test that delegates twice has to say so.
-func withCost(t *testing.T, merged map[string]any, limit float64) map[string]any {
-	t.Helper()
-	return config.Merge(merged, map[string]any{"agent": map[string]any{
-		"mode": "yolo", "cost_limit": limit,
-	}})
 }
 
 func openSession(t *testing.T, p *Process, merged map[string]any, dir string, i int, spec func(*Spec)) *Session {
@@ -450,10 +436,7 @@ func (h *countingHooks) BeforeExecute(context.Context, []model.Action, map[strin
 	h.before++
 	return nil
 }
-func (h *countingHooks) OnSubmit(context.Context, model.Message) error { return nil }
-func (h *countingHooks) OnLimits(context.Context, *agent.Config, *model.Interrupt) error {
-	return nil
-}
+func (h *countingHooks) OnSubmit(context.Context, model.Message) error   { return nil }
 func (h *countingHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
 func (h *countingHooks) OnMessage(model.Message) {
 	h.mu.Lock()
@@ -799,18 +782,13 @@ func TestSubagentPromptsBubbleToTheParentsHuman(t *testing.T) {
 		t.Errorf("the parent was asked about a command whose asker was %q, want \"worker\" - an unattributed prompt is the §5.5 failure", parentHooks.lastAsker)
 	}
 
-	// The parent's run-shaping hooks are not reachable from a child: a limits
-	// offer would raise the wrong budget, and a submit prompt would end the wrong
-	// conversation.
-	pending := &model.Interrupt{Kind: model.KindLimitsExceeded}
-	if err := kid.Loop.Hooks.OnLimits(context.Background(), kid.Cfg, pending); !errors.Is(err, pending) {
-		t.Errorf("OnLimits returned %v, want the child's own pending interrupt", err)
-	}
+	// The parent's run-shaping hooks are not reachable from a child: a submit
+	// prompt answered on a child's behalf would end the wrong conversation.
 	if err := kid.Loop.Hooks.OnSubmit(context.Background(), model.Message{}); err != nil {
 		t.Errorf("OnSubmit returned %v, want nil: a child ends when it ends", err)
 	}
-	if parentHooks.limits != 0 || parentHooks.submits != 0 {
-		t.Errorf("the parent's human was asked about the child's run: limits=%d submits=%d", parentHooks.limits, parentHooks.submits)
+	if parentHooks.submits != 0 {
+		t.Errorf("the parent's human was asked to end the child's run: submits=%d", parentHooks.submits)
 	}
 }
 
@@ -848,7 +826,6 @@ func TestUnattendedParentSpawnsUnattendedChild(t *testing.T) {
 type recordingHooks struct {
 	before    int
 	submits   int
-	limits    int
 	lastAsker string
 }
 
@@ -859,11 +836,7 @@ func (h *recordingHooks) BeforeExecute(_ context.Context, _ []model.Action, tvar
 	}
 	return nil
 }
-func (h *recordingHooks) OnSubmit(context.Context, model.Message) error { h.submits++; return nil }
-func (h *recordingHooks) OnLimits(context.Context, *agent.Config, *model.Interrupt) error {
-	h.limits++
-	return nil
-}
+func (h *recordingHooks) OnSubmit(context.Context, model.Message) error   { h.submits++; return nil }
 func (h *recordingHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
 func (h *recordingHooks) OnMessage(model.Message)                         {}
 func (h *recordingHooks) OnInterrupt(context.Context) error               { return nil }
@@ -895,7 +868,7 @@ func TestSendRevivesAFinishedSubagent(t *testing.T) {
 			done("REPORT-2: second pass done"),
 		}}
 	}
-	parent, err := p.Open(Spec{Config: withCost(t, merged, 20), Workdir: base, Project: base, Model: scripted(0)})
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1008,31 +981,23 @@ func waitJobDone(t *testing.T, s *Session, id string) *session.JobRow {
 	return row
 }
 
-// TestSubagentOutlivesItsParentsBudget is the ruling that subagents take as long
-// as they take, asserted as behaviour rather than commented. The shipped
-// cost_limit is $3 and the step budget is off; a child that used to be stopped by
-// its own ledger is now allowed to finish, which is what "how long did the task
-// need" means when the answer is longer than a number in a config file.
-//
-// It replaces a test that asserted the opposite - that a child ended on
-// LimitsExceeded and reported so - and that test's failure was the proof the
-// carve-out works: the report is the child's real submission now, not a budget
-// notice.
-func TestSubagentOutlivesItsParentsBudget(t *testing.T) {
+// TestSubagentRecordsItsCostWithoutBoundingIt keeps the distinction the budget
+// ruling turns on: enforcement is gone, bookkeeping is not. A child's spend is
+// still tallied turn by turn and reaches the parent's tree total, because "what
+// did that delegation cost me" is a fair question even when nobody sends an
+// invoice and nothing is allowed to stop the work over the answer
+// (docs/parallel-sessions.md §5.14, §5.8).
+func TestSubagentRecordsItsCostWithoutBoundingIt(t *testing.T) {
 	p, base := newProcess(t)
 	merged := testConfig(t)
-	// A budget the child cannot finish inside if limits apply to it.
-	parent, err := p.Open(Spec{Config: withCost(t, merged, 1), Workdir: base, Project: base, Model: scripted(0)})
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if parent.Cfg.CostLimit != 1 {
-		t.Fatal("the test's own budget did not apply to the parent")
 	}
 	p.ChildModel = func(string) model.Model {
 		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 			turn("echo a > a.txt"), turn("echo b > b.txt"), turn("echo c > c.txt"),
-			done("REPORT: three passes, one dollar budget"),
+			done("REPORT: three passes, nobody stopped me"),
 		}}
 	}
 	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "unbounded", Prompt: "do all of it"})
@@ -1048,17 +1013,25 @@ func TestSubagentOutlivesItsParentsBudget(t *testing.T) {
 		t.Errorf("child reported %.120q", body)
 	}
 	if strings.Contains(strings.ToLower(body), "limit") {
-		t.Errorf("a limit ended the child after all: %.160q", body)
+		t.Errorf("a limit touched the child: %.160q", body)
 	}
-	// And the child's spend is still recorded, because the ledger is accounting
-	// and only the enforcement is gone - the parent's human still wants to know
-	// what the delegation cost (§5.8).
 	kid, ok := p.childOfJob(parent.ID.String(), reply.JobID)
 	if !ok {
 		t.Fatal("child not mapped")
 	}
-	if kid.Loop.Cost <= 0 {
-		t.Errorf("child cost = %v, want its spend recorded even though nothing bounded it", kid.Loop.Cost)
+	if kid.Loop.NCalls != 4 || kid.Loop.Cost <= 0 {
+		t.Errorf("child ledger = %d calls / %v, want the four turns recorded", kid.Loop.NCalls, kid.Loop.Cost)
+	}
+	// And the rollup sees it: the parent's tree total includes the child's spend.
+	total, calls, err := p.Store.TreeTotals(parent.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Four calls and four dollars of price-attribution, all of it the child's:
+	// the parent never ran, so anything non-zero here can only have arrived
+	// through the tree.
+	if total != 4 || calls != 4 {
+		t.Errorf("tree totals = %v/%v, want 4/4 attributed to the parent's tree", total, calls)
 	}
 }
 

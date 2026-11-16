@@ -229,8 +229,8 @@ func TestMiniYAMLLoadsAsAgentModelEnvConfigs(t *testing.T) {
 	if String(agent, "system_template", "") == "" || String(agent, "instance_template", "") == "" {
 		t.Error("agent.system_template and agent.instance_template must be non-empty")
 	}
-	if _, ok := agent["cost_limit"]; !ok {
-		t.Error("agent.cost_limit missing")
+	if Int(agent, "context_window", 0) <= 0 {
+		t.Error("agent.context_window missing: compaction needs a real window to fire against")
 	}
 	if String(agent, "mode", "") == "" {
 		t.Errorf("agent.mode missing")

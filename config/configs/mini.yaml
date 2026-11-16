@@ -151,8 +151,6 @@ agent:
     ```
   instance_template: |
     {{.task}}
-  step_limit: 0
-  cost_limit: 3.
   mode: confirm
 environment:
   env:

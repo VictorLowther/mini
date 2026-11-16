@@ -26,7 +26,6 @@ func compactionConfig(t *testing.T, mutate ...func(*Config)) *Config {
 	c := agentConfig(t)
 	c.SystemTemplate = "s"
 	c.InstanceTemplate = "{{.task}}"
-	c.CostLimit = 0 // canned turns bill $1; the long test runs would hit 3
 	c.ContextWindow = 5000
 	c.CompactKeepTokens = 60
 	c.CompactSummaryMaxTokens = 100

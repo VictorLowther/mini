@@ -66,8 +66,8 @@ func TestParseFlags(t *testing.T) {
 	o, err := parseFlags([]string{
 		"-t", "do the thing", "-y", "-m", "qwen", "--url", "http://h:1",
 		"--max-tokens", "2048", "--thinking", "low",
-		"-c", "mini", "-c", "agent.step_limit=4",
-		"-o", "/tmp/t.json", "-l", "0", "--exit-immediately", "--print",
+		"-c", "mini", "-c", "agent.context_window=4",
+		"-o", "/tmp/t.json", "--exit-immediately", "--print",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,11 +81,8 @@ func TestParseFlags(t *testing.T) {
 	if !o.exitImmediately || !o.printMode {
 		t.Errorf("bool flags = %+v", o)
 	}
-	if strings.Join(o.configSpecs, ",") != "mini,agent.step_limit=4" {
+	if strings.Join(o.configSpecs, ",") != "mini,agent.context_window=4" {
 		t.Errorf("configs = %v", o.configSpecs)
-	}
-	if !o.costLimit.set || o.costLimit.v != 0 {
-		t.Errorf("cost limit must distinguish 0 from unset, got %+v", o.costLimit)
 	}
 }
 
@@ -109,7 +106,7 @@ func TestBuildConfigWithoutSpecsUsesEmbeddedMini(t *testing.T) {
 		t.Errorf("config name = %q", name)
 	}
 	cfg := agent.ConfigFromMap(sub(merged, "agent"))
-	if cfg.Mode != "confirm" || cfg.CostLimit != 3.0 || cfg.SystemTemplate == "" {
+	if cfg.Mode != "confirm" || cfg.ContextWindow != 262144 || cfg.SystemTemplate == "" {
 		t.Errorf("agent config = %+v", cfg)
 	}
 	if config := sub(merged, "model"); config == nil {
@@ -121,7 +118,7 @@ func TestBuildConfigSpecsReplaceTheDefault(t *testing.T) {
 	// A deliberate and surprising semantic, pinned here so it stays chosen
 	// rather than accidental: naming -c replaces the default config file, it
 	// does not layer on top of it.
-	o, err := parseFlags([]string{"-c", "agent.step_limit=7"})
+	o, err := parseFlags([]string{"-c", "agent.context_window=7"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,8 +127,8 @@ func TestBuildConfigSpecsReplaceTheDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := agent.ConfigFromMap(sub(merged, "agent"))
-	if cfg.StepLimit != 7 {
-		t.Errorf("step_limit = %d", cfg.StepLimit)
+	if cfg.ContextWindow != 7 {
+		t.Errorf("context_window = %d", cfg.ContextWindow)
 	}
 	if cfg.SystemTemplate != "" {
 		t.Error("mini.yaml must not have been merged in")
@@ -139,7 +136,7 @@ func TestBuildConfigSpecsReplaceTheDefault(t *testing.T) {
 }
 
 func TestBuildConfigCLIFlagsWin(t *testing.T) {
-	o, err := parseFlags([]string{"-y", "-l", "1.25", "-m", "chosen", "--url", "http://sushi:1234", "-t", "task text"})
+	o, err := parseFlags([]string{"-y", "-m", "chosen", "--url", "http://sushi:1234", "-t", "task text"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +145,7 @@ func TestBuildConfigCLIFlagsWin(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := agent.ConfigFromMap(sub(merged, "agent"))
-	if cfg.Mode != "yolo" || cfg.CostLimit != 1.25 {
+	if cfg.Mode != "yolo" {
 		t.Errorf("agent = %+v", cfg)
 	}
 	if str(sub(merged, "model"), "model_name") != "chosen" || str(sub(merged, "model"), "base_url") != "http://sushi:1234" {

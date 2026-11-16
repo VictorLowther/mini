@@ -78,8 +78,6 @@ type guiView struct {
 	status      *widget.Label
 	editor      *chatInput
 
-	limitsLabel *widget.Label
-
 	cancelItem *fyne.MenuItem
 	wasRunning bool
 	lastTitle  string
@@ -91,11 +89,7 @@ type guiView struct {
 	lastFlush    time.Time
 	flushPending bool
 
-	// dialog is the prompt above the input: "" or "limits". Leaving the app
-	// is never a dialog: /quit or the native quit hotkey only.
-	dialog    string
-	limitsIdx int
-	limits    [2]float64
+	// Leaving the app is never a prompt: /quit or the native quit hotkey only.
 
 	// committed is the transcript source of truth the widgets are rendered
 	// from; the thinking toggle rebuilds every block from it.
@@ -174,7 +168,6 @@ func newGUIView(g *GUI, w fyne.Window) *guiView {
 	v.body = container.New(virtualLayout{v}, v.topPad, v.botPad)
 	v.scroll = container.NewVScroll(v.body)
 	v.editor = newChatInput(v)
-	v.limitsLabel = widget.NewLabel(limitLabelSteps)
 	v.panel = container.NewVBox()
 	v.panelScroll = container.NewVScroll(v.panel)
 	v.card = widget.NewCard("", "", v.panelScroll)
@@ -799,9 +792,6 @@ func (v *guiView) rebuildAll() {
 }
 
 func (v *guiView) toggleThinking() {
-	if v.dialog != "" {
-		return
-	}
 	on := v.gui.ToggleReasoning()
 	v.rebuildAll()
 	v.noteLocal(map[bool]string{true: "thinking shown", false: "thinking hidden"}[on])
@@ -1383,13 +1373,9 @@ func (v *guiView) setPanel(objs ...fyne.CanvasObject) {
 }
 
 func (v *guiView) showQuestion(q Question) {
-	v.dialog = ""
 	switch q.Kind {
 	case AskConfirm:
 		v.setPanel(plainRT(displayTitle(q)), monoBlock(panelActionLines(q.Actions)), dimRT(panelConfirmHint))
-	case AskLimits:
-		v.openDialog("limits")
-		return
 	default: // new-task, human, interruption, task
 		v.setPanel(plainRT(displayTitle(q)))
 	}
@@ -1399,7 +1385,6 @@ func (v *guiView) showQuestion(q Question) {
 // questionResolved hides the panel: the answer came from this goroutine, so
 // there is no message pump that would notice HasQuestion going false.
 func (v *guiView) questionResolved() {
-	v.dialog = ""
 	v.setPanel()
 }
 
@@ -1414,47 +1399,6 @@ const (
 	limitLabelSteps = "New step limit: "
 	limitLabelCost  = "New cost limit: "
 )
-
-func (v *guiView) openDialog(name string) {
-	v.dialog = name
-	v.limitsIdx = 0
-	v.limits = [2]float64{}
-	v.editor.SetText("")
-	switch name {
-	case "limits":
-		v.limitsLabel.SetText(limitLabelSteps)
-		v.setPanel(plainRT(displayTitle(v.gui.PendingQuestion())), v.limitsLabel)
-	}
-	v.focusEditor()
-}
-
-// closeDialog dismisses the prompt. A pending question stays pending (there is
-// no give-up answer; giving up means ending the run), so the limits banner
-// hides with its input row and the next submit reopens it.
-func (v *guiView) closeDialog() {
-	v.dialog = ""
-	q := v.gui.PendingQuestion()
-	switch {
-	case !v.gui.HasQuestion():
-		v.setPanel()
-	case q.Kind == AskLimits:
-		v.setPanel()
-	default:
-		v.showQuestion(q)
-	}
-	v.focusEditor()
-}
-
-func (v *guiView) submitLimits(value string) {
-	v.limits[v.limitsIdx] = ParseLimitLine(value)
-	if v.limitsIdx == 0 {
-		v.limitsIdx = 1
-		v.limitsLabel.SetText(limitLabelCost)
-		return
-	}
-	v.dialog = ""
-	v.gui.resolve(Answer{NewLimits: true, Steps: int(v.limits[0]), Cost: v.limits[1]})
-}
 
 func (v *guiView) showRunDone() {
 	info, err := v.gui.result()
@@ -1474,14 +1418,10 @@ func (v *guiView) showRunDone() {
 }
 
 // esc is the cancel key: it interrupts the command in flight while the agent
-// works and dismisses the limits prompt; at idle it does nothing, because
-// leaving is deliberate - /quit, the native quit hotkey, or closing the
-// window.
+// works; at idle it does nothing, because leaving is deliberate - /quit, the
+// native quit hotkey, or closing the window. It used also to dismiss the limits
+// prompt, which went with the limits themselves (§5.14).
 func (v *guiView) esc() {
-	if v.dialog == "limits" {
-		v.closeDialog()
-		return
-	}
 	if v.gui.loopRunning() {
 		v.gui.CancelCurrentTurn()
 		v.noteLocal("cancelling this turn…")
@@ -1529,8 +1469,6 @@ func (v *guiView) handleInput(text string) {
 			return
 		}
 		g.resolve(Answer{Text: text})
-	case AskLimits:
-		v.openDialog("limits")
 	case AskConfirm:
 		// Empty input confirms; anything else rejects, after slash handling.
 		resolved, reprompt := v.slash(text)
@@ -1699,19 +1637,6 @@ func (c *chatInput) FocusLost() {
 
 func (c *chatInput) TypedKey(key *fyne.KeyEvent) {
 	v := c.v
-	if v.dialog == "limits" {
-		switch key.Name {
-		case fyne.KeyReturn, fyne.KeyEnter:
-			value := c.Text
-			c.Entry.SetText("")
-			v.submitLimits(value)
-		case fyne.KeyEscape:
-			v.closeDialog()
-		default:
-			c.Entry.TypedKey(key)
-		}
-		return
-	}
 	switch key.Name {
 	case fyne.KeyEscape:
 		// Never forward: the entry ignores Escape, and it is the run's
@@ -1732,10 +1657,6 @@ func (c *chatInput) TypedKey(key *fyne.KeyEvent) {
 
 func (c *chatInput) TypedRune(r rune) {
 	v := c.v
-	if v.dialog == "limits" {
-		c.Entry.TypedRune(r)
-		return
-	}
 	if r == 'y' && c.Text == "" && v.gui.HasQuestion() && v.gui.PendingQuestion().Kind == AskConfirm {
 		// A bare y confirms an empty editor; anything typed is the rejection
 		// comment.

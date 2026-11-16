@@ -1085,9 +1085,16 @@ that can be closed - so those numbers stopped being a guardrail and became a
 second, invisible author of the report. "The subagent ended on its step limit" is
 an answer that came from a config file nobody meant as a task specification.
 
-**Landed for subagents** (`host.Open`): a child's step, cost and wall budgets are
-cleared at the one place that decides what a child is, so no caller can leak one
-in and no config can revive it. The trigger was §9.3's revival - a child's spend
+**Landed for everything, at the maintainer's second look.** The first pass
+cleared a child's step, cost and wall budgets in `host.Open`, which fixed the
+symptom only for the sessions this document happened to be about. The ruling
+then widened: no budgets for anything - they are a relic of the one-shot
+harness, and mini runs local models, so the only real cost is electricity and
+the only honest brake on a runaway is a person deciding to stop it. What went:
+the three `Config` fields and their config keys, `checkLimits` and its call,
+`OnLimits` from `agent.Hooks` and all four implementations, the limits dialog in
+both front ends, `AskLimits` as a live prompt kind, `limitsBanner`,
+`ParseLimitLine`, and `cmd/mini`'s `-l/--cost-limit` flag. The trigger had been - a child's spend
 belongs to its session and is not reset by another run of it, so re-driving a
 helper could stop it partway through its second pass on the strength of its first -
 and both alternatives were worse: a fresh ledger per revival is no ledger at all
@@ -1097,24 +1104,24 @@ parent's number on a child's behalf is the human's decision, not the harness's.
 that asserted the opposite - whose failure was itself the proof, since the report
 it captured was the child's real submission rather than a budget notice.
 
-**Still to remove: the same for top-level sessions.** Enforcement is one function
-and the fields are one struct, so that part is contained - `agent`, `cmd/mini`'s
-`-l` flag, the shipped config. It is left unfinished deliberately rather than
-half-done, because deleting `checkLimits` orphans the `OnLimits` hook and the
-whole limits dialog in both front ends, and `OnLimits` is a method on
-`agent.Hooks`: every implementation changes with it - `ui.Interactive`, the batch
-front end, `host.bubblingHooks`, and the fakes in three test files. That surface
-wants removing in the same commit as the enforcement, not a commit where the UI
-asks a question that can never be asked.
+**Two things worth how they were handled.** `OnLimits` was deleted from the
+`Hooks` interface rather than left uncallable, because an interface method
+nothing can invoke is still a method four implementations have to answer for -
+`ui.Interactive`, the batch front end, `host.bubblingHooks` and a test fake - and
+the GUI's whole dialog subsystem turned out to exist only for the limits prompt.
+That made the removal larger than the field list suggested and is the right size:
+a abstraction with one client, whose client is gone, is not an abstraction, it is
+a level of indirection to nothing. `LimitsExceeded`, `TimeExceeded` and
+`AskLimits` were retired rather than deleted, because old transcripts carry them
+as data and a resumed run should still be able to say what ended it - deleting
+those would erase history to remove a feature.
 
-Two things to settle with it. First, **whether `cost_limit` counts as a budget
-here**: the ruling named turns and time, which are unambiguous - both go, since
-each is a guess about how long a task should take. Money is different in kind: it
-is not a duration estimate, it is a limit on what a person will spend on a box
-that burns a GPU while idle, and `OnLimits` exists so they can raise it mid-flight.
-So the top-level cut is either step + wall with the dollar guard kept, or all
-three - and it decides whether `AskLimits` survives in some form or goes entirely.
-Second, **what bounds a runaway instead**: `job_kill`, `Quit`, closing the process
+Asked directly, the answer on money was that there is no money: `cost_limit`
+went with the others. It had the strongest claim to being different in kind - not
+a guess about duration but a ceiling on spend, liftable mid-flight by a human -
+and on a local box it was a limit against a number that is always zero, which is
+worse than no limit because it looks like protection. **What bounds a runaway
+instead**: `job_kill`, `Quit`, closing the process
 and its subtree (§9.2), and the in-flight-request bound (§5.7), which is the only
 cost that actually matters on one GPU. A runaway is visible in `jobs` with a name,
 an elapsed time and an output path - a thing a human can act on, where a silent

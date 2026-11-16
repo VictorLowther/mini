@@ -274,17 +274,9 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 	// path - which is a thing a human can act on, where a silent budget cut is a
 	// thing that merely stops.
 	//
-	// Top-level sessions keep their budgets. Those limits are the human's control
-	// over a run they are watching, and `OnLimits` exists so they can be lifted
-	// deliberately mid-flight; a subagent has nobody watching it in that sense, so
-	// the same mechanism stops being a guardrail and becomes a second, invisible
-	// author of the report - "the subagent ended on its cost limit" is an answer
-	// the parent got because of a number in a file nobody meant as a task spec.
-	if spec.Kind == session.KindSubagent {
-		agentCfg.StepLimit = 0
-		agentCfg.CostLimit = 0
-		agentCfg.WallTimeLimitSeconds = 0
-	}
+	// Nothing to clear for a child: the budgets this used to zero out are gone for
+	// every session, so a subagent inherits the same unboundedness simply by
+	// there being no limit left to inherit (§5.14).
 
 	sess, err := p.row(spec, modelCfg)
 	if err != nil {

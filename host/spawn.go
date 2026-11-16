@@ -455,13 +455,6 @@ func (b *bubblingHooks) BeforeExecute(ctx context.Context, actions []model.Actio
 // whose human is somebody else's.
 func (b *bubblingHooks) OnSubmit(context.Context, model.Message) error { return nil }
 
-// OnLimits does not offer the parent's human a chance to raise a child's budget.
-// Returning the pending interrupt ends the child with its limits named, and that
-// is the report the parent gets.
-func (b *bubblingHooks) OnLimits(_ context.Context, _ *agent.Config, pending *model.Interrupt) error {
-	return pending
-}
-
 func (b *bubblingHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
 
 // OnMessage is ignored: a child's turn-by-turn printing belongs to the roster of

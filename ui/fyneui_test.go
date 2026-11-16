@@ -285,7 +285,6 @@ func (p *guiPane) panel() string {
 }
 
 func (p *guiPane) status() string { var s string; p.do(func() { s = p.v.status.Text }); return s }
-func (p *guiPane) dialog() string { var s string; p.do(func() { s = p.v.dialog }); return s }
 func (p *guiPane) value() string  { var s string; p.do(func() { s = p.v.editor.Text }); return s }
 func (p *guiPane) panelShown() bool {
 	var b bool
@@ -510,9 +509,7 @@ func TestGUIEscAtIdleNeverQuits(t *testing.T) {
 	p := newGUIForTest(t, c, &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}})
 	p.do(func() { p.prepareTranscript() })
 	p.esc()
-	if p.dialog() != "" {
-		t.Errorf("esc opened dialog %q; leaving is /quit or %s only", p.dialog(), quitKeyName())
-	}
+	// esc must not start leaving: that is /quit or the native hotkey.
 	if strings.Contains(p.transcript(), "Quit?") {
 		t.Errorf("esc opened a quit prompt:\n%s", p.transcript())
 	}
@@ -549,64 +546,6 @@ func TestGUISlashCommandsWorkAtThePanel(t *testing.T) {
 	p.typeText("")
 	p.enter()
 	<-got
-}
-
-func TestGUILimitsDialogAsksTwice(t *testing.T) {
-	c := newConfig("yolo")
-	c.StepLimit, c.CostLimit = 3, 1.5
-	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
-	p := newGUIForTest(t, c, l)
-	got := askG(t, p, Question{Kind: AskLimits, Title: limitsBanner(c, 0, 0), Cfg: c})
-	if p.dialog() != "limits" {
-		t.Fatalf("dialog = %q, want limits", p.dialog())
-	}
-	panel := p.panel()
-	if !strings.Contains(panel, "Limits exceeded") || !strings.Contains(panel, "New step limit: ") {
-		t.Errorf("panel = %q", panel)
-	}
-	p.typeText("12")
-	p.enter()
-	if p.dialog() != "limits" {
-		t.Fatalf("dialog = %q, want the second limits input", p.dialog())
-	}
-	if panel := p.panel(); !strings.Contains(panel, "New cost limit: ") {
-		t.Errorf("second limits label missing: %q", panel)
-	}
-	p.typeText("7.5")
-	p.enter()
-	ans := <-got
-	if ans.Steps != 12 || ans.Cost != 7.5 || !ans.NewLimits {
-		t.Errorf("answer = %+v", ans)
-	}
-}
-
-// TestGUILimitsEscKeepsTheQuestion: esc hides the prompt, but there is no
-// give-up answer; the next submit reopens it.
-func TestGUILimitsEscKeepsTheQuestion(t *testing.T) {
-	c := newConfig("yolo")
-	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
-	p := newGUIForTest(t, c, l)
-	got := askG(t, p, Question{Kind: AskLimits, Title: limitsBanner(c, 0, 0), Cfg: c})
-	p.esc()
-	if p.dialog() != "" {
-		t.Errorf("esc should hide the limits prompt, dialog = %q", p.dialog())
-	}
-	if !p.HasQuestion() {
-		t.Fatal("esc must not answer the limits question")
-	}
-	p.typeText("anything")
-	p.enter() // swallowed: reopens the prompt with cleared input
-	if p.dialog() != "limits" || p.value() != "" {
-		t.Errorf("dialog = %q editor = %q, want limits reopened empty", p.dialog(), p.value())
-	}
-	p.typeText("9")
-	p.enter()
-	p.typeText("2.5")
-	p.enter()
-	ans := <-got
-	if ans.Steps != 9 || ans.Cost != 2.5 || !ans.NewLimits {
-		t.Errorf("answer = %+v", ans)
-	}
 }
 
 func TestGUITaskQuestionUsesTheEditor(t *testing.T) {
@@ -806,7 +745,6 @@ func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {
 	p := newGUIForTest(t, c, l)
 	p.do(func() { p.prepareTranscript() })
 
-	l.Cfg.CostLimit = 10
 	l.Handler.Reasoning("the user wants a ")
 	l.Handler.Reasoning("listing of the current directory")
 	l.Handler.Content("I will list the files.")

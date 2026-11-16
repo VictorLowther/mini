@@ -12,9 +12,10 @@ import (
 
 // Question kinds: the five prompts agents/interactive.py actually contains.
 const (
-	AskConfirm  = "confirm"      // execute these actions?
-	AskNewTask  = "new-task"     // agent is ready for the next task
-	AskLimits   = "limits"       // step/cost limit reached on a terminal
+	AskConfirm = "confirm"  // execute these actions?
+	AskNewTask = "new-task" // agent is ready for the next task
+	// "limits" is retired, not deleted: old transcripts carry it as the kind of
+	// prompt that was outstanding when a run ended (§5.14).
 	AskHuman    = "human"        // human mode: command for the agent to run
 	AskTask     = "task"         // what do you want to do?
 	AskInterrup = "interruption" // Ctrl+C: type a comment
@@ -36,11 +37,6 @@ type Question struct {
 	// can hold two askers makes an unattributed prompt the default rather than
 	// the exception.
 	Origin string
-	// Limits echoed back for the AskLimits prompt.
-	StepLimit int
-	CostLimit float64
-	Cost      float64
-	NCalls    int
 }
 
 // Answer is a UI's reply to a Question. Which fields matter depends on Kind.
@@ -52,10 +48,6 @@ type Answer struct {
 	// RePrompt means the UI consumed a control command (help, mode switch on
 	// the wrong mode) and the same question should be asked again.
 	RePrompt bool
-	// NewLimits carries raised limits (AskLimits); when false the run gives up.
-	NewLimits bool
-	Steps     int
-	Cost      float64
 }
 
 // displayTitle is the one line a prompt is introduced by, in both front ends.

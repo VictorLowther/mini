@@ -30,15 +30,22 @@ import (
 // Version is reported as mini_version in every trajectory.
 const Version = "0.1.0"
 
-// Config is AgentConfig plus InteractiveAgentConfig. mode, whitelist_actions
+// Config is AgentConfig plus InteractiveAgentConfig.
+//
+// It carries no budgets. Step limits, dollar limits and wall clocks are relics of
+// the one-shot benchmark harness this port came from, where bounding an
+// autonomous run was the only thing standing between a task and forever. Here a
+// human is watching a persistent session, `jobs` reports elapsed time, and the
+// brakes that work are job_kill, Quit and closing the process - so a budget
+// stopped being a guardrail and became a second, invisible author of the report
+// (docs/parallel-sessions.md §5.14). mode, whitelist_actions
 // and confirm_exit are read by the interactive hooks and ignored when the loop
 // has no hooks.
 type Config struct {
-	SystemTemplate             string
-	InstanceTemplate           string
-	StepLimit                  int
-	CostLimit                  float64
-	WallTimeLimitSeconds       int
+	SystemTemplate   string
+	InstanceTemplate string
+	// No step, cost or wall-clock budget. See Cost below for what replaced them
+	// and why - docs/parallel-sessions.md §5.14.
 	MaxConsecutiveFormatErrors int
 	OutputPath                 string
 
@@ -68,9 +75,6 @@ func ConfigFromMap(m map[string]any) *Config {
 	return &Config{
 		SystemTemplate:             config.String(m, "system_template", ""),
 		InstanceTemplate:           config.String(m, "instance_template", ""),
-		StepLimit:                  config.Int(m, "step_limit", 0),
-		CostLimit:                  config.Float(m, "cost_limit", 3.0),
-		WallTimeLimitSeconds:       config.Int(m, "wall_time_limit_seconds", 0),
 		MaxConsecutiveFormatErrors: config.Int(m, "max_consecutive_format_errors", 3),
 		OutputPath:                 config.String(m, "output_path", ""),
 		Mode:                       config.String(m, "mode", "confirm"),
@@ -93,9 +97,6 @@ func (c *Config) Dump() map[string]any {
 	return map[string]any{
 		"system_template":               c.SystemTemplate,
 		"instance_template":             c.InstanceTemplate,
-		"step_limit":                    c.StepLimit,
-		"cost_limit":                    c.CostLimit,
-		"wall_time_limit_seconds":       c.WallTimeLimitSeconds,
 		"max_consecutive_format_errors": c.MaxConsecutiveFormatErrors,
 		"output_path":                   outPath,
 		"mode":                          c.Mode,
@@ -119,10 +120,9 @@ type Hooks interface {
 	// OnSubmit is asked whether the run really ends here; an interrupt (a new
 	// task, or a mode switch) continues the run instead.
 	OnSubmit(ctx context.Context, exitMsg model.Message) error
-	// OnLimits offers the user a chance to lift the step/cost limits. nil means
-	// "limits raised, query again"; returning pending (or another interrupt)
-	// ends the run with it. A wall-clock limit never calls this.
-	OnLimits(ctx context.Context, cfg *Config, pending *model.Interrupt) error
+	// OnLimits went away with the budgets it existed to lift (§5.14). It is not
+	// replaced here on purpose: a hook nothing can call is still a method every
+	// implementation has to answer for, and there were four of them.
 	// NextHumanCommand asks the user for a command to run instead of querying
 	// the model; ok is false whenever the mode is not "human".
 	NextHumanCommand(ctx context.Context) (command string, ok bool)
@@ -1303,22 +1303,6 @@ func (l *Loop) Query(ctx context.Context) (model.Message, error) {
 			return msg, nil
 		}
 	}
-	if err := l.checkLimits(); err != nil {
-		var in *model.Interrupt
-		errors.As(err, &in)
-		if in.Kind != model.KindTimeExceeded && l.Hooks != nil {
-			// A wall-clock limit cannot be lifted by raising the step/cost
-			// limits, so only the other one is worth prompting for.
-			if hookErr := l.Hooks.OnLimits(ctx, l.Cfg, in); hookErr != nil {
-				return nil, hookErr
-			}
-			if err := l.checkLimits(); err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
 	l.NCalls++
 	// Project (and compact first if the projection outgrew its trigger) right
 	// here: every step passes this point, which is what makes the trigger
@@ -1356,16 +1340,6 @@ func (l *Loop) Query(ctx context.Context) (model.Message, error) {
 	l.publish()
 	l.addMessages(msg)
 	return msg, nil
-}
-
-func (l *Loop) checkLimits() error {
-	if (0 < l.Cfg.StepLimit && l.Cfg.StepLimit <= l.NCalls) || (0 < l.Cfg.CostLimit && l.Cfg.CostLimit <= l.Cost) {
-		return &model.Interrupt{Kind: model.KindLimitsExceeded, Messages: []model.Message{exitMessage(model.KindLimitsExceeded, "")}}
-	}
-	if 0 < l.Cfg.WallTimeLimitSeconds && l.Cfg.WallTimeLimitSeconds <= int(time.Since(l.start).Seconds()) {
-		return &model.Interrupt{Kind: model.KindTimeExceeded, Messages: []model.Message{exitMessage(model.KindTimeExceeded, "")}}
-	}
-	return nil
 }
 
 // progressOf lifts the numbers a UI wants out of a model reply, so the GUI

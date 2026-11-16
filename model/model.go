@@ -163,7 +163,12 @@ type ToolOutcome struct {
 // InterruptKind names the control-flow conditions the loop reacts to. They are
 // the Python exception class names, which double as the exit_status strings.
 const (
-	KindSubmitted         = "Submitted"
+	KindSubmitted = "Submitted"
+	// LimitsExceeded and TimeExceeded are retired, not deleted. Sessions recorded
+	// before the budgets went away carry these strings in their transcripts and
+	// trajectories, and a resumed run should still be able to say what ended an
+	// old one. Nothing produces them now; deleting them would erase history
+	// rather than remove a feature (docs/parallel-sessions.md §5.14).
 	KindLimitsExceeded    = "LimitsExceeded"
 	KindTimeExceeded      = "TimeExceeded"
 	KindFormatError       = "FormatError"

@@ -55,11 +55,6 @@ func slash(cfg *agent.Config, input string, out io.Writer, readMore func() strin
 	return input, false
 }
 
-func limitsBanner(cfg *agent.Config, nCalls int, cost float64) string {
-	return fmt.Sprintf("Limits exceeded. Limits: %d steps, $%.2f.\nCurrent spend: %d steps, $%.2f.\n",
-		cfg.StepLimit, cfg.CostLimit, nCalls, cost)
-}
-
 func confirmationTitle(n int) string {
 	return fmt.Sprintf("Execute %d action(s)? Enter to confirm, type a comment to reject, or /h to show available commands", n)
 }

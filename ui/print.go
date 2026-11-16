@@ -247,9 +247,6 @@ func (p *Print) Ask(ctx context.Context, q Question) (Answer, error) {
 	}
 	defer release()
 
-	if q.Kind == AskLimits {
-		return p.askLimits(ctx, q)
-	}
 	for {
 		fmt.Fprintf(p.Out, "\n%s\n%s", displayTitle(q), promptLine())
 		line, err := p.readLine(ctx)
@@ -294,18 +291,4 @@ func (p *Print) answerFor(q Question, text string) (Answer, error) {
 	default: // new-task, human, interruption
 		return Answer{Text: text}, nil
 	}
-}
-
-func (p *Print) askLimits(ctx context.Context, q Question) (Answer, error) {
-	fmt.Fprint(p.Out, "\n"+displayTitle(q))
-	stepsText, err := p.readLine(ctx)
-	if err != nil {
-		return Answer{}, err
-	}
-	fmt.Fprint(p.Out, "New cost limit: ")
-	costText, err := p.readLine(ctx)
-	if err != nil {
-		return Answer{}, err
-	}
-	return Answer{NewLimits: true, Steps: int(ParseLimitLine(stepsText)), Cost: ParseLimitLine(costText)}, nil
 }

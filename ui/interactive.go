@@ -3,7 +3,6 @@ package ui
 import (
 	"context"
 	"regexp"
-	"strconv"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/model"
@@ -117,32 +116,6 @@ func (h *Interactive) OnSubmit(ctx context.Context, exitMsg model.Message) error
 	}
 }
 
-// OnLimits asks for a new step and cost limit, but only when a terminal is
-// attached; an unattended run stops cleanly with LimitsExceeded.
-func (h *Interactive) OnLimits(ctx context.Context, cfg *agent.Config, pending *model.Interrupt) error {
-	if !h.UI.Interactive() {
-		return pending
-	}
-	ans, err := h.UI.Ask(ctx, Question{
-		Kind:      AskLimits,
-		Title:     limitsBanner(cfg, h.Loop.NCalls, h.Loop.Cost),
-		Cfg:       cfg,
-		StepLimit: cfg.StepLimit,
-		CostLimit: cfg.CostLimit,
-		NCalls:    h.Loop.NCalls,
-		Cost:      h.Loop.Cost,
-	})
-	if err != nil {
-		return err
-	}
-	if !ans.NewLimits {
-		return pending
-	}
-	cfg.StepLimit = ans.Steps
-	cfg.CostLimit = ans.Cost
-	return nil
-}
-
 // NextHumanCommand implements human mode.
 func (h *Interactive) NextHumanCommand(ctx context.Context) (string, bool) {
 	if h.Cfg.Mode != "human" {
@@ -182,16 +155,6 @@ func (h *Interactive) OnInterrupt(ctx context.Context) error {
 
 // OnMessage forwards every history addition to the UI.
 func (h *Interactive) OnMessage(m model.Message) { h.UI.Message(m) }
-
-// ParseLimitLine reads one of the numeric limit answers; empty or invalid input
-// disables that limit, like entering 0.
-func ParseLimitLine(s string) float64 {
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil || v < 0 {
-		return 0
-	}
-	return v
-}
 
 // askerOf pulls the origin label out of a loop's template variables. The loop
 // owns that map, so the seam that already carries the prompt context carries the

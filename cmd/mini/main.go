@@ -97,7 +97,6 @@ type options struct {
 	thinking        string
 	maxTokens       int
 	yolo            bool
-	costLimit       optionalFloat
 	configSpecs     stringList
 	output          string
 	exitImmediately bool
@@ -160,8 +159,6 @@ func parseFlags(args []string) (*options, error) {
 	fs.IntVar(&o.maxTokens, "max-tokens", 0, "output token budget (0 lets the server decide)")
 	fs.BoolVar(&o.yolo, "y", false, "run without confirmation (mode=yolo)")
 	fs.BoolVar(&o.yolo, "yolo", false, "run without confirmation (mode=yolo)")
-	fs.Var(&o.costLimit, "l", "cost limit; 0 disables (needs model.pricing)")
-	fs.Var(&o.costLimit, "cost-limit", "cost limit; 0 disables (needs model.pricing)")
 	fs.Var(&o.configSpecs, "c", "config file, name, or key=value (repeatable; replaces the default mini.yaml)")
 	fs.StringVar(&o.output, "o", "", "trajectory file")
 	fs.StringVar(&o.output, "output", "", "trajectory file")
@@ -564,7 +561,6 @@ func buildConfig(o *options) (map[string]any, string, error) {
 		"run": map[string]any{"task": orUnset(o.task)},
 		"agent": map[string]any{
 			"mode":         strFn("yolo", o.yolo),
-			"cost_limit":   floatOrUnset(o.costLimit),
 			"confirm_exit": boolFn(false, o.exitImmediately),
 			"output_path":  orUnset(o.output),
 		},

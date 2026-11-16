@@ -26,7 +26,7 @@ func TestSentinelEchoIsJustACommand(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "a.py"), []byte("print(2)\n"), 0o644)
 
 	l := &Loop{
-		Cfg: &Config{SystemTemplate: "s", InstanceTemplate: "t", CostLimit: 10},
+		Cfg: &Config{SystemTemplate: "s", InstanceTemplate: "t"},
 		Model: &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 			turn("chained", "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"),
 			done("The staged change is the only edit: print(1) became print(2)."),

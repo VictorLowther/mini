@@ -53,8 +53,6 @@ func newConfig(mode string, whitelist ...string) *agent.Config {
 	return &agent.Config{
 		Mode:             mode,
 		WhitelistActions: whitelist,
-		CostLimit:        10,
-		StepLimit:        0,
 		ConfirmExit:      true,
 		SystemTemplate:   "sys",
 		InstanceTemplate: "task={{.task}}",
@@ -381,45 +379,6 @@ func TestConfirmExitFalseNeverPrompts(t *testing.T) {
 	}
 	if len(h.ui.kinds) != 0 {
 		t.Errorf("unexpected prompts: %s", kinds(h))
-	}
-}
-
-func TestLimitsExceededDoesNotBlockWithoutATerminal(t *testing.T) {
-	c := newConfig("yolo")
-	c.CostLimit = 0.5
-	l, h := pair(t, c, []any{"echo one", "echo two"}, &env.Local{}, "", false)
-	done := make(chan struct{})
-	var info map[string]any
-	go func() { info, _ = l.Run(context.Background(), "T"); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the limits prompt blocked a non-interactive run")
-	}
-	if info["exit_status"] != "LimitsExceeded" {
-		t.Errorf("info = %#v", info)
-	}
-	if strings.Contains(kinds(h), "limits") {
-		t.Error("must not prompt for limits without a terminal")
-	}
-}
-
-func TestLimitsPromptLiftsTheCeiling(t *testing.T) {
-	c := newConfig("yolo")
-	c.CostLimit = 0.5
-	l, h := pair(t, c, []any{"echo one", submit("done")}, &env.Local{}, "10\n10\n\n", true)
-	info, err := l.Run(context.Background(), "T")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info["exit_status"] != "Submitted" {
-		t.Errorf("info = %#v", info)
-	}
-	if c.CostLimit != 10 || c.StepLimit != 10 {
-		t.Errorf("limits not lifted: %+v", c)
-	}
-	if !strings.Contains(h.output(), "Limits exceeded") {
-		t.Errorf("banner missing:\n%s", h.output())
 	}
 }
 
