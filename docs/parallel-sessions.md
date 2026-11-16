@@ -4,7 +4,9 @@ Status: **built through §7 step 6.** The prerequisite (steps 1-5) and feature 1
 subagents - are in the tree and tested; what remains is step 7, the multi-session
 UI, and the confirmation bubbling it carries (the one thing that makes spawning
 from a `confirm`-mode parent refuse rather than over-grant, §5.5). §8 is the
-record of what landed and where. The first draft of this document was written
+record of what landed and where. §3.7 and decision 13 settle the last structural
+seam - how a session asks a person something when it is not in a position to use
+its own prompt path. The first draft of this document was written
 from mini's own source alone, before the survey in §3, and the survey disagreed
 with it in eight places. Those are
 recorded in §3.5 rather than quietly edited out, because the disagreements are
@@ -389,6 +391,70 @@ and the next reader is owed them.
    either - but it is deferred, not resolved, and §5.9 says so at the point where
    someone will decide to spawn a writing subagent.
 
+### 3.7 Asking the human from outside the loop
+
+The seam §9.4's queue and §5.5's bubbling both lead to: a session needs something
+from a person, and it is not in a position to use its normal prompt path - it is a
+child, or a background job, or a resumed run nobody has typed at yet. Four
+harnesses have solved this and they split into two camps.
+
+**qwen-code: bridge it to the nearest ancestor that can answer.** An approval
+request is an event carrying `respond` - literally a callback the requester
+closes over (`AgentApprovalRequestEvent`, `background-tasks.ts:240-258`) - plus a
+`subagentId` that says which descendant is waiting. The comment on that field is
+the load-bearing one: the bridge caller **declares** it, because "the runtime id
+and the registry agentId use different suffixes, so comparing them cannot
+distinguish own from nested." Attribution cannot be derived; it has to be carried.
+
+The interesting part is what the callback *isn't*. The machinery is in answering
+"who can hear this?": `findBackgroundedAncestorAgentId` walks the lineage links to
+the nearest backgrounded, still-running ancestor (`agent.ts:501-520`), because "a
+nested foreground agent has no inline UI. Its scheduler's TOOL_WAITING_APPROVAL
+fires on the invocation's own emitter, which nothing bridges - the call would wait
+forever." Approvals get parked "exactly where the ancestor's own approvals go," so
+one dialog answers a whole tree. Three refinements, each a scar:
+
+- **No ancestor, no bridge.** A top-level foreground launch "keeps the inline
+  confirmation path unchanged" - the fallback is a different mechanism, not a hang.
+- **Double answers are deduped** by a per-call `responded` guard, because a dialog
+  and an inline path can both be live.
+- **The bridge is skipped when the ancestor auto-denies**
+  (`getShouldAvoidPermissionPrompts`),
+  since under that ancestor "no TOOL_WAITING_APPROVAL can fire and the subscription
+  would be dead."
+- Cycle protection comes from a visited set rather than a hop budget, because depth
+  is configurable up to 100.
+
+**oh-my-pi: do not bridge. Refuse, and make the spawn the boundary.** Flatly the
+other answer (`docs/approval-mode.md`): "Subagents run headless with
+`tools.approvalMode: yolo` so ordinary tier-based prompts do not stall them. **The
+parent `task` approval is the authorization boundary.** Per-tool policies still use
+the normal resolver: user `deny` remains absolute, and any call that resolves to
+`prompt` rejects because a headless subagent cannot satisfy it" (:216). And the
+general rule behind it: "Without an interactive UI (print mode, headless
+subagents, the Cursor exec bridge) the call is refused, like any other prompt with
+nobody to answer it" (:63).
+
+omp also puts a **floor under yolo inheritance**: stealing the user's foreground
+must be asked for "in every mode", and the mode that makes subagents headless
+deliberately cannot grant it, "because the default `yolo` would otherwise let every
+headless subagent take the user's foreground" (:130). Headlessness is a convenience
+for ordinary prompts, not a licence.
+
+**zero: inherit, never widen, and resolve at the seam.** A member's
+`PermissionMode` is empty to mean "inherit the orchestrator's mode (never
+widened)" (`swarm/definition.go:110`), and the spec that crosses the launcher seam
+carries a resolved model "never the `inherit` sentinel" (`member.go:23`) - the same
+resolve-before-crossing discipline §5.1 cites for authority. Its subagent prompt is
+also the clearest statement of §9.7's identity paragraph in the survey: "You start
+with zero context - the briefing below is all you know."
+
+**crush** sidesteps the question by construction: subagents are dispatched into a
+read-only or full access tier chosen at spawn time (`readOnlyParent`,
+`resolveSubagent`, `agent_dispatch.go:383-402`), so the capability that would need
+asking for is largely not offered, and what is offered needs no prompt. That is
+omp's posture with the tier chosen per dispatch instead of per mode.
+
 ## 4. What mini already proved
 
 Worth recording because it is surprising and because it decided the shape of the
@@ -450,7 +516,7 @@ host.Session                one per conversation - top-level, resumed, or subage
   CancelTurn / Quit / Close this session only, never a sibling
 ```
 
-### The twelve settled decisions
+### The thirteen settled decisions
 
 **1. Assembly takes a merged config, not flags.** `Spec.Config` is
 `map[string]any`, already resolved. `cmd/mini` keeps owning flags, `-c` specs
@@ -957,6 +1023,59 @@ else* - the parent, collecting a report - so that is where the claim has to be
 tested, and §5.10 tests it in the row. The principle lands entirely inside the
 agent kind, and the loop never learns about it.
 
+**13. Asking the human is a callback the session owns, and its absence is a
+refusal rather than a wait.** Settled from the survey in §3.7 and the maintainer's
+leaning toward exactly the mechanism qwen turns out to use.
+
+Every session carries an `Asker`: one function it calls when it needs a person and
+cannot use its ordinary prompt path - a subagent's confirmation, a resumed run's
+question, a limit reached while nobody is watching. The child constructs the
+question, hands it over, and waits for the answer; that is the callback, and it is
+all the seam is. What the survey adds is the four things that have to be decided
+*around* it, none of which are the callback itself:
+
+- **Attribution is carried, never derived.** qwen's `subagentId` exists because
+  ids from different layers cannot be compared to tell own work from nested
+  ("comparing them cannot distinguish own from nested; the bridge caller declares
+  it"). So `ui.Question` gains an origin set by the asker, naming the session that
+  is waiting - which is §5.5's field and §9.4's queue finally having a producer.
+- **Who can hear it.** In qwen that costs a lineage walk, a visited set and a
+  "nearest backgrounded ancestor" rule because its tree nests to 100. mini's tree
+  is two levels by construction (§5.6, backstopped by `Create`), so the answer is
+  one hop: **ask my parent's asker, or there is none.** The machinery the survey
+  found is real and mini gets to skip almost all of it - which is the strongest
+  argument for the simple shape rather than against it.
+- **No asker means refuse, not wait.** Both omp (:63, :216) and qwen's
+  no-ancestor case land here, and it is the rule the design already uses for
+  `job_send` on a bash job: the request fails with a reason the model can act on.
+  A callback with no implementation hanging forever is precisely qwen's "the call
+  would wait forever" failure, arrived at by a different road.
+- **Double answers are guarded.** qwen needs a per-call `responded` flag because a
+  dialog and an inline path can both be live. mini has one path and a queue that
+  hands out one turn at a time (§9.4), so this is already paid for - but it should
+  stay in mind the day a second answering surface appears.
+
+**Headlessness is not a licence, and there is a floor under inheritance.** omp
+makes subagents yolo so ordinary prompts do not stall them, keeps `deny` absolute,
+and refuses to let that convenience grant the capability that would take the
+user's foreground "in every mode". mini's version of that line is worth naming now
+even though it has nothing to put behind it yet: an unattended child may not gain
+anything the human never approved, and `job_kill` with `all: true` is already
+treated this way - the harness refuses to guess at a sweeping action and makes the
+model ask for it explicitly. If step 6 grows a capability whose blast radius spans
+sessions, that is where the floor goes.
+
+**This retires the confirm-mode spawn guard, and that is its point.** The guard
+added in §8 - refuse to spawn from a `confirm` parent because the child would run
+unattended - was the right call while bubbling did not exist, and it was always
+meant to be temporary: `TestConfirmModeParentCannotSpawnYet` skips itself when it
+becomes obsolete. Once a child's questions reach a human, omp's posture is the
+better one: the child runs, ordinary prompts bubble, anything that cannot reach a
+person refuses with a reason, and **the delegation itself is the thing the human
+approves** - which is a decision they can actually make, taken once, at the point
+where they can see the task, rather than one they are asked to make blind per
+command from a transcript they cannot see.
+
 ### Report contract
 
 The report is the child's **submission at quiescence**: its `exit` message
@@ -1046,7 +1165,8 @@ push).
    resuming the same project; queued
    (not refused) queries under a saturated gate; a parent deletion that leaves
    no directory behind; an orphaned child swept at open.
-6. **Built; bubbling deferred to step 7** (§8). Feature 1: `KindAgent`; `Spec.Config` derived from the
+6. **Built; bubbling deferred to step 7** (§8). Feature 1: `KindAgent`; `Spec.Config`
+  derived from the
    parent - constructed inside the tool call as a fresh copy, so nothing is
    inherited by accident (§9.8); two tools, `agent` to spawn and `job_send` to
    speak to a child whether it is running or finished (§9.3, §9.5, §9.11), the
