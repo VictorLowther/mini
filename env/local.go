@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -25,6 +27,11 @@ type Local struct {
 	CWD string
 	// Env overrides the inherited process environment (the config's env block).
 	Env map[string]string
+	// Logger receives the interpreter's own failures. Nil is slog.Default().
+	// It exists for one reason - the interp.Run recover below - so a panic
+	// inside the third-party interpreter is reported with its stack instead of
+	// arriving at the model as a bare command failure nobody can act on.
+	Logger *slog.Logger
 	// Timeout bounds one command. Zero means DefaultTimeout, and a negative
 	// value means no deadline at all: only the caller's context can end the
 	// run. That is what a background job needs
@@ -64,6 +71,37 @@ func (l *Local) runContext(ctx context.Context) (context.Context, context.Cancel
 	}
 	cctx, cancel := context.WithTimeout(ctx, d)
 	return cctx, cancel, d
+}
+
+// logger is the interpreter's own sink; nil means the process default.
+func (l *Local) logger() *slog.Logger {
+	if l.Logger != nil {
+		return l.Logger
+	}
+	return slog.Default()
+}
+
+// recoveredPanic turns a panic from inside mvdan.cc/sh into the failed Result
+// the caller expects, after saying so loudly: level error, the offending
+// command, and the stack, because the stack is the only thing that distinguishes
+// "an input shape we can tell the model to avoid" from "a bug worth filing
+// upstream" - and without it logged, both look identical to a command that
+// simply did not work.
+//
+// The command text is logged in full rather than truncated. It is the repro, so
+// a shortened copy is not actionable, and a panic path is not where a size limit
+// earns anything.
+func (l *Local) recoveredPanic(rec any, command, dir string) Result {
+	l.logger().Error("interpreter panic: recovered so the run survives, but this is a bug in mvdan.cc/sh or an input shape worth working around",
+		"panic", fmt.Sprint(rec),
+		"command", command,
+		"cwd", dir,
+		"stack", string(debug.Stack()))
+	return Result{
+		ReturnCode:    -1,
+		ExceptionInfo: fmt.Sprintf("An error occurred while executing the command: command execution panic: %v", rec),
+		Extra:         map[string]any{"exception_type": "Panic", "exception": fmt.Sprint(rec)},
+	}
 }
 
 // Execute runs one command and returns its Result. The only Go error it
@@ -127,15 +165,17 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 	}
 
 	// interp.Run can panic on exotic input; a panic must not kill the agent.
-	// The command's bytes are already in out, so the Result only reports the
-	// failure itself.
+	// Recovering here is deliberate and it is the only recover in mini's
+	// runtime path (docs/parallel-sessions.md §9.12): every other panic is a
+	// bug in mini and is left loud and fatal on purpose. This one is not our
+	// bug, so it is caught - but "caught" must not mean "quiet", or a repeatable
+	// interpreter fault reaches the model as an unexplained exit -1 and nobody
+	// ever learns there is an upstream issue to file or a syntax to work around.
+	// Hence recoveredPanic, which logs the stack at error level before building
+	// the Result.
 	defer func() {
 		if rec := recover(); rec != nil {
-			result = Result{
-				ReturnCode:    -1,
-				ExceptionInfo: fmt.Sprintf("An error occurred while executing the command: command execution panic: %v", rec),
-				Extra:         map[string]any{"exception_type": "Panic", "exception": fmt.Sprint(rec)},
-			}
+			result = l.recoveredPanic(rec, command, dir)
 			err = nil
 		}
 	}()

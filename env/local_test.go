@@ -3,12 +3,15 @@ package env
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -397,3 +400,77 @@ func TestNegativeTimeoutMeansNoDeadline(t *testing.T) {
 		t.Error("the run returned before the sleep finished")
 	}
 }
+
+// TestRecoveredPanicIsLoud covers the one recover in mini's runtime path.
+// Catching an interpreter panic is deliberate - it is not our bug, and a command
+// must not kill the agent - but per docs/parallel-sessions.md §9.12 it must not
+// be quiet either. A repeatable fault that arrives only as "exit -1, something
+// about a panic" is indistinguishable from a command that simply did not work,
+// and then nobody learns there is an upstream issue to file or a syntax to route
+// around. So the policy is asserted rather than trusted: error level, the stack,
+// and the full command. The function under test is what Execute's deferred
+// recover calls; the panic itself cannot be provoked reliably from a script,
+// which is the entire reason the recover exists.
+func TestRecoveredPanicIsLoud(t *testing.T) {
+	var mu sync.Mutex
+	var captured []slog.Record
+	l := &Local{Logger: slog.New(&captureHandler{mu: &mu, out: &captured})}
+
+	const cmd = `echo ${ arr[99999999`
+	got := l.recoveredPanic(errors.New("runtime error: index out of range"), cmd, "/some/dir")
+
+	if got.ReturnCode != -1 {
+		t.Errorf("return code = %d, want -1", got.ReturnCode)
+	}
+	if got.Extra["exception_type"] != "Panic" {
+		t.Errorf("exception_type = %v, want Panic", got.Extra["exception_type"])
+	}
+	if !strings.Contains(got.ExceptionInfo, "command execution panic") {
+		t.Errorf("ExceptionInfo = %q, want the model-facing panic text", got.ExceptionInfo)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 1 {
+		t.Fatalf("log records = %d, want exactly 1 - the recover has to speak", len(captured))
+	}
+	r := captured[0]
+	if r.Level != slog.LevelError {
+		t.Errorf("level = %v, want error", r.Level)
+	}
+	attrs := map[string]string{}
+	r.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value.String(); return true })
+	for key, want := range map[string]string{
+		"panic":   "index out of range",
+		"command": cmd,
+		"cwd":     "/some/dir",
+		"stack":   "goroutine",
+	} {
+		if !strings.Contains(attrs[key], want) {
+			t.Errorf("attr %q = %.80q, want it to contain %q", key, attrs[key], want)
+		}
+	}
+	// The command is logged whole, not truncated: it is the repro, so a
+	// shortened copy cannot be replayed, and this is not where a size limit
+	// earns anything.
+	if attrs["command"] != cmd {
+		t.Errorf("command attr = %q, want the exact input", attrs["command"])
+	}
+}
+
+// captureHandler is a minimal slog sink: the assertion is about records, so
+// slog's own handlers would only be in the way.
+type captureHandler struct {
+	mu  *sync.Mutex
+	out *[]slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.out = append(*h.out, r.Clone())
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
