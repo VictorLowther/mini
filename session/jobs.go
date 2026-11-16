@@ -301,7 +301,7 @@ WHERE session_id = ? AND id = ?`, pid, pgid, time.Now().UnixMilli(), s.ID.String
 // front end can show the human what mini cannot prove - that nothing is still
 // holding the GPU - instead of printing "still running" from a stale column.
 func (s *Session) SweepOrphanedJobs() ([]string, error) {
-	rows, err := s.store.db.Query(`SELECT id, label, command FROM jobs
+	rows, err := s.store.db.Query(`SELECT id, label, command, started_at FROM jobs
 WHERE session_id = ? AND state = 'running'`, s.ID.String())
 	if err != nil {
 		return nil, fmt.Errorf("session store: find orphaned jobs: %w", err)
@@ -309,11 +309,12 @@ WHERE session_id = ? AND state = 'running'`, s.ID.String())
 	defer rows.Close()
 	type stale struct {
 		id, label, command string
+		started            int64
 	}
 	var staleRows []stale
 	for rows.Next() {
 		var v stale
-		if err := rows.Scan(&v.id, &v.label, &v.command); err != nil {
+		if err := rows.Scan(&v.id, &v.label, &v.command, &v.started); err != nil {
 			return nil, fmt.Errorf("session store: find orphaned jobs: %w", err)
 		}
 		staleRows = append(staleRows, v)
@@ -339,6 +340,21 @@ WHERE session_id = ? AND state = 'running'`, now, now, s.ID.String()); err != ni
 		warnings = append(warnings, fmt.Sprintf(
 			"marked reloaded running job %s (%s) as orphaned; original process ownership was lost",
 			v.id, trunc(name, 60)))
+		// Orphaning *is* a finish, so it queues a firing like any other, and the
+		// result becomes debt the resumed conversation pays at its first step
+		// boundary. Without this the model learns nothing about a soak its own
+		// previous process was killed holding - the ending happened, nobody was
+		// told, and the log just stopped growing.
+		//
+		// This is also where an unfired monitor on the job would be cancelled
+		// when monitors exist: a job that finished cannot produce another
+		// result, and the exit firing is its last word. See Manager.recordExit.
+		if _, err := s.RecordJobEvent(JobEventRow{
+			JobID: v.id, MonitorID: "exit", Reason: JobOrphaned,
+			FiredAt: now, ExitReason: trunc(name, 60),
+		}); err != nil {
+			return warnings, err
+		}
 	}
 	return warnings, nil
 }
@@ -356,16 +372,20 @@ func trunc(s string, n int) string {
 // and the batch injector consume the same record and a firing is delivered at
 // most once. Only the table exists today; the monitor engine writes it.
 type JobEventRow struct {
-	ID          int64
-	JobID       string
-	MonitorID   string
-	Reason      string
-	LineNo      *int
-	ByteOffset  *int64
-	Matched     string
-	Context     string
-	Elapsed     int64
-	ExitCode    *int
+	ID         int64
+	JobID      string
+	MonitorID  string
+	Reason     string
+	LineNo     *int
+	ByteOffset *int64
+	Matched    string
+	Context    string
+	Elapsed    int64
+	ExitCode   *int
+	// ExitReason carries what the harness knew about the ending when the ending
+	// was not the job's own - the orphan case, where there is no exit code and
+	// the most useful fact is which run it was.
+	ExitReason  string
 	FiredAt     int64
 	DeliveredAt *int64
 }
@@ -380,7 +400,7 @@ func (s *Session) RecordJobEvent(e JobEventRow) (int64, error) {
 (session_id, job_id, monitor_id, reason, line_no, byte_offset, matched, context, elapsed, exit_code, fired_at, delivered_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) RETURNING id`,
 		s.ID.String(), e.JobID, or(e.MonitorID, "exit"), e.Reason, int64p(e.LineNo),
-		e.ByteOffset, e.Matched, e.Context, e.Elapsed, int64p(e.ExitCode), e.FiredAt).Scan(&id)
+		e.ByteOffset, e.Matched, or(e.Context, e.ExitReason), e.Elapsed, int64p(e.ExitCode), e.FiredAt).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("session store: record job event: %w", err)
 	}

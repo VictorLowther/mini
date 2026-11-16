@@ -501,6 +501,23 @@ carries the fourth, because what becomes delivered is the *result*, not the job.
 `UndeliveredFirings()` is therefore the authoritative question: **what does the
 conversation still owe?**
 
+Two rules settle what that debt means, and both were decisions rather than
+discoveries:
+
+- **Any queued firing is debt, whatever its reason.** The exit firing and (once
+  monitors exist) a match firing are the same kind of object to the loop. The
+  alternative was a special case per reason code, and a special case is where
+  delivery rules go to rot.
+- **Finishing cancels the job's unfired monitors, before the exit firing is
+  queued.** A job that has finished cannot produce another result, so a rule still
+  armed against its log is a promise that can never be kept - and had it fired
+  afterwards, the run would have taken a step to report news about a job that had
+  already said its last thing. Cancelling first is also what makes the debt
+  *finite and decidable*: at most one firing per monitor plus one exit firing per
+  job, so `UndeliveredFirings` means "results owed" and never "results that might
+  still arrive". The place this will be enforced is `Manager.recordExit`, the one
+  site that writes a job's last word, and the invariant is stated there in code.
+
 Backgrounded and foreground jobs are the same machine. They differ in exactly one
 respect:
 
@@ -522,7 +539,14 @@ Three consequences, each of which removed a mechanism:
    cancel path is needed to make progress possible. Termination is structural:
    firings are claimed when delivered, so each continuation retires one debt and
    cannot repeat.
-3. **The card was already showing this state.** "Finished, not yet reported" is
+3. **Orphaning counts as finishing, so a crash is reported rather than
+   discovered.** The startup sweep queues a firing for every row it ends, which
+   means resuming a session whose soak died with the previous process tells the
+   model at its first boundary - "job j1 ended: orphaned ... python train.py" -
+   instead of letting it find out hours later that the log stopped growing for a
+   reason. The debt survives in the database, so this holds even when nothing was
+   alive to notice the death.
+4. **The card was already showing this state.** "Finished, not yet reported" is
    the `running -> finished` edge without the `finished -> delivered` edge - which
    is why `ui.JobCard.Notified` exists and needed no new plumbing.
 
@@ -1169,16 +1193,15 @@ ask for a job. Step 2 (promotion) is where the tool surface appears.
    prefix, but it means the last *synchronous* observation of a long command is
    "moved to background" — so `jobs` must be discoverable from the summary text
    if compaction eats the wake (durable-state list above).
-2. ~~Should a wake be able to resume a run that has already submitted?~~
-   **Answered by the state machine: a finished-but-undelivered result continues
-   the run, and nothing else does.** What remains genuinely open is narrower and
-   belongs to the monitor engine: a *match* wake for a job that keeps running
-   (a training run logging `val_loss=nan`) is not a `finished` transition, so
-   under the rule above it owes nothing and would not re-enter the loop. Either
-   match firings count as owed results - in which case "delivered" is about the
-   event, not the job's end, which the schema already supports - or long-lived
-   jobs need an explicit "watch and stop" affordance. Cheap reading is that any
-   queued firing is a debt, which the current query already expresses.
+2. ~~Should a wake be able to resume a run that has already submitted? What about
+   a match wake for a job that never finishes?~~ **Settled: any queued firing is
+   debt, so both continue the run, and the match question dissolves.** A training
+   run logging `val_loss=nan` is still running, but the firing its monitor queued
+   is owed, so the next boundary pays it and the conversation continues - no
+   "watch and stop" affordance needed, because `finished` is no longer what
+   creates an obligation. The complementary rule keeps that from becoming
+   unbounded: finishing cancels unfired monitors, so a job's debt is capped and the
+   run can always reach a state where it owes nothing.
 3. ~~Confirm mode and `all`.~~ **Settled: no prompt, for `all` included.** This
    doc originally said a kill is still a shell side effect and should inherit the
    gate, by way of zero's `TaskStop`. That is wrong, and the mistake is

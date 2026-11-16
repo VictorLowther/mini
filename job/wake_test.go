@@ -107,26 +107,27 @@ func TestClaimFiringsReportsEachEndingOnce(t *testing.T) {
 	}
 }
 
-// The card asks whether an ended job's wake has been collected yet, which is how
-// a human sees the difference between "finished" and "finished and nobody has
-// been told".
-func TestHasUndeliveredExitTracksTheQueue(t *testing.T) {
+// The card asks whether a job has a result still sitting in the queue, which is
+// how a human sees the difference between "finished" and "finished and nobody has
+// been told yet". Any firing counts: when monitors exist, a match wake holds the
+// card in the same state.
+func TestHasUndeliveredFiringTracksTheQueue(t *testing.T) {
 	m, _ := newMgr(t, 0)
 	r, err := m.Start(Spec{Command: "echo bye", TCNO: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	finish(t, r)
-	if !m.HasUndeliveredExit("j1") {
+	if !m.HasUndeliveredFiring("j1") {
 		t.Fatal("an unreported ending is not flagged")
 	}
-	if m.HasUndeliveredExit("j99") {
+	if m.HasUndeliveredFiring("j99") {
 		t.Error("an unknown job is flagged")
 	}
 	if _, err := m.ClaimFirings(4); err != nil {
 		t.Fatal(err)
 	}
-	if m.HasUndeliveredExit("j1") {
+	if m.HasUndeliveredFiring("j1") {
 		t.Error("the ending is still flagged after being delivered")
 	}
 }

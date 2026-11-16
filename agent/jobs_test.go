@@ -746,3 +746,49 @@ func TestOwedDeliveriesSurviveIntoTheNextRun(t *testing.T) {
 }
 
 func isExit(m model.Message) bool { return m["role"] == "exit" }
+
+// The resume case this decision exists for. A soak that was killed when the
+// previous process died is finished-but-never-said, so the resumed run pays that
+// debt at its first boundary: the model is told before it is asked for anything,
+// rather than discovering hours later that the log stopped growing for a reason.
+func TestResumeReportsJobsOrphanedByThePreviousRun(t *testing.T) {
+	l, jm, _ := newJobLoop(t, &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		done("understood, submitting"),
+	}}, &env.Local{Timeout: 5 * time.Second})
+	// What a crashed session leaves behind: a row still marked running.
+	if _, err := jm.Session.CreateJob(session.JobRow{ID: "j1", Command: "python train.py", Label: "finetune"}); err != nil {
+		t.Fatal(err)
+	}
+	warnings := jm.Sweep()
+	if len(warnings) != 1 {
+		t.Fatalf("sweep warnings = %v", warnings)
+	}
+	if n := jm.OwedDeliveries(); n != 1 {
+		t.Fatalf("owed after the sweep = %d, want 1", n)
+	}
+
+	info, err := run(t, l, "continue the work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wakes := jobWakes(l)
+	if len(wakes) != 1 {
+		t.Fatalf("wake messages = %d, want 1:\\n%s", len(wakes), dumpHistory(l))
+	}
+	for _, want := range []string{"job j1 ended: orphaned", "finetune", "python train.py", "ownership was lost"} {
+		if !strings.Contains(wakes[0], want) {
+			t.Errorf("wake missing %q:\\n%s", want, wakes[0])
+		}
+	}
+	// The wake came first, so the model was informed rather than surprised, and
+	// the debt is cleared: a second resume says nothing.
+	if got := info["exit_status"]; got != model.KindSubmitted {
+		t.Errorf("exit_status = %v", got)
+	}
+	if n := jm.OwedDeliveries(); n != 0 {
+		t.Errorf("owed after delivery = %d", n)
+	}
+	if !isExit(l.Messages[len(l.Messages)-1]) {
+		t.Errorf("history must end with the exit row:\\n%s", dumpHistory(l))
+	}
+}

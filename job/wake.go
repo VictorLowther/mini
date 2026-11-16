@@ -60,12 +60,13 @@ func (m *Manager) ClaimFirings(limit int) ([]Firing, error) {
 	return out, nil
 }
 
-// HasUndeliveredExit reports whether a job's own ending is still sitting in the
-// queue undelivered. The card uses it for "finished, not yet reported" - the
-// state a human needs to see in the gap between a job ending and the next turn
-// boundary - and it reads the same queue the hold watches, so the two
-// consumers agree on what "reported" means without talking to each other.
-func (m *Manager) HasUndeliveredExit(id string) bool {
+// HasUndeliveredFiring reports whether a result from this job is still
+// sitting in the queue undelivered - any result, the exit firing or (when
+// monitors land) a match, because queued firings are the debt and the reason
+// does not matter. The card uses it for "finished, not yet reported": the state
+// a human needs to see in the gap between a job ending and the boundary that
+// says so.
+func (m *Manager) HasUndeliveredFiring(id string) bool {
 	events, err := m.Session.PendingJobEvents(32)
 	if err != nil {
 		return false

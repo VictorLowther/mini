@@ -66,7 +66,7 @@ func (j jobCards) JobCard(id string) (ui.JobCard, bool) {
 	if !card.Running {
 		// An ended job whose firing nobody has collected yet: the human can see
 		// the outcome, and the model will be told at the next turn boundary.
-		card.Notified = j.m.HasUndeliveredExit(id)
+		card.Notified = j.m.HasUndeliveredFiring(id)
 	}
 	return card, true
 }

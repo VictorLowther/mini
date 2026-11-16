@@ -464,3 +464,64 @@ func TestUndeliveredFiringsIsTheDebtQuestion(t *testing.T) {
 		t.Errorf("session b's firing showed up in a's debt: %d", n)
 	}
 }
+
+// Orphaning is a finish, so it queues a firing like any other ending. Without
+// it, a soak killed by the previous process's death leaves the resumed model
+// with no reason to expect its work is gone - the log simply stopped growing and
+// nobody said so.
+func TestSweepOrphanedQueuesTheEnding(t *testing.T) {
+	st, _ := openStore(t)
+	s := newSession(t, st)
+	mkJob(t, s, "j1")
+	if _, err := s.CreateJob(JobRow{ID: "j2", Command: "python train.py", Label: "finetune"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.SweepOrphanedJobs(); err != nil {
+		t.Fatal(err)
+	}
+	owed, err := s.UndeliveredFirings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owed != 2 {
+		t.Fatalf("owed after sweeping two running jobs = %d, want 2", owed)
+	}
+	events, err := s.PendingJobEvents(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("pending = %d", len(events))
+	}
+	for _, e := range events {
+		if e.Reason != JobOrphaned {
+			t.Errorf("firing reason = %s, want %s", e.Reason, JobOrphaned)
+		}
+		// An orphan has no exit code and cannot invent one; the useful fact is
+		// which run it was, carried in context.
+		if e.ExitCode != nil {
+			t.Errorf("orphan firing claimed exit code %v", *e.ExitCode)
+		}
+	}
+	// It is debt exactly once: the resumed conversation pays it at a boundary and
+	// is not asked to pay it again.
+	ids := make([]int64, len(events))
+	for i, e := range events {
+		ids[i] = e.ID
+	}
+	if err := s.MarkJobEventsDelivered(ids); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UndeliveredFirings(); n != 0 {
+		t.Errorf("owed after delivery = %d", n)
+	}
+	// And a second sweep, with nothing running, queues nothing new.
+	w, err := s.SweepOrphanedJobs()
+	if err != nil || len(w) != 0 {
+		t.Errorf("second sweep: %v, %v", w, err)
+	}
+	if n, _ := s.UndeliveredFirings(); n != 0 {
+		t.Errorf("second sweep created %d new owed deliveries", n)
+	}
+}

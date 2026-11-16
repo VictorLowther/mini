@@ -305,7 +305,17 @@ func (m *Manager) recordEndLocked(r *Run, oc outcome) *session.JobRow {
 	return row
 }
 
-// recordExit turns a terminal state into a firing. This is what makes a wait
+// recordExit turns a terminal state into a firing, and is the one place a job's
+// last word is written.
+//
+// The invariant monitors must honour here: **finishing cancels the job's unfired
+// monitors**, before this firing is queued. A job cannot produce another result,
+// so a rule still armed against its log is a promise that can never be kept - and
+// if it fired afterwards the run would take a step to report news about a job that
+// had already said its last thing. Cancelling first also keeps the debt finite and
+// decidable: at most one firing per monitor plus the exit firing per job, and
+// UndeliveredFirings is then exactly "results owed", never "results that might
+// still arrive". This is what makes a wait
 // correct rather than merely fast: a job that ended while the model was doing
 // something else has to still be waiting there when the model asks, because the
 // alternative is a hold that ignores the one event it was asked to watch and
