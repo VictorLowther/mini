@@ -109,6 +109,13 @@ func TestShippedTemplatesRender(t *testing.T) {
 		// (model imports tpl), hence the literals. agent's
 		// TestShippedPromptsStateTheWindow keeps them honest.
 		"view_lines": 100, "view_chars": 10000,
+		// The generated tools listing (docs/parallel-sessions.md §5.6): the
+		// prompt describes tools from these rather than naming them in prose, so
+		// they have to resolve here too. Literals again, for the same reason as
+		// above - tpl cannot import model - and agent/prompt_test.go renders the
+		// real ToolSet end to end, which is what keeps these honest.
+		"tool_list": "- `bash` - run a bash command\n- `jobs` - list this session's jobs\n- `job_kill` - end a job",
+		"has_jobs":  true, "has_agent": false, "subagent": false,
 	}
 	for _, spec := range []string{"mini"} {
 		m, err := config.FromSpec(spec)

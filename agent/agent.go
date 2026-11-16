@@ -173,6 +173,20 @@ type Loop struct {
 	// the capture: the loop still writes each command's output to a scratch
 	// file it reads back.
 	Recorder Recorder
+	// Tools is the set this session was advertised, and the authority for what
+	// its own prompts may say about them (§5.6). Zero means the top-level set.
+	// A subagent gets model.SubagentTools, which is how "no spawn tool for
+	// children" reaches the instructions rather than only the request body: a
+	// capability that is hidden from the array but discussed in the prose is a
+	// capability the model will try to use and be refused for.
+	Tools model.ToolSet
+	// Spawner is the host seam the subagent tools need: the loop is not allowed
+	// to know what a session is, in the same way it is not allowed to know what
+	// a store is (Recorder) or what a terminal looks like (Hooks). nil means
+	// this loop cannot spawn, and the tools say so rather than failing quietly -
+	// they are not even advertised to it, since a loop built without a Spawner
+	// gets the subagent tool set (§5.6).
+	Spawner Spawner
 	// Handler receives streamed reasoning/content while Model.Query runs.
 	Handler *model.Handler
 	Logger  *slog.Logger
@@ -366,6 +380,57 @@ func (l *Loop) jobsObservation(action model.Action, sink io.Writer) env.Result {
 // `&`, make -j, a loop) and none of them is addressable as "the job" from
 // inside a shell. Cancellation reaches all of them, because the run owns the
 // context every command it started was signalled through.
+// spawnObservation answers an `agent` call the way a backgrounded bash call is
+// answered: with the job's id and where its output is going, and no result,
+// because there is not one yet. That is the contract the tool description sells
+// and the reason the row exists before the report does.
+func (l *Loop) spawnObservation(ctx context.Context, action model.Action, sink io.Writer) env.Result {
+	if l.Spawner == nil {
+		// Unreachable for a session assembled by host - a loop without a
+		// Spawner is not offered the tool - but a hand-built Loop could get
+		// here, and "this harness cannot spawn" is a truer answer than a panic.
+		return refusedObservation(errors.New("subagent spawning is not available in this session"))
+	}
+	name, _ := action.Args["name"].(string)
+	prompt, _ := action.Args["prompt"].(string)
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(prompt) == "" {
+		return refusedObservation(errors.New("agent needs both a short 'name' and the full 'prompt' for the subagent"))
+	}
+	reply, err := l.Spawner.Spawn(ctx, SpawnRequest{Name: name, Prompt: prompt})
+	if err != nil {
+		fmt.Fprintf(sink, "refused: %v\n", err)
+		return refusedObservation(err)
+	}
+	fmt.Fprintf(sink, "started subagent %q as job %s, output at %s\n", reply.Name, reply.JobID, reply.OutputPath)
+	return env.Result{
+		ReturnCode: 0,
+		Extra: map[string]any{
+			"job_id": reply.JobID, "job_output_path": reply.OutputPath,
+			"subagent": reply.Name,
+		},
+	}
+}
+
+// sendObservation answers `job_send`. Success is a bare ok: the message is not
+// an result the model waits on, and inventing a shape for "it was delivered"
+// would be one more thing to describe in the tool.
+func (l *Loop) sendObservation(ctx context.Context, action model.Action, sink io.Writer) env.Result {
+	if l.Spawner == nil {
+		return refusedObservation(errors.New("this session cannot speak to subagents"))
+	}
+	id, _ := action.Args["id"].(string)
+	text, _ := action.Args["text"].(string)
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(text) == "" {
+		return refusedObservation(errors.New("job_send needs an 'id' (from the jobs tool) and the 'text' to send"))
+	}
+	if err := l.Spawner.Send(ctx, id, text); err != nil {
+		fmt.Fprintf(sink, "refused: %v\n", err)
+		return refusedObservation(err)
+	}
+	fmt.Fprintf(sink, "delivered to %s\n", id)
+	return env.Result{ReturnCode: 0}
+}
+
 func (l *Loop) killObservation(action model.Action, sink io.Writer) env.Result {
 	if l.Jobs == nil {
 		return noRegistryResult()
@@ -526,8 +591,56 @@ func describeEndedJob(b *strings.Builder, j *session.JobRow) {
 	if size, age, ok := jobFileStat(j.OutputPath); ok {
 		fmt.Fprintf(b, "  (%s, last write %s)", size, age)
 	}
+	// A subagent's ending is its report, and the report has to arrive in the
+	// wake rather than one turn later after a read: the whole value of spawning
+	// is that a second context does work this one cannot hold, and paying a turn
+	// to fetch the answer would give the cost back. A bash job's ending is
+	// instead a pointer, because a build log is not something to paste.
+	//
+	// Both follow the same truncate-and-spill rule as any other observation -
+	// body inline up to the window, path for the rest - so the design's one
+	// output shape holds for a kind that had not been imagined when it was
+	// written (docs/parallel-sessions.md "Report contract").
+	if j.Kind == session.KindSubagent {
+		if body, ok := readJobBody(j.OutputPath, model.MaxViewChars); ok {
+			fmt.Fprintf(b, "\n\n%s\n", body)
+			if strings.HasSuffix(body, "(truncated)") {
+				fmt.Fprintf(b, "  the full report is in %s\n", j.OutputPath)
+			}
+			return
+		}
+		fmt.Fprintf(b, "  (the subagent left no report in %s)\n", j.OutputPath)
+		return
+	}
 	fmt.Fprintf(b, "\n  read it with: tail -n %d %s   (or grep -n PATTERN %s)\n",
 		model.MaxViewLines, j.OutputPath, j.OutputPath)
+}
+
+// readJobBody returns the first n bytes of a job's output file, marked as
+// truncated when there is more. Head rather than tail: a report leads with its
+// answer, while a build log - the other kind of job file - ends with it, which
+// is why the two cases above do not share this helper's excerpt rule.
+func readJobBody(path string, n int) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	buf := make([]byte, n+1)
+	read, _ := io.ReadFull(f, buf)
+	if read == 0 {
+		return "", true
+	}
+	if read > n {
+		// Cut the raw bytes at n and trim after, so the bound cannot exceed the
+		// slice it is applied to - trimming first and then slicing by the
+		// untrimmed length is how this panics on a report that ends in newlines.
+		return strings.TrimRight(string(buf[:n]), "\n") + "\n(truncated)", true
+	}
+	return strings.TrimRight(string(buf[:read]), "\n"), true
 }
 
 // lastJobSummary picks out the most recent ended job for the "nothing is
@@ -747,10 +860,61 @@ func (l *Loop) setCancelTurn(cancel context.CancelFunc) {
 	l.mu.Unlock()
 }
 
-func (l *Loop) setRunning(v bool) {
+// SpawnRequest is one subagent as the model asked for it. Name is the
+// human-facing label and Prompt the whole task, because a subagent starts with
+// no context at all (docs/parallel-sessions.md §5, ruling 1).
+type SpawnRequest struct {
+	Name   string
+	Prompt string
+}
+
+// SpawnReply is what the tool call returns immediately: the job the spawner can
+// already list, kill and send to. The report is not here - it arrives later, at
+// a step boundary, like any other background result (§5.10).
+type SpawnReply struct {
+	JobID      string
+	OutputPath string
+	Name       string
+}
+
+// Spawner is the host's side of the subagent tools. The loop calls it from the
+// agent goroutine only, exactly like the rest of the seams.
+type Spawner interface {
+	// Spawn opens the child session, registers it as a job of this session, and
+	// returns as soon as it is running.
+	Spawn(ctx context.Context, req SpawnRequest) (SpawnReply, error)
+	// Send delivers text to one of this session's agent jobs: a user message at
+	// the next boundary if it is running, a resume-and-deliver if it has stopped
+	// (§9.3). A job of any other kind is refused.
+	Send(ctx context.Context, jobID, text string) error
+}
+
+// ErrRunInProgress is what Run returns when the loop is already driving a
+// conversation. It names the alternative because the caller who hits it almost
+// always wanted the alternative: to say something to a running session.
+var ErrRunInProgress = errors.New("agent: a run is already in progress on this session; use QueueMessage to speak to it")
+
+// beginRun claims the loop for one run, reporting whether it was free. The test
+// and the set are one critical section - checking Running() and then setting it
+// is the race, not a narrower version of it.
+func (l *Loop) beginRun() bool {
 	l.mu.Lock()
-	l.running = v
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	if l.running {
+		return false
+	}
+	l.running = true
+	return true
+}
+
+// tools is the advertised set, defaulting to the top-level one so a Loop built
+// by hand - every test, and any future caller that did not think about kinds -
+// renders the prompt it always has.
+func (l *Loop) tools() model.ToolSet {
+	if len(l.Tools) > 0 {
+		return l.Tools
+	}
+	return model.TopLevelTools()
 }
 
 func (l *Loop) logger() *slog.Logger {
@@ -781,6 +945,14 @@ func (l *Loop) TemplateVars(kwargs ...map[string]any) map[string]any {
 			// comes back truncated again. Interpolate the consts instead.
 			"view_lines": model.MaxViewLines,
 			"view_chars": model.MaxViewChars,
+			// The tools, generated from the one set rather than written again.
+			// `subagent` is derived from the absence of the spawn tool rather
+			// than stored beside it, so the two cannot disagree: visibility is
+			// the mechanism, and this makes it the same fact in three places.
+			"tool_list": l.tools().Listing(),
+			"has_jobs":  l.tools().Has(model.ToolJobs),
+			"has_agent": l.tools().Has(model.ToolAgent),
+			"subagent":  !l.tools().Has(model.ToolAgent),
 		},
 		l.extraVars,
 	)
@@ -817,8 +989,24 @@ func (l *Loop) addMessages(msgs ...model.Message) []model.Message {
 // message lands at the end of the history. It returns the last message's extra
 // (exit_status, submission), or the error that ended the run.
 func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (map[string]any, error) {
-	l.setRunning(true)
-	l.runCtx = ctx
+	// Single-flight, and it refuses rather than queues. Running() has always
+	// been advisory - the front ends use it to grey out a button - but a Loop
+	// owns one history, one cost ledger and one cancel slot, so a second
+	// concurrent Run would interleave turns into the first one's transcript and
+	// both would believe they held the cancel. With one session per process the
+	// UI's discipline was enough; with subagents and a multi-session window the
+	// loop is reachable from goroutines that were never going to coordinate, so
+	// the guarantee belongs here (docs/parallel-sessions.md §3.5.6).
+	//
+	// Refusing rather than blocking is the half that comes from mini having a
+	// steering channel: QueueMessage is the supported way to reach a live loop
+	// (agent.go:676-678), so a second caller has made a mistake the loop can
+	// name, not a request to be queued. zero blocks for exactly this reason and
+	// can afford to - its ACP sessions have nothing else to say with.
+	if !l.beginRun() {
+		return nil, ErrRunInProgress
+	}
+	l.setRunCtx(ctx)
 	defer func() {
 		l.mu.Lock()
 		l.running = false
@@ -1062,11 +1250,25 @@ func (l *Loop) interrupted(cause error) error {
 
 // runContext returns the context of the whole run (never a cancelled turn
 // context), falling back to Background when no run is active.
+//
+// Both sides of runCtx take l.mu. The field used to be touched only from the
+// agent goroutine, which is why it escaped the mutex, but a second reader now
+// exists by design: anything watching a live loop from another goroutine - a
+// parent polling a subagent, a front end with more than one session - asks this
+// question while Run is writing the answer.
 func (l *Loop) runContext() context.Context {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.runCtx != nil {
 		return l.runCtx
 	}
 	return context.Background()
+}
+
+func (l *Loop) setRunCtx(ctx context.Context) {
+	l.mu.Lock()
+	l.runCtx = ctx
+	l.mu.Unlock()
 }
 
 // Query asks the model for the next turn, after checking the limits (which
@@ -1241,6 +1443,10 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 			res = l.jobsObservation(action, sink)
 		case model.ToolJobKill:
 			res = l.killObservation(action, sink)
+		case model.ToolAgent:
+			res = l.spawnObservation(ctx, action, sink)
+		case model.ToolJobSend:
+			res = l.sendObservation(ctx, action, sink)
 		default:
 			res, detached, err = l.runCommand(ctx, action, tc, sink)
 		}
