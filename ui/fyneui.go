@@ -69,6 +69,9 @@ type GUI struct {
 	v         *guiView
 	// jobs backs the live cards for calls that handed off. See GUIOptions.Jobs.
 	jobs JobReader
+	// asks serializes prompts so exactly one question is on screen at a time.
+	// See askQueue and docs/parallel-sessions.md §9.4.
+	asks askQueue
 
 	// post delivers a closure to the thread that owns the canvas, and it is the
 	// only way anything here may reach the view: the deferred passes are
@@ -437,6 +440,17 @@ func (g *GUI) Write(p []byte) (int, error) {
 
 // Ask shows a question and blocks until the keyboard answers it.
 func (g *GUI) Ask(ctx context.Context, q Question) (Answer, error) {
+	// Take the turn first. Publishing without it is the bug §9.4 records: this
+	// function used to overwrite g.pending unconditionally, so a second caller
+	// silently orphaned the first one's channel and that goroutine waited for an
+	// answer that could never arrive. Queued callers see nothing until their turn
+	// comes, which is the "one at a time" the ruling settled on.
+	release, err := g.asks.acquire(ctx)
+	if err != nil {
+		return Answer{}, err
+	}
+	defer release()
+
 	reply := make(chan Answer, 1)
 	g.mu.Lock()
 	g.pending = reply

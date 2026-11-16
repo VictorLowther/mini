@@ -34,6 +34,8 @@ type Print struct {
 	settings Settings
 
 	in *bufio.Reader
+	// asks serializes prompts; see askQueue and docs/parallel-sessions.md §9.4.
+	asks askQueue
 	// Terminal reports whether a human is on stdin. Set from os.Stdin's mode;
 	// tests override it.
 	Terminal bool
@@ -233,6 +235,18 @@ func (p *Print) readMultiline(ctx context.Context) string {
 
 // Ask prints the question and interprets the answer, slash commands included.
 func (p *Print) Ask(ctx context.Context, q Question) (Answer, error) {
+	// The same turn-taking as the window (§9.4). Here the assumption was
+	// structural rather than a field being overwritten: this writes the prompt
+	// straight to Out and reads one shared stdin, so two concurrent asks would
+	// interleave their text and compete for the same line - a garbled prompt is
+	// better than the window's silent hang, but neither is acceptable once a
+	// second session can ask.
+	release, err := p.asks.acquire(ctx)
+	if err != nil {
+		return Answer{}, err
+	}
+	defer release()
+
 	if q.Kind == AskLimits {
 		return p.askLimits(ctx, q)
 	}
