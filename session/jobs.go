@@ -406,7 +406,7 @@ WHERE session_id = ? AND delivered_at IS NULL ORDER BY id LIMIT ?`, s.ID.String(
 }
 
 // MarkJobEventsDelivered stamps delivery time so a firing is never injected
-// twice, which matters because the batch drain and job_wait both read the same
+// twice, which matters because the wake drain and the hold both read the same
 // table.
 func (s *Session) MarkJobEventsDelivered(ids []int64) error {
 	if len(ids) == 0 {

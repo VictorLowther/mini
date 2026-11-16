@@ -289,7 +289,7 @@ func (s *Sushi) requestBody(msgs []Message) map[string]any {
 	body := map[string]any{
 		"model":          s.Model,
 		"messages":       prepared,
-		"tools":          []any{BASH_TOOL, JOBS_TOOL, JOB_KILL_TOOL, JOB_WAIT_TOOL},
+		"tools":          []any{BASH_TOOL, JOBS_TOOL, JOB_KILL_TOOL},
 		"stream":         true,
 		"stream_options": map[string]any{"include_usage": true},
 	}

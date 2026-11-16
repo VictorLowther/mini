@@ -308,7 +308,7 @@ func (m *Manager) recordEndLocked(r *Run, oc outcome) *session.JobRow {
 // recordExit turns a terminal state into a firing. This is what makes a wait
 // correct rather than merely fast: a job that ended while the model was doing
 // something else has to still be waiting there when the model asks, because the
-// alternative is a job_wait that ignores the one event it was asked to watch and
+// alternative is a hold that ignores the one event it was asked to watch and
 // blocks on a run that may never finish. That bug was found by a test, not by
 // reading.
 //

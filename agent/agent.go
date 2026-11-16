@@ -163,6 +163,10 @@ type Loop struct {
 	// interface has no timeout to expose, and a container environment's idea of
 	// a sane wait should not have to widen the contract.
 	CommandBudget time.Duration
+	// jobsWarnedAtSubmit keeps the submit-with-live-jobs warning to one extra
+	// step per run, so it can never become a loop between a model that wants to
+	// stop and a job that will not end.
+	jobsWarnedAtSubmit bool
 	// Jobs is the registry backgrounded commands are handed to. nil means this
 	// run cannot background anything - a test harness, or a front end that has
 	// not wired one up - and `background: true` then comes back as a reported
@@ -435,52 +439,68 @@ func (l *Loop) killObservation(action model.Action, sink io.Writer) env.Result {
 	return env.Result{ReturnCode: code}
 }
 
-// waitObservation answers job_wait: block until one of the session's jobs ends,
-// then say which and how. A wait that finds nothing running answers immediately,
-// because "there was nothing to wait for" is a fact the model needs now, not a
-// timeout to sit through.
-func (l *Loop) waitObservation(ctx context.Context, sink io.Writer) (env.Result, bool, error) {
+// wakeLimit caps how much one boundary reports. Eight matches the default job
+// cap, and it keeps a pathological queue from turning one message into a log
+// dump; anything left over is still in the queue, claimed by nobody, and comes
+// back at the next boundary.
+const wakeLimit = 8
+
+// jobWake drains the firing queue into the message the design promises: one
+// appended user message at a step boundary, a digest per firing, bounded, and
+// never an edit to anything already in history.
+//
+// It returns zero or one message - an empty slice when there is nothing to say,
+// because a wake that says nothing costs a message, a turn of attention, and a
+// permanent hole in the transcript that a resumed run has to reason around.
+//
+// This replaces asking the model to call a wait tool. Results arrive on their
+// own, so the only thing the model has to decide is whether it has work left: if
+// all that remains is waiting for a job, it should stop, and the harness will
+// bring it back with the outcome. That is why the queue is durable and claimed
+// only on delivery - a job that ends after a submission is still here at the next
+// boundary, in this run or the next one.
+func (l *Loop) jobWake() []model.Message {
 	if l.Jobs == nil {
-		return noRegistryResult(), false, nil
+		return nil
 	}
-	row, ok, err := l.Jobs.WaitAny(ctx)
+	fire, err := l.Jobs.ClaimFirings(wakeLimit)
 	if err != nil {
-		if ctx.Err() != nil {
-			// The human stopped waiting. Every run is untouched, and that has
-			// to be true: a cancelled wait that read as a killed job would be
-			// the worst possible lie this tool could tell.
-			return env.Result{}, false, err
-		}
-		return env.Result{ReturnCode: 1, ExceptionInfo: err.Error()}, false, nil
+		// A queue that cannot be read must not end the run: the events are still
+		// there and the next boundary tries again.
+		l.logger().Error("jobs: could not drain the wake queue", "err", err)
+		return nil
 	}
-
+	if len(fire) == 0 {
+		return nil
+	}
 	var b strings.Builder
-	if !ok {
-		b.WriteString("no background jobs are running in this session, so there was nothing to wait for.\n")
-		if list, lerr := l.Jobs.List(); lerr == nil && len(list) > 0 {
-			last, ago := lastJobSummary(list)
-			fmt.Fprintf(&b, "%d job(s) have ended here; the most recent is %s (%s, %s).\n",
-				len(list), last, ago, jobStateOf(list))
-		} else {
-			b.WriteString("No job has been started in this session yet: a command that outlives its wait, or one run with background: true, appears here.\n")
-		}
-		if sink != nil {
-			_, _ = io.WriteString(sink, b.String())
-		}
-		return env.Result{ReturnCode: 0}, false, nil
+	if len(fire) == 1 {
+		b.WriteString("A background job ended while you were working on something else.\n\n")
+	} else {
+		fmt.Fprintf(&b, "%d background jobs ended while you were working on something else.\n\n", len(fire))
 	}
-
-	describeEndedJob(&b, row)
+	for _, f := range fire {
+		row := f.Job
+		describeEndedJob(&b, &row)
+		b.WriteString("\n")
+	}
 	if still := l.Jobs.StillRunning(); still > 0 {
-		fmt.Fprintf(&b, "%d other job(s) still running; call jobs to list them, job_wait to wait again.\n", still)
+		fmt.Fprintf(&b, "%d other job(s) still running: call jobs to list them or job_kill to stop one. \n", still)
+		b.WriteString("Do not poll their logs - you will be told when each one ends.\n")
+	} else {
+		b.WriteString("Nothing else is running in this session.\n")
 	}
-	if sink != nil {
-		_, _ = io.WriteString(sink, b.String())
-	}
-	// The wait's own outcome is success even when the job it reported failed:
-	// the job's exit code belongs to the job, and conflating them would make a
-	// correctly-reported failure look like the tool call misbehaving.
-	return env.Result{ReturnCode: 0}, false, nil
+	return []model.Message{{
+		"role":    "user",
+		"content": b.String(),
+		// Marked as harness-authored, so the front ends show it as feedback
+		// rather than something the human typed, and a resumed run can tell the
+		// two apart without parsing prose.
+		"extra": map[string]any{
+			"interrupt_type": "JobUpdate",
+			"job_updates":    len(fire),
+		},
+	}}
 }
 
 // describeEndedJob is the salient detail set: what it was, how it ended, how long
@@ -822,6 +842,9 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	// Compaction state is per run: the breaker and the reactive budget
 	// restart, and a stale /compact request from a previous run must not
 	// fire.
+	// The submit-with-live-jobs warning is per run: a resumed or second task in
+	// the same window deserves its own chance to reconsider.
+	l.jobsWarnedAtSubmit = false
 	l.compactFails = 0
 	l.autoCompactOff = false
 	l.overflowBudget = maxOverflowCompactions
@@ -864,6 +887,14 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	}
 
 	for {
+		// A step boundary. Anything a background job reported since the last one
+		// is appended here, as one message, before the next model call - the
+		// only place this design writes to history besides an observation, and
+		// deliberately not in the middle of a turn: a wake is an appended
+		// message like every other observation, never an edit (the cache-prefix
+		// rule docs/compaction-research.md §4 puts first).
+		l.addMessages(l.jobWake()...)
+
 		stepCtx, cancel := context.WithCancel(ctx)
 		l.setCancelTurn(cancel)
 		err := l.step(stepCtx)
@@ -876,6 +907,12 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 		case errors.As(err, &in) && in.Kind == model.KindFormatError:
 			l.handleFormatError(in)
 		case errors.As(err, &in):
+			// The boundary where the agent has just decided it can stop. A job
+			// that ended during the last turn would otherwise be recorded after
+			// the run's final message - which is to say, never read by anyone.
+			// Delivered first, so the exit row stays the last thing in history
+			// and the run's return value keeps its shape.
+			l.addMessages(l.jobWake()...)
 			l.addMessages(in.Messages...)
 		default:
 			l.handleUncaught(err)
@@ -884,6 +921,20 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 		}
 		l.save()
 		if l.lastRole() == "exit" {
+			// Anything still undelivered is reported before the exit row (see
+			// the boundary above). A job that is still *running* here is left
+			// running: the session's reap ends it and records a firing, which
+			// the next run of this session delivers at its first boundary.
+			// Holding the run open instead would be wrong in the case that
+			// matters most on this hardware - a server started with
+			// background: true never exits, so the agent could never finish.
+			if l.warnPendingJobsAtSubmit(ctx) {
+				continue
+			}
+			if n := l.liveJobCount(); n > 0 {
+				l.logger().Info("the task ended with jobs still running; they will be reaped at session close",
+					"running", n)
+			}
 			break
 		}
 		if ctx.Err() != nil {
@@ -896,6 +947,74 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	}
 	extra, _ := last["extra"].(map[string]any)
 	return extra, nil
+}
+
+// warnPendingJobsAtSubmit gives a run that is about to end with work still
+// burning exactly one chance to reconsider, and returns true when the loop
+// should take another step.
+//
+// It exists because the directive that replaced job_wait - "results are
+// delivered automatically, so stop when the only thing left is waiting" - is
+// only safe when stopping is not the same as leaving. In an interactive session
+// it is not: the human is still there, the jobs keep running, and the wake is
+// delivered at whatever step boundary comes next. In a headless run the
+// submission ends the process, and the session's reap takes the jobs with it, so
+// obeying the directive would silently destroy the very work the model
+// backgrounded on purpose.
+//
+// One warning, once per run, then the model's decision stands. That is the whole
+// design: it is a confirmation, not a wait, so it cannot hang, cannot hold the
+// run open for a server that never exits, and cannot loop - while still turning
+// "the soak will be done in ninety seconds" from a silent kill into a step the
+// model can spend on something else.
+func (l *Loop) warnPendingJobsAtSubmit(ctx context.Context) bool {
+	if l.jobsWarnedAtSubmit || ctx.Err() != nil {
+		return false
+	}
+	n := l.liveJobCount()
+	if n == 0 {
+		return false
+	}
+	// A human holding the confirm-exit prompt is already being asked. Asking
+	// twice, in two different voices, is how a session gets a question nobody
+	// can tell the difference between.
+	if l.Hooks != nil && l.Cfg.ConfirmExit {
+		return false
+	}
+	l.jobsWarnedAtSubmit = true
+	l.logger().Info("the task submitted while jobs are still running; warning once and continuing",
+		"running", n)
+	l.addMessages(model.Message{
+		"role": "user",
+		"content": fmt.Sprintf("%s still running. Ending now closes the session and stops them; "+
+			"their results cannot be delivered afterwards.\nIf you have other work to do, do it now - a job that ends "+
+			"will be reported to you automatically at your next step. If you really are finished, submit again and "+
+			"the run will end.", jobsRunning(n)),
+		"extra": map[string]any{
+			"interrupt_type": "JobsPendingAtSubmit",
+			"jobs_running":   n,
+		},
+	})
+	return true
+}
+
+// jobsRunning phrases the count together with the verb it needs, because "1
+// background jobs are" is the sort of slip that makes harness text feel
+// generated - and this is the one message in the feature a model may act on.
+func jobsRunning(n int) string {
+	if n == 1 {
+		return "1 background job is"
+	}
+	return fmt.Sprintf("%d background jobs are", n)
+}
+
+// liveJobCount is the run's view of the registry, and nil-safe: a Loop without
+// a registry has no jobs by definition.
+func (l *Loop) liveJobCount() int {
+	if l.Jobs == nil {
+		return 0
+	}
+	return l.Jobs.StillRunning()
 }
 
 // handleFormatError bills the failed call, counts it, and terminates the run
@@ -1155,8 +1274,6 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 			res = l.jobsObservation(action, sink)
 		case model.ToolJobKill:
 			res = l.killObservation(action, sink)
-		case model.ToolJobWait:
-			res, detached, err = l.waitObservation(ctx, sink)
 		default:
 			res, detached, err = l.runCommand(ctx, action, tc, sink)
 		}

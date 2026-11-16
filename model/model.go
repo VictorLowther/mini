@@ -24,11 +24,6 @@ const (
 	ToolBash    = "bash"
 	ToolJobs    = "jobs"
 	ToolJobKill = "job_kill"
-	// ToolJobWait blocks until one of the session's jobs ends. It is a tool and
-	// not a bash command because the answer lives in the registry, and waiting
-	// on `sleep` in a shell instead is the polling loop this design exists to
-	// remove.
-	ToolJobWait = "job_wait"
 )
 
 // Action is one parsed tool call.
@@ -215,7 +210,10 @@ var BASH_TOOL = map[string]any{
 			"job id and output path instead of a result - so a long command " +
 			"costs a turn, not a re-run. Set background: true to skip the wait " +
 			"when you already know, and timeout_s to wait longer on purpose. A " +
-			"job outlives a turn, never a session.",
+			"job's result is delivered to you automatically at your next step, " +
+			"so never poll a log or sleep to wait for one - if the only thing " +
+			"left is waiting, say so or turn to other work. A job outlives a " +
+			"turn, never a session.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -249,7 +247,7 @@ var JOBS_TOOL = map[string]any{
 	"type": "function",
 	"function": map[string]any{
 		"name":        ToolJobs,
-		"description": "List the session's jobs: id, state, how long, why it is still around, exit status, and the path its output is accumulating at. Read-only. A job is the only way to end a command that outlived its turn - the shell runs in-process, so no pattern-based kill command can reach a whole job.",
+		"description": "List the session's jobs: id, state, how long, why it is still around, exit status, and the path its output is accumulating at. Read-only. Endings are delivered to you automatically at your next step, so this is for checking in, not for watching. A job is the only way to end a command that outlived its turn - the shell runs in-process, so no pattern-based kill command can reach a whole job.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -281,23 +279,6 @@ var JOB_KILL_TOOL = map[string]any{
 					"description": "End every running job of this session. Use when the work is finished or when you are giving up on a batch.",
 				},
 			},
-		},
-	},
-}
-
-// JOB_WAIT_TOOL blocks the turn until one of the session's background jobs
-// finishes. It deliberately takes nothing: the model is not asked to keep a list
-// of its own running work in context just to be told when any of it ended, which
-// is the whole reason a registry exists. The empty property set is what the
-// server needs in order to call it with `{}`.
-var JOB_WAIT_TOOL = map[string]any{
-	"type": "function",
-	"function": map[string]any{
-		"name":        ToolJobWait,
-		"description": "Wait until one of this session's background jobs ends. It takes no arguments and names no id: any job ending wakes it, and the answer says which one, whether it exited or was killed, its exit code, how long it ran, and where its output is. If nothing is running it answers immediately instead of blocking. Prefer this to tailing a log in a loop - waiting costs no GPU time, no tokens per poll, and no turns.",
-		"parameters": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
 		},
 	},
 }

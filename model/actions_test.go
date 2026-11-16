@@ -159,15 +159,13 @@ func TestParseJobToolCalls(t *testing.T) {
 		t.Errorf("rejection text = %q", rejectionText(t, err))
 	}
 
-	// job_wait takes nothing at all, so `{}` is the whole call - and an id a
-	// model passes anyway is ignored rather than made into an error, since the
-	// semantics are "any job" whatever the model thought it was narrowing.
-	a, err = parse("job_wait", `{}`)
-	if err != nil || a.ToolName() != ToolJobWait {
-		t.Errorf("action = %+v, %v", a, err)
-	}
-	if a, err = parse("job_wait", `{"id":"j1","timeout_ms":5}`); err != nil || a.ToolName() != ToolJobWait {
-		t.Errorf("job_wait rejected stray arguments: %+v, %v", a, err)
+	// job_wait is gone: results arrive at a step boundary on their own, so a
+	// model asking to be blocked is asking for something the harness now does by
+	// itself. It must read as an unknown tool rather than silently succeeding.
+	if _, err := parse("job_wait", `{}`); err == nil {
+		t.Error("job_wait was still accepted")
+	} else if !strings.Contains(rejectionText(t, err), "Unknown tool 'job_wait'") {
+		t.Errorf("rejection text = %q", rejectionText(t, err))
 	}
 }
 
@@ -194,7 +192,6 @@ func TestNeedsConfirmationIsOnlyAboutStartingWork(t *testing.T) {
 		{ToolBash, true},     // starts work
 		{ToolJobs, false},    // reads a table
 		{ToolJobKill, false}, // ends work already permitted
-		{ToolJobWait, false}, // reads the registry, blocking on nothing dangerous
 	}
 	for _, c := range cases {
 		a := Action{Tool: c.tool, Command: "anything"}

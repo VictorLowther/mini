@@ -90,6 +90,8 @@ func TestBackgroundReturnsAHandoffInsteadOfWaiting(t *testing.T) {
 		turnActions("start the soak", model.Action{
 			Command: "sleep 30; echo should-never-be-seen", Background: true}),
 		done("submitted"),
+		// The one-shot warning about live jobs costs a step.
+		done("submitted after the warning"),
 	}}
 	l, jm, rec := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 
@@ -162,6 +164,7 @@ func TestForegroundCommandIsPromotedWhenItOutrunsItsBudget(t *testing.T) {
 		// not. env would have killed this at the deadline a step ago.
 		turnActions("build it", model.Action{Command: "echo building; sleep 4; echo finished", TimeoutS: 1}),
 		done("submitted"),
+		done("submitted after the warning"),
 	}}
 	l, jm, rec := newJobLoop(t, m, &env.Local{Timeout: 30 * time.Second})
 
@@ -327,6 +330,8 @@ func TestPromotionUsesTheConfiguredBudget(t *testing.T) {
 	m2 := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turnActions("takes longer", model.Action{Command: "sleep 30"}),
 		done("submitted"),
+		// The promoted job is still burning, so the one-shot warning costs a step.
+		done("submitted after the warning"),
 	}}
 	l2, jm2, _ := newJobLoop(t, m2, &env.Local{Timeout: 60 * time.Second})
 	l2.CommandBudget = 1 * time.Second
@@ -397,6 +402,7 @@ func TestJobKillToolEndsTheJobAndItsProcess(t *testing.T) {
 		turnActions("start it", model.Action{Command: "sleep " + marker, Background: true}),
 		turnActions("kill it", model.Action{Tool: model.ToolJobKill, Command: "j1"}),
 		done("submitted"),
+		done("submitted after the warning"),
 	}}
 	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
 	if _, err := run(t, l, "start then stop a soak"); err != nil {
@@ -469,118 +475,194 @@ func TestJobKillReportsWhatItCouldNotDo(t *testing.T) {
 	}
 }
 
-// job_wait takes no arguments and wakes on whichever of the session's jobs ends
-// first - the model is not asked to hold a list of its own background work in
-// context to be told when any of it finished.
-func TestJobWaitWakesOnTheFirstJobToEnd(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("start the long one", model.Action{Command: "sleep 40", Background: true, Description: "long"}),
-		turnActions("start the short one", model.Action{Command: "sleep 1; echo finished-fast", Background: true, Description: "short"}),
-		turnActions("block until one ends", model.Action{Tool: model.ToolJobWait}),
-		done("submitted"),
-	}}
-	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+// isJobWake identifies the harness-authored delivery message. It is a user-role
+// message like a human's, and the marker is what keeps the two distinguishable
+// without parsing prose.
+// jobSpecFor names a launch that is not tied to a tool call, for tests that
+// drive the registry directly.
+func jobSpecFor(cmd string) job.Spec {
+	return job.Spec{Command: cmd}
+}
 
-	start := time.Now()
-	if _, err := run(t, l, "run two soaks and wait for either"); err != nil {
-		t.Fatal(err)
-	}
-	// It woke on the 1-second job, not the 40-second one, and it did not sit
-	// through the slow one to prove a point.
-	if d := time.Since(start); d > 25*time.Second {
-		t.Errorf("the wait took %v; it should have woken on the fast job", d)
-	}
+func isJobWake(m model.Message) bool {
+	e, _ := m["extra"].(map[string]any)
+	return e["interrupt_type"] == "JobUpdate"
+}
 
-	obs := observations(l)
-	if len(obs) != 3 {
-		t.Fatalf("observations = %d", len(obs))
-	}
-	woke := obs[2]
-	for _, want := range []string{"job j2 ended: completed", "exit 0", "label=short",
-		"finished-fast", "read it with: tail -n 100", "1 other job(s) still running"} {
-		if !strings.Contains(woke, want) {
-			t.Errorf("wait report missing %q:\n%s", want, woke)
+func jobWakes(l *Loop) []string {
+	var out []string
+	for _, m := range l.Messages {
+		if isJobWake(m) {
+			out = append(out, fmt.Sprint(m["content"]))
 		}
 	}
-	if !strings.Contains(woke, "after 1") {
-		t.Errorf("the report should say how long it ran:\n%s", woke)
+	return out
+}
+
+func dumpHistory(l *Loop) string {
+	var out []string
+	for _, m := range l.Messages {
+		out = append(out, fmt.Sprintf("[%v] %.180s", m["role"], strings.TrimSpace(fmt.Sprint(m["content"]))))
 	}
-	// The job that did not end is untouched, and still listed as running.
-	list, err := jm.List()
+	return strings.Join(out, "\n---\n")
+}
+
+// An ending the model never asked about still reaches it - at the next step
+// boundary, rather than waiting to be requested. This is the case a wait built
+// on live handles gets wrong: the job has left the running set, so a later
+// a later blocking call has nothing to report and the event is lost. The queue
+// keeps it, and
+// the boundary collects it.
+func TestStepBoundaryDeliversAnUnseenEnding(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("quick background job", model.Action{Command: "echo bye", Background: true}),
+		turnActions("busy elsewhere", model.Action{Command: "echo working", TimeoutS: 5}),
+		done("submitted"),
+	}}
+	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	if _, err := run(t, l, "start a quick job, then do other work"); err != nil {
+		t.Fatal(err)
+	}
+
+	wakes := jobWakes(l)
+	if len(wakes) != 1 {
+		t.Fatalf("wake messages = %d, want exactly one:\n%s", len(wakes), dumpHistory(l))
+	}
+	if isJobWake(l.Messages[len(l.Messages)-1]) {
+		t.Error("a wake landed after the exit row")
+	}
+	for _, want := range []string{"job j1 ended: completed", "exit 0", "while you were working on something else",
+		"read it with: tail -n 100", "Nothing else is running"} {
+		if !strings.Contains(wakes[0], want) {
+			t.Errorf("wake missing %q:\n%s", want, wakes[0])
+		}
+	}
+	// Exactly once: the queue was claimed, so no later boundary repeats it.
+	// repeats it.
+	if n := len(jobWakes(l)); n != 1 {
+		t.Errorf("wake count = %d, want 1", n)
+	}
+}
+
+// The drain itself, without a run around it: a queue with nothing in it says
+// nothing, and a claimed event is never offered again. Both halves matter - the
+// first because an empty wake still costs a turn of attention, the second
+// because the hold watches the same queue and a repeated report is worse
+// than a missed one.
+func TestJobWakeClaimsEachEventOnce(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("idle")}}
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+
+	if got := l.jobWake(); got != nil {
+		t.Errorf("an empty queue produced %d message(s)", len(got))
+	}
+	r, err := jm.Start(jobSpecFor("echo wake-me"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 2 {
-		t.Fatalf("registry = %+v", list)
+	select {
+	case <-r.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("the job never ended")
 	}
-	for _, j := range list {
-		if j.ID == "j1" && j.State != session.JobRunning {
-			t.Errorf("the unwaited-for job ended too: %+v", j)
-		}
-		if j.ID == "j2" && j.State != session.JobCompleted {
-			t.Errorf("j2 = %s", j.State)
-		}
+	got := l.jobWake()
+	if len(got) != 1 {
+		t.Fatalf("wake messages = %d, want 1", len(got))
 	}
-}
-
-// Nothing to wait for is an answer, delivered now - not a timeout to sit
-// through, and not an error to retry.
-func TestJobWaitWithNoJobsAnswersImmediately(t *testing.T) {
-	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("wait for nothing", model.Action{Tool: model.ToolJobWait}),
-		done("submitted"),
-	}}
-	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
-	start := time.Now()
-	if _, err := run(t, l, "wait"); err != nil {
-		t.Fatal(err)
+	text := fmt.Sprint(got[0]["content"])
+	if !strings.Contains(text, "job "+r.ID()+" ended: completed") {
+		t.Errorf("wake = %q", text)
 	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Errorf("an empty wait blocked for %v", d)
-	}
-	woke := lastObservation(l)
-	for _, want := range []string{"no background jobs are running", "No job has been started in this session yet"} {
-		if !strings.Contains(woke, want) {
-			t.Errorf("empty-wait report missing %q:\n%s", want, woke)
-		}
-	}
-	// Success, because the tool did exactly what it was asked.
-	if strings.Contains(woke, "<returncode>1") || strings.Contains(woke, "-1") {
-		t.Errorf("an empty wait should not read as a failure:\n%s", woke)
+	if again := l.jobWake(); again != nil {
+		t.Errorf("the same firing was offered twice")
 	}
 }
 
-// A job that finished while the model was busy elsewhere must still be there when
-// it asks. This is the case a wait built on live handles gets wrong: the job is
-// gone from the running set, so the wait blocks on the next one instead of
-// reporting the event it exists to report.
-func TestJobWaitReportsAnEndingNobodySaw(t *testing.T) {
+// A run with no jobs must not gain a message per step. An empty wake costs a
+// turn of attention and leaves a hole in the transcript that a resumed run then
+// has to reason about.
+func TestNoWakeWhenNothingHappened(t *testing.T) {
 	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("quick background job", model.Action{Command: "echo bye", Background: true}),
-		// An ordinary foreground turn passes while the job ends.
-		turnActions("busy elsewhere", model.Action{Command: "echo working", TimeoutS: 5}),
-		turnActions("now wait", model.Action{Tool: model.ToolJobWait}),
+		turnActions("just a command", model.Action{Command: "echo hi"}),
+		turnActions("another", model.Action{Command: "echo again"}),
 		done("submitted"),
 	}}
 	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
-	if _, err := run(t, l, "start a quick job, do other work, then wait"); err != nil {
+	if _, err := run(t, l, "two quick commands"); err != nil {
 		t.Fatal(err)
 	}
-	obs := observations(l)
-	if len(obs) != 3 {
-		t.Fatalf("observations = %d", len(obs))
+	if n := len(jobWakes(l)); n != 0 {
+		t.Errorf("a jobless run produced %d wake message(s):\n%s", n, dumpHistory(l))
 	}
-	if !strings.Contains(obs[2], "job j1 ended: completed") {
-		t.Errorf("the missed ending was not reported:\n%s", obs[2])
+}
+
+func submitWarnings(l *Loop) []string {
+	var out []string
+	for _, m := range l.Messages {
+		if e, _ := m["extra"].(map[string]any); e["interrupt_type"] == "JobsPendingAtSubmit" {
+			out = append(out, fmt.Sprint(m["content"]))
+		}
 	}
-	// And it is reported once: the next wait has nothing owed to it.
-	m2 := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-		turnActions("wait again", model.Action{Tool: model.ToolJobWait}),
-		done("submitted"),
+	return out
+}
+
+// "End your turn if the only thing left is waiting" is only safe when ending a
+// turn does not end the jobs. In a headless run it does - submission closes the
+// process and the session's reap stops the work - so the model gets exactly one
+// chance to reconsider, and its second decision stands.
+func TestSubmitWithLiveJobsWarnsOnce(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("start a soak", model.Action{Command: "sleep 25", Background: true, Description: "soak"}),
+		turnActions("premature submit", model.Action{}),
+		done("submitting anyway"),
 	}}
-	l2, jm2, _ := newJobLoop(t, m2, &env.Local{Timeout: 5 * time.Second})
-	l2.Jobs = jm2
-	if _, err := run(t, l2, "wait again"); err != nil {
+	m.Outputs[1] = done("I think I am done")
+	l, jm, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	l.Cfg.ConfirmExit = false // no human is asked; the warning is the only gate
+
+	info, err := run(t, l, "start a soak then submit")
+	if err != nil {
 		t.Fatal(err)
+	}
+	warns := submitWarnings(l)
+	if len(warns) != 1 {
+		t.Fatalf("warnings = %d, want exactly one (it must not become a loop):\n%s", len(warns), dumpHistory(l))
+	}
+	for _, want := range []string{"1 background job is still running",
+		"Ending now closes the session and stops them", "submit again"} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warning missing %q:\n%s", want, warns[0])
+		}
+	}
+	if got := info["exit_status"]; got != model.KindSubmitted {
+		t.Errorf("exit_status = %v", got)
+	}
+	// The model's second answer wins: the run ends, and the job is left for the
+	// reap rather than held hostage by the harness.
+	if list, _ := jm.List(); len(list) != 1 || list[0].State != session.JobRunning {
+		t.Errorf("registry = %+v", list)
+	}
+	// And the warning never outlives the run it was raised in.
+	if l.jobsWarnedAtSubmit != true {
+		t.Error("the per-run flag was not set")
+	}
+}
+
+// A human with confirm_exit already gets asked whether the run really ends. A
+// second, differently-worded no from the harness would be a question nobody can
+// tell the difference between.
+func TestNoSubmitWarningWhenAHumanIsAsked(t *testing.T) {
+	m := &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turnActions("start a soak", model.Action{Command: "sleep 25", Background: true}),
+		done("submitting"),
+	}}
+	l, _, _ := newJobLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	l.Hooks = &stubHooks{}
+	l.Cfg.ConfirmExit = true
+	if _, err := run(t, l, "start a soak then submit"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(submitWarnings(l)); n != 0 {
+		t.Errorf("warnings = %d with a human holding confirm_exit", n)
 	}
 }

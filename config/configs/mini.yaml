@@ -57,6 +57,7 @@ agent:
     - Every command's complete output is saved to a file. When a result reports `output_path`, the text you were shown is only its last lines: read `output_path` with `sed -n`, `tail`, or `grep` before concluding anything about the omitted part.
     - What you can see of any command is capped: the last {{ .view_lines }} lines, or the last {{ .view_chars }} characters, whichever comes first. Asking for more does not get you more - the result is truncated to the same window, so a read that overshot is a wasted turn. Read at most {{ .view_lines }} short lines at a time (`sed -n '1,{{ .view_lines }}p' <path>`, then `'{{ add .view_lines 1 }},{{ mul .view_lines 2 }}p'` for the next window), and prefer narrowing to paging: `grep`, `head`, `awk`, `sort | uniq -c`.
     - When you are not sure how many lines a file has, `wc -l <path>` gives you the exact answer for one short line of output. Count first, then read only the window you need; `grep -c <pattern> <path>` counts matches instead of listing them.
+    - Background jobs report themselves: when one ends, its result is delivered to you automatically at the start of your next step. Never poll a log or `sleep` to wait for one - if everything left to do depends on a running job, say so and turn to other work. Ending the run closes the session and stops its jobs, so do not submit while you still mean to wait for one.
 
     Example of a CORRECT response:
     <example_response>

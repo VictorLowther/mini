@@ -11,6 +11,7 @@ package agent
 // fails if either side drifts or if the dead advice comes back.
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -46,6 +47,26 @@ func TestShippedPromptsStateTheWindow(t *testing.T) {
 			t.Logf("SYS LINE: %.160s", strings.TrimSpace(line))
 		}
 	}
+	// The directive that replaced the wait tool. It lives in the prompt because
+	// it is about turn discipline, and it is asserted here because a model that
+	// is not told results arrive on their own will poll logs in a loop - the
+	// exact behaviour the delivery path exists to remove.
+	for _, want := range []string{"Background jobs report themselves", "delivered to you automatically",
+		"Never poll a log", "stops its jobs"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("the system prompt is missing %q", want)
+		}
+	}
+	tool, err := json.Marshal(model.BASH_TOOL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"delivered to you automatically", "never poll a log", "outlives a turn"} {
+		if !strings.Contains(string(tool), want) {
+			t.Errorf("the bash description is missing %q", want)
+		}
+	}
+
 	for _, bad := range []string{"<no value>", "sed -n '1,200p'", "{{"} {
 		if strings.Contains(sys, bad) {
 			t.Errorf("system prompt contains %q", bad)
