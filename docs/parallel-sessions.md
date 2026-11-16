@@ -516,7 +516,7 @@ host.Session                one per conversation - top-level, resumed, or subage
   CancelTurn / Quit / Close this session only, never a sibling
 ```
 
-### The thirteen settled decisions
+### The fourteen settled decisions
 
 **1. Assembly takes a merged config, not flags.** `Spec.Config` is
 `map[string]any`, already resolved. `cmd/mini` keeps owning flags, `-c` specs
@@ -1075,6 +1075,55 @@ person refuses with a reason, and **the delegation itself is the thing the human
 approves** - which is a decision they can actually make, taken once, at the point
 where they can see the task, rather than one they are asked to make blind per
 command from a transcript they cannot see.
+
+**14. No turn or time budgets.** They are a relic of the one-shot harness this
+port came from: mini-swe-agent solved one benchmark instance, printed a trajectory
+and exited, so bounding its steps and its clock was the only way to stop an
+autonomous run going forever. mini is an interactive product with a human watching,
+a persistent transcript, `jobs` reporting elapsed times, `job_kill`, and a window
+that can be closed - so those numbers stopped being a guardrail and became a
+second, invisible author of the report. "The subagent ended on its step limit" is
+an answer that came from a config file nobody meant as a task specification.
+
+**Landed for subagents** (`host.Open`): a child's step, cost and wall budgets are
+cleared at the one place that decides what a child is, so no caller can leak one
+in and no config can revive it. The trigger was §9.3's revival - a child's spend
+belongs to its session and is not reset by another run of it, so re-driving a
+helper could stop it partway through its second pass on the strength of its first -
+and both alternatives were worse: a fresh ledger per revival is no ledger at all
+(anything can be finished in n+1 passes for the price of n), and raising the
+parent's number on a child's behalf is the human's decision, not the harness's.
+`TestSubagentOutlivesItsParentsBudget` asserts the behaviour, and replaced a test
+that asserted the opposite - whose failure was itself the proof, since the report
+it captured was the child's real submission rather than a budget notice.
+
+**Still to remove: the same for top-level sessions.** Enforcement is one function
+and the fields are one struct, so that part is contained - `agent`, `cmd/mini`'s
+`-l` flag, the shipped config. It is left unfinished deliberately rather than
+half-done, because deleting `checkLimits` orphans the `OnLimits` hook and the
+whole limits dialog in both front ends, and `OnLimits` is a method on
+`agent.Hooks`: every implementation changes with it - `ui.Interactive`, the batch
+front end, `host.bubblingHooks`, and the fakes in three test files. That surface
+wants removing in the same commit as the enforcement, not a commit where the UI
+asks a question that can never be asked.
+
+Two things to settle with it. First, **whether `cost_limit` counts as a budget
+here**: the ruling named turns and time, which are unambiguous - both go, since
+each is a guess about how long a task should take. Money is different in kind: it
+is not a duration estimate, it is a limit on what a person will spend on a box
+that burns a GPU while idle, and `OnLimits` exists so they can raise it mid-flight.
+So the top-level cut is either step + wall with the dollar guard kept, or all
+three - and it decides whether `AskLimits` survives in some form or goes entirely.
+Second, **what bounds a runaway instead**: `job_kill`, `Quit`, closing the process
+and its subtree (§9.2), and the in-flight-request bound (§5.7), which is the only
+cost that actually matters on one GPU. A runaway is visible in `jobs` with a name,
+an elapsed time and an output path - a thing a human can act on, where a silent
+budget cut is a thing that merely stops.
+
+What stays in every reading is the **accounting**: `Cost`, `NCalls`, the tree
+total, the card headers, the trajectory. Those answer "what did this cost", which
+is a different question from "when should we stop you", and §5.8's rollup depends
+on the first staying accurate even as the second goes away.
 
 ### Report contract
 
