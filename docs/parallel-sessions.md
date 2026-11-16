@@ -1352,6 +1352,26 @@ reaped and given its own tool set today; it cannot yet be *reached* by another
 session, and `agent` is not yet in either set - by construction, with the
 comment above saying so.
 
+### A known flake, pre-existing
+
+`job`'s `TestCapRefusesAndNamesTheRemedy` fails roughly once in fifty full-suite
+runs, always under load, always with "cap did not release after the reap". It was
+chased while landing this work and cleared of suspicion by the commit series
+itself: it reproduced on a commit that touches no `job` file at all, so it
+predates the kind seam, the cap exemption and `noteQuiescent` - and the last of
+those returns before its extra store read whenever no hook is set, which is the
+case in every `job` test.
+
+The mechanism the evidence points at is the one the test exercises hardest: its
+command forks two `sleep`s, and `KillAll` waits a bounded `unwindAllowance` per
+run. On a saturated box that window can legitimately expire with a row still
+being written, and the next `Start` then sees one live job. That is the
+documented design - "a kill that is working is never reported as one that
+failed" (`job/job.go:57-62`) - rather than a bug in it, so the fix belongs in the
+test: await quiescence instead of trusting the reap's deadline. Noted here so the
+next person who meets it does not spend an afternoon suspecting their own
+concurrency work.
+
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that
