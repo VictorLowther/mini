@@ -510,3 +510,101 @@ func TestProjectOf(t *testing.T) {
 		t.Errorf("non-repo: wd=%q project=%q", wd, project)
 	}
 }
+
+// TestSessionsHidesAndProtectsSubagentSessions is the user-facing half of
+// docs/parallel-sessions.md §5.4 and §5.11: a subagent session is listed by
+// neither resume nor rm, and it goes away only with its parent - rows and files
+// together. It is written against the real command rather than the store because
+// the two bugs it guards are both in what a human types: `mini -r` choosing the
+// newest row in the project, and `mini sessions rm` reaching something it should
+// not be able to name.
+func TestSessionsHidesAndProtectsSubagentSessions(t *testing.T) {
+	stateDir, traj := cliEnv(t, "")
+	srv := fixtureServer(t, "toolcall.sse", "submit.sse")
+	defer srv.Close()
+	repoDir(t)
+	runCLI(t, srv.URL, "the human's task", traj)
+	parentID := mustSessionID(t, stateDir)
+
+	st, err := session.Open(filepath.Join(stateDir, "sessions.db"), filepath.Join(stateDir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := uuid.Parse(parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := st.Get(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := st.Create(session.Row{
+		ID: uuid.NewV7(), ParentID: parent.ID.String(), Kind: session.KindSubagent,
+		Title: "quantise 70b", Workdir: parent.Workdir, Project: parent.Project, ModelName: "test-model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	// The child's result directory, as OpenToolCall and JobPath would leave it:
+	// inside the per-session directory that the row's id names.
+	childDir := filepath.Join(stateDir, "tcr", child.ID.String())
+	if err := os.MkdirAll(childDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childDir, "job-j1.log"), []byte("loss=0.42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := runSessionsCommand([]string{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	listing := out.String()
+	if !strings.Contains(listing, parentID) {
+		t.Errorf("the human's own session is missing from:\n%s", listing)
+	}
+	if strings.Contains(listing, child.ID.String()) {
+		t.Errorf("the listing shows a subagent session, which is what §3.5.7 forbids:\n%s", listing)
+	}
+	if !strings.Contains(listing, "(1 sub)") {
+		t.Errorf("the listing does not account for the subagent under this run:\n%s", listing)
+	}
+
+	// rm cannot name a child. The message is the existing "no session matching",
+	// which is the right shape: the row is not a thing this command can point at,
+	// not a thing that failed to be removed.
+	out.Reset()
+	err = runSessionsCommand([]string{"rm", child.ID.String()}, &out)
+	if err == nil || !strings.Contains(err.Error(), "no session matching") {
+		t.Errorf("rm of a subagent err = %v, want it refused as unnameable", err)
+	}
+	if _, statErr := os.Stat(childDir); statErr != nil {
+		t.Error("the refused rm still removed the child's files")
+	}
+
+	// Removing the parent takes the subtree, including the files the cascade
+	// alone would have stranded.
+	out.Reset()
+	if err := runSessionsCommand([]string{"rm", parentID}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{
+		filepath.Join(stateDir, "tcr", parentID),
+		childDir,
+	} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s survived the removal of its tree", dir)
+		}
+	}
+
+	st2, err := session.Open(filepath.Join(stateDir, "sessions.db"), filepath.Join(stateDir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if _, err := st2.Get(child.ID); err == nil {
+		t.Error("the child row survived its parent's removal")
+	}
+}

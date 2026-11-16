@@ -78,10 +78,22 @@ func runSessionsCommand(args []string, stdout io.Writer) error {
 		return err
 	}
 	w := tabwriter.NewWriter(stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "SESSION UUID\tUPDATED\tSTEPS\tCOST\tTASK")
+	// COST is the session's own spend and TREE is the whole run's, kept as two
+	// columns because they answer two different questions and the design
+	// separates them deliberately: cost_limit bounds a session, while the number
+	// a human wants for "what did this cost me" includes every subagent under it
+	// (docs/parallel-sessions.md §5.8). Collapsing them would make the footer
+	// disagree with the limit that stopped the run.
+	fmt.Fprintln(w, "SESSION UUID\tUPDATED\tSTEPS\tCOST\tTREE\tTASK")
 	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%d\t$%.2f\t%s\n",
-			r.ID, time.UnixMilli(r.UpdatedAt).Format("2006-01-02 15:04"), r.NCalls, r.Cost, r.Title)
+		tree := "-"
+		if kids, err := store.Children(r.ID.String()); err == nil && len(kids) > 0 {
+			if cost, calls, err := store.TreeTotals(r.ID.String()); err == nil {
+				tree = fmt.Sprintf("$%.2f/%d (%d sub)", cost, calls, len(kids))
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t$%.2f\t%s\t%s\n",
+			r.ID, time.UnixMilli(r.UpdatedAt).Format("2006-01-02 15:04"), r.NCalls, r.Cost, tree, r.Title)
 	}
 	return w.Flush()
 }
