@@ -15,10 +15,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"uuid"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -26,6 +27,7 @@ import (
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
+	"github.com/VictorLowther/mini/host"
 	"github.com/VictorLowther/mini/job"
 	"github.com/VictorLowther/mini/model"
 	"github.com/VictorLowther/mini/session"
@@ -385,12 +387,15 @@ type miniRun struct {
 	// for the store's global settings table - the interface state that is not
 	// part of any session (ui/prefs.go).
 	Store *session.Store
-	// Jobs is the registry of runs that outlive their tool call. Nothing starts
-	// one yet - the bash parameters and the job_* tools are the next steps of
-	// docs/jobs-research.md §4's build order - but the sweep at open and the
-	// reap on exit are already wired, which is what keeps the feature safe to
-	// ship half-finished.
-	Jobs       *job.Manager
+	// Jobs is the registry of runs that outlive their tool call: the sweep at
+	// open, the handoff from a promoted foreground command, the jobs and
+	// job_kill tools, and the reap on exit.
+	Jobs *job.Manager
+	// Proc is the process-level owner this session was opened by. The front ends
+	// do not need it yet; step 7's session strip enumerates it (§7 step 7), and
+	// holding it here is what lets a second session be opened without one CLI
+	// invocation per conversation.
+	Proc       *host.Process
 	ResumeMsgs []model.Message
 	ResumeNote string
 	ConfigName string
@@ -401,6 +406,16 @@ type miniRun struct {
 // buildRun prepares a run exactly as mini always has, in the same order,
 // printing nothing: every failure comes back unprefixed so the frontend that
 // owns the terminal prints "mini: "+err like before.
+// buildRun prepares a run exactly as mini always has, in the same order,
+// printing nothing: every failure comes back unprefixed so the frontend that
+// owns the terminal prints "mini: "+err like before.
+//
+// What changed is that the assembly itself belongs to host now. This function is
+// the CLI half - global environment, first-run setup, flag-derived config, the
+// store, project identity, resume resolution - and one call to
+// `host.Process.Open` for the six objects that used to be built here. That split
+// is the prerequisite (§5): a subagent has no flags and no terminal, so anything
+// it needs to become a session must live below this function.
 func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTarget) (r *miniRun, err error) {
 	loadGlobalEnv()
 	if err := maybeRunFirstTimeSetup(stdin, stdout, o); err != nil {
@@ -411,33 +426,8 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	if err != nil {
 		return nil, err
 	}
-
-	agentCfg := agent.ConfigFromMap(config.Sub(merged, "agent"))
 	modelCfg := config.Sub(merged, "model")
 	envCfg := config.Sub(merged, "environment")
-
-	if agentCfg.OutputPath == "" {
-		agentCfg.OutputPath = defaultOutputPath()
-	}
-	if agentCfg.SystemTemplate == "" || agentCfg.InstanceTemplate == "" {
-		return nil, errors.New("the agent config needs system_template and instance_template")
-	}
-
-	m := model.NewSushi(modelCfg)
-	if m.Model == "" {
-		return nil, errors.New("no model set. Pass -m NAME or run `mini config setup`.")
-	}
-
-	// The window is the server's to know: ask it (GET /v1/models) before the
-	// loop and the front ends are built, so the compaction trigger, the
-	// footer's ctx%% and the trajectory all run against the extent this session
-	// actually has. agent.context_window stays the fallback for a server that
-	// will not say, then model.DefaultContextWindow. It is a startup question
-	// with a known-good default answer, so a silent or unreachable server
-	// costs one short request and never a run.
-	agentCfg.ContextWindow, _ = m.DiscoverContextWindow(context.Background(), agentCfg.ContextWindow)
-
-	e := newEnvironment(envCfg)
 
 	// A store that cannot be opened is fatal: a transcript source of truth
 	// that silently stopped recording is worse than a run that refuses to
@@ -449,87 +439,76 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 	if err != nil {
 		return nil, fmt.Errorf("session store: %w", err)
 	}
-	// A failed setup must not leave the database locked for the next attempt
-	// in this process; a successful one hands the handle to the caller.
-	defer func() {
-		if err != nil {
-			_ = store.Close()
-		}
-	}()
+
+	// The bound on in-flight chat completions is resolved before any session can
+	// ask a question, from the stored preference or the config or the default
+	// (§5.7). It needs the store to read the stored preference, so it goes
+	// immediately after opening it and before host.New, whose sweeps are the
+	// other process-level startup step.
+	applyConcurrency(store, modelCfg)
+
+	proc := host.New(store, context.Background())
 
 	// Project identity: the git toplevel, else the canonical working
 	// directory, so `mini sessions` and `mini -r` find the runs started in
-	// this checkout from anywhere inside it.
-	startDir := e.CWD
+	// this checkout from anywhere inside it. This stays with the CLI on
+	// purpose - it is a rule about checkouts and symlinks, not a property of
+	// running a conversation - so the host is handed the answer rather than
+	// the means of computing it.
+	startDir := config.String(envCfg, "cwd", "")
 	if startDir == "" {
 		startDir, _ = os.Getwd()
 	}
 	workdir, project := projectOf(startDir)
 
-	l := &agent.Loop{Cfg: agentCfg, Model: m, Env: e, Logger: slog.Default()}
-
-	// Fresh runs get a row (Title backfilled by the store when the task
-	// message lands, which is what titles the GUI's ask-for-a-task flow
-	// too); -r runs load the stored transcript and continue it.
-	var (
-		sess       *session.Session
-		resumeMsgs []model.Message
-		resumeNote string
-	)
+	spec := host.Spec{Config: merged, Workdir: workdir, Project: project}
 	if o.resume.present {
 		found, err := findResumable(store, project, o.resume.value)
 		if err != nil {
+			_ = store.Close()
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, errors.New("no session for this directory")
 			}
 			return nil, fmt.Errorf("session store: %w", err)
 		}
-		msgs, err := found.Transcript()
-		if err != nil {
-			return nil, fmt.Errorf("session store: %w", err)
-		}
-		sess = found
-		resumeMsgs = msgs
-		resumeNote = fmt.Sprintf("resumed session %s (%d turns)", sess.ID, len(msgs))
-		l.Cost, l.NCalls = sess.Cost, sess.NCalls
-		l.Resume(msgs)
-	} else {
-		created, err := store.Create(session.Row{ID: uuid.NewV7(), Workdir: workdir, Project: project, ModelName: m.Model})
-		if err != nil {
-			return nil, fmt.Errorf("session store: %w", err)
-		}
-		sess = created
+		spec.Resume = found
 	}
-	l.Recorder = sess
 
-	// Job registry, one per run. It interprets backgrounded commands through the
-	// same env.Local that answers the foreground bash tool, so a job is the same
-	// shell with a longer leash rather than a second dialect the model cannot
-	// see coming. The sweep runs before anything can start: a row still marked
-	// 'running' is a claim about a process this mini does not own, so it becomes
-	// orphaned and the human is told, which is the honest version of "still
-	// running" (docs/jobs-research.md §4).
-	jobs := &job.Manager{Session: sess, Local: e, Logger: slog.Default()}
-	l.Jobs = jobs
-	// One number for the foreground wait, from the same setting that governs
-	// the environment's own deadline.
-	l.CommandBudget = e.Timeout
-	for _, w := range jobs.Sweep() {
-		slog.Warn("job left running by a previous run", "warning", w)
+	hs, err := proc.Open(spec)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	sushi, ok := hs.Model.(*model.Sushi)
+	if !ok {
+		_ = store.Close()
+		return nil, errors.New("mini always opens a sushi client; the model was replaced under it")
+	}
+	// A request that had to queue says so, for the same reason a retry does: a
+	// stalled session with no explanation is indistinguishable from a crashed
+	// one. The GUI turns this into a line in the transcript in step 7; for now
+	// it is a log record, which is at least a true one.
+	sushi.OnGateWait = func(w model.GateWait) {
+		slog.Info("waiting for a model slot",
+			"waited", w.Waited.Round(time.Millisecond).String(),
+			"busy", w.Busy, "waiting", w.Waiting, "limit", w.Limit)
+	}
+	for _, wm := range hs.SweepWarn {
+		slog.Warn("job left running by a previous run", "warning", wm)
 	}
 
 	return &miniRun{
-		O: o, AgentCfg: agentCfg, Model: m, Env: e, Loop: l, Sess: sess, Store: store,
-		Jobs:       jobs,
-		ResumeMsgs: resumeMsgs, ResumeNote: resumeNote,
+		O: o, AgentCfg: hs.Cfg, Model: sushi, Env: hs.Env, Loop: hs.Loop,
+		Sess: hs.Sess, Store: store, Jobs: hs.Jobs, Proc: proc,
+		ResumeMsgs: hs.ResumeMsgs, ResumeNote: hs.ResumeNote,
 		ConfigName: configName, LogTarget: logTarget,
 		// Reaping rides the one cleanup path both front ends already share, and
 		// runs before the database closes so the ended states are recorded: a
-		// job outlives a turn, never a session.
+		// job outlives a turn, never a session. Process.Close ends children
+		// before parents (§9.2), which is the order that cannot leave a running
+		// process whose session is already closed.
 		closeStore: func() {
-			if n := jobs.KillAll(); n > 0 {
-				slog.Info("reaped live jobs on exit", "count", n)
-			}
+			_ = proc.Close()
 			_ = store.Close()
 		},
 	}, nil
@@ -643,12 +622,42 @@ func defaultConfigSpec() string {
 	return "mini"
 }
 
-func defaultOutputPath() string {
-	dir, err := config.EnsureConfigDir()
-	if err != nil {
-		return "last_mini_run.traj.json"
+// settingMaxConcurrentRequests is the stored bound on in-flight chat
+// completions - machine state rather than run configuration, in exactly the
+// sense that makes the thinking toggle live here instead of in the config file
+// (ui/prefs.go:12-20): it is a preference about this box, it should still be
+// there next launch, and `mini -p` must not rewrite anybody's config to keep it.
+//
+// The key deliberately has NO entry in the embedded mini.yaml. Precedence below
+// treats a config value as an explicit statement for this run, so a shipped
+// default sitting in the file would outrank the stored preference forever and
+// the setting would be a write-only column.
+const settingMaxConcurrentRequests = "max_concurrent_requests"
+
+// applyConcurrency resolves the process-wide bound on in-flight chat completion
+// requests and installs it. It is process-wide rather than per-session because
+// the resource it protects - one GPU behind one sushi - is shared by every
+// session in the process, and a bound a subagent can step around by building
+// its own client is not a bound (docs/parallel-sessions.md §5.7).
+//
+// The chain is ordered by specificity, which is how the context window resolves
+// in model.DiscoverContextWindow, and it logs its answer with the same
+// "source" field so a reader can tell which of the three moved.
+func applyConcurrency(store *session.Store, modelCfg map[string]any) {
+	limit, source := model.DefaultMaxConcurrentRequests, "default"
+	if stored, ok, err := store.Setting(settingMaxConcurrentRequests); err == nil && ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(stored)); err == nil && n > 0 {
+			limit, source = n, "setting"
+		}
 	}
-	return filepath.Join(dir, "last_mini_run.traj.json")
+	// A config value - from the file or a -c override - outranks the stored
+	// preference: a script that asks for one request at a time means it for this
+	// run, and that is what the config file is for.
+	if n := config.Int(modelCfg, "max_concurrent_requests", 0); n > 0 {
+		limit, source = n, "config"
+	}
+	model.DefaultGate.SetLimit(limit)
+	slog.Info("model concurrency", "limit", limit, "source", source)
 }
 
 // projectOf canonicalises dir and walks up to the nearest directory containing
@@ -693,26 +702,22 @@ func findResumable(store *session.Store, project, prefix string) (*session.Sessi
 	return store.Get(rows[0].ID)
 }
 
-// newEnvironment builds the local environment from the `environment:` section.
-func newEnvironment(cfg map[string]any) *env.Local {
-	l := &env.Local{
-		CWD:     config.String(cfg, "cwd", ""),
-		Env:     map[string]string{},
-		Timeout: time.Duration(config.Int(cfg, "timeout", int(env.DefaultTimeout.Seconds()))) * time.Second,
-	}
-	for k, v := range config.Sub(cfg, "env") {
-		if s, ok := v.(string); ok {
-			l.Env[k] = s
-		} else {
-			l.Env[k] = fmt.Sprint(v)
-		}
-	}
-	return l
-}
+// globalEnvOnce guards loadGlobalEnv because writing the process environment is
+// a thing that happens once per process, not once per session. It used to be
+// called from buildRun, which is only ever run once, so the distinction was
+// academic; with assembly callable N times it becomes a race between one
+// session's startup and another session's shells snapshotting os.Environ()
+// (env/local.go:119), which is exactly the kind of cross-talk a parallel session
+// must not have.
+var globalEnvOnce sync.Once
 
 // loadGlobalEnv applies the global .env without overriding real environment
 // variables, matching dotenv's default (override=False).
 func loadGlobalEnv() {
+	globalEnvOnce.Do(func() { loadGlobalEnvNow() })
+}
+
+func loadGlobalEnvNow() {
 	values, err := config.LoadEnv(config.GlobalConfigFile())
 	if err != nil {
 		slog.Warn("could not read the global config", "path", config.GlobalConfigFile(), "err", err)

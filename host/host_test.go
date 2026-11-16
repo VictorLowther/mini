@@ -1,0 +1,764 @@
+package host
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/VictorLowther/mini/agent"
+	"github.com/VictorLowther/mini/config"
+	"github.com/VictorLowther/mini/job"
+	"github.com/VictorLowther/mini/model"
+	"github.com/VictorLowther/mini/session"
+)
+
+// newProcess points the state directory at a temp dir and opens the store and a
+// Process over it, the way cmd/mini does.
+func newProcess(t *testing.T) (*Process, string) {
+	t.Helper()
+	base := t.TempDir()
+	t.Setenv("MINI_STATE_DIR", base)
+	st, err := session.Open(filepath.Join(base, "sessions.db"), filepath.Join(base, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	p := New(st, context.Background())
+	p.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	return p, base
+}
+
+func testConfig(t *testing.T) map[string]any {
+	t.Helper()
+	merged, err := config.FromSpec("mini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return merged
+}
+
+// scripted returns the model-injection config and the outputs one session will
+// replay: write a marker into its own directory, read it back, submit.
+func scripted(i int) model.Model {
+	return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turn(fmt.Sprintf("echo marker%d > marker.txt", i)),
+		turn("cat marker.txt"),
+		done(fmt.Sprintf("report-%d", i)),
+	}}
+}
+
+func turn(cmd string) model.Message {
+	return model.Message{"role": "assistant", "content": "run", "extra": map[string]any{
+		"actions": []model.Action{{Command: cmd}}, "cost": 1.0,
+	}}
+}
+
+func done(text string) model.Message {
+	return model.Message{"role": "assistant", "content": text, "extra": map[string]any{"cost": 1.0}}
+}
+
+// yolo returns the shipped config with the interactive mode set to yolo, which
+// is what `-y` does for a real run and what a spawning parent must be until
+// confirmations can bubble to a human (§5.5): a child answers to nobody, so a
+// confirm-mode parent may not create one.
+func yolo(t *testing.T, merged map[string]any) map[string]any {
+	t.Helper()
+	return config.Merge(merged, map[string]any{"agent": map[string]any{"mode": "yolo"}})
+}
+
+func openSession(t *testing.T, p *Process, merged map[string]any, dir string, i int, spec func(*Spec)) *Session {
+	t.Helper()
+	s := Spec{Config: merged, Workdir: dir, Project: dir, Model: scripted(i)}
+	s.OutputPath = "" // per-session default, which is what is under test
+	if spec != nil {
+		spec(&s)
+	}
+	if s.Model == nil {
+		s.Model = scripted(i)
+	}
+	sess, err := p.Open(s)
+	if err != nil {
+		t.Fatalf("open session %d: %v", i, err)
+	}
+	return sess
+}
+
+// TestOpenRunsManySessionsAtOnce is the reason the package exists: several
+// complete conversations, assembled concurrently through one host, each writing
+// into its own directory. It is the four-session probe from agent/parallel_test.go
+// driven through the real assembly path rather than by hand, so the tripwire
+// covers the wiring and not only the core.
+func TestOpenRunsManySessionsAtOnce(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+
+	const n = 4
+	dirs := make([]string, n)
+	sessions := make([]*Session, n)
+	for i := range dirs {
+		dirs[i] = filepath.Join(base, fmt.Sprintf("repo%d", i))
+		if err := os.MkdirAll(dirs[i], 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sessions[i] = openSession(t, p, merged, dirs[i], i, nil)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i, s := range sessions {
+		wg.Add(1)
+		go func(i int, s *Session) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if _, errs[i] = s.Run(ctx, fmt.Sprintf("task %d", i)); errs[i] != nil {
+				return
+			}
+			b, err := os.ReadFile(filepath.Join(dirs[i], "marker.txt"))
+			if err != nil {
+				errs[i] = fmt.Errorf("s%d marker: %w", i, err)
+				return
+			}
+			if got := strings.TrimSpace(string(b)); got != fmt.Sprintf("marker%d", i) {
+				errs[i] = fmt.Errorf("s%d wrote %q", i, got)
+			}
+		}(i, s)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("session %d: %v", i, err)
+		}
+	}
+
+	// The process enumerated all of them, and each row is a top-level one.
+	live := p.Sessions()
+	if len(live) != n {
+		t.Fatalf("live sessions = %d, want %d", len(live), n)
+	}
+	for _, s := range live {
+		if s.Kind != session.KindTop {
+			t.Errorf("session %s kind = %q, want top", s.ID, s.Kind)
+		}
+	}
+}
+
+// TestChildSessionLineage covers §5.3, §5.5 and §5.6 through the assembly path:
+// a child carries the parent link, resolves its root to the top of the tree,
+// keeps the name its parent gave it, and cannot itself have children.
+func TestChildSessionLineage(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent := openSession(t, p, merged, base, 0, nil)
+
+	child, err := p.Open(Spec{
+		Config: merged, Workdir: base, Project: base, Model: scripted(1),
+		Kind: session.KindSubagent, ParentID: parent.ID.String(), Name: "quantise 70b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Kind != session.KindSubagent || child.Parent != parent.ID {
+		t.Errorf("child = kind %q parent %v, want subagent/%v", child.Kind, child.Parent, parent.ID)
+	}
+	if child.Name != "quantise 70b" {
+		t.Errorf("name = %q, want the label the parent chose", child.Name)
+	}
+	row, err := p.Store.Get(child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.RootID != parent.ID.String() {
+		t.Errorf("child root = %q, want the parent's id (it is its own root's child)", row.RootID)
+	}
+	if pr, _ := p.Store.Get(parent.ID); pr.RootID != parent.ID.String() {
+		t.Errorf("top-level root = %q, want its own id", pr.RootID)
+	}
+
+	// Two levels, by construction, enforced at the store rather than by trusting
+	// every caller to have hidden the spawn tool.
+	if _, err := p.Open(Spec{
+		Config: merged, Workdir: base, ParentID: child.ID.String(), Kind: session.KindSubagent,
+	}); err == nil {
+		t.Error("a grandchild was opened; the two-level rule is not holding")
+	} else if !strings.Contains(err.Error(), "cannot have children") {
+		t.Errorf("grandchild refused for the wrong reason: %v", err)
+	}
+
+	if kids := p.Children(parent.ID); len(kids) != 1 || kids[0].ID != child.ID {
+		t.Errorf("Children = %+v, want the one child", kids)
+	}
+}
+
+// TestTrajectoryPathsDoNotCollide is §4 item 3 and §9.8 together: the default is
+// named after the session, and a child does not quietly inherit the parent's
+// chosen file.
+func TestTrajectoryPathsDoNotCollide(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+
+	parent := openSession(t, p, merged, base, 0, func(s *Spec) {
+		s.OutputPath = filepath.Join(base, "mine.traj.json")
+	})
+	if parent.Cfg.OutputPath != filepath.Join(base, "mine.traj.json") {
+		t.Errorf("explicit path not honored: %q", parent.Cfg.OutputPath)
+	}
+
+	child, err := p.Open(Spec{
+		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
+		Model: scripted(1), OutputPath: parent.Cfg.OutputPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Cfg.OutputPath == parent.Cfg.OutputPath {
+		t.Fatal("a child was given the parent's trajectory file; both would write it")
+	}
+
+	// Two defaults differ, and both sit under the state directory.
+	a := openSession(t, p, merged, base, 2, nil)
+	b := openSession(t, p, merged, base, 3, nil)
+	if a.Cfg.OutputPath == b.Cfg.OutputPath {
+		t.Errorf("two sessions share a default trajectory: %q", a.Cfg.OutputPath)
+	}
+	for _, s := range []*Session{a, b, child} {
+		if !strings.Contains(s.Cfg.OutputPath, s.ID.String()) && s.Cfg.OutputPath == parent.Cfg.OutputPath {
+			t.Errorf("session %s trajectory %q is not its own", s.ID, s.Cfg.OutputPath)
+		}
+	}
+}
+
+// TestProcessCloseReapsTheWholeTree is §9.2's ruling: abandoning a parent takes
+// its child sessions and their jobs with it, and the registry says so rather
+// than leaving rows claiming work is happening.
+func TestProcessCloseReapsTheWholeTree(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent := openSession(t, p, merged, base, 0, nil)
+	child, err := p.Open(Spec{
+		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
+		Name: "soak", Model: scripted(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run, err := child.Jobs.Start(job.Spec{Command: "sleep 30; echo never", Label: "soak", TCNO: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := child.LiveJobs(); got != 1 {
+		t.Fatalf("child live jobs = %d, want 1", got)
+	}
+
+	// The order is children first, so the child reaps its own registry before the
+	// parent's reap has to describe it.
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-run.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the child's job outlived the process that started it")
+	}
+	if child.LiveJobs() != 0 {
+		t.Errorf("child still reports %d live jobs after the reap", child.LiveJobs())
+	}
+	if !child.Closed() || !parent.Closed() {
+		t.Error("Process.Close did not close the whole tree")
+	}
+	if n := len(p.Sessions()); n != 0 {
+		t.Errorf("live sessions after Close = %d, want 0", n)
+	}
+}
+
+// TestGoAndWaitIsAsyncAndSingleFlight covers the job-shaped lifecycle feature 1
+// needs: Go returns before the work is done, Wait yields the report, and a second
+// run on the same session is refused rather than interleaved.
+func TestGoAndWaitIsAsyncAndSingleFlight(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	s := openSession(t, p, merged, base, 0, nil)
+	// A command that keeps the run busy long enough to observe it from outside.
+	s.Loop.Model = &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turn("sleep 1; echo hi"), done("the report"),
+	}}
+
+	s.Go("take your time")
+	waitForHost(t, "the run to start", s.Running)
+
+	if _, err := s.Run(context.Background(), "second"); err == nil {
+		t.Error("a second Run was allowed while one was in progress")
+	} else if !strings.Contains(err.Error(), "in progress") {
+		t.Errorf("refusal = %v, want the single-flight error", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	info, err := s.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info["exit_status"] != model.KindSubmitted {
+		t.Errorf("exit_status = %v, want %q", info["exit_status"], model.KindSubmitted)
+	}
+	if info["submission"] != "the report" {
+		t.Errorf("submission = %v, want the child's final text", info["submission"])
+	}
+	if s.Running() {
+		t.Error("still running after Wait returned")
+	}
+}
+
+// TestResumeLoadsTheStoredConversation is the host half of `mini -r`: the
+// transcript, and the cost ledger that goes with it.
+func TestResumeLoadsTheStoredConversation(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	first := openSession(t, p, merged, base, 0, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := first.Run(ctx, "do the thing"); err != nil {
+		t.Fatal(err)
+	}
+	row, err := p.Store.Get(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.NCalls == 0 {
+		t.Fatal("the run recorded no calls; the resume has nothing to restore")
+	}
+
+	resumed, err := p.Open(Spec{Config: merged, Resume: row, Model: scripted(9)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed.ResumeMsgs) == 0 || resumed.ResumeNote == "" {
+		t.Errorf("resume carried nothing: %d msgs, note %q", len(resumed.ResumeMsgs), resumed.ResumeNote)
+	}
+	if resumed.Loop.NCalls != row.NCalls || resumed.Loop.Cost != row.Cost {
+		t.Errorf("ledger = %d/%v, want the stored %d/%v", resumed.Loop.NCalls, resumed.Loop.Cost, row.NCalls, row.Cost)
+	}
+	if resumed.ID != first.ID {
+		t.Error("a resume opened a different session")
+	}
+}
+
+func TestOpenAfterCloseIsRefused(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Open(Spec{Config: merged, Workdir: base, Model: scripted(0)}); err == nil {
+		t.Fatal("a session was opened on a closed process")
+	}
+	// And the guards are honest about the config they need.
+	if _, err := New(p.Store, nil).Open(Spec{}); err == nil {
+		t.Error("Open accepted a nil config")
+	}
+}
+
+func TestGlobalEnvIsAppliedOnce(t *testing.T) {
+	p, _ := newProcess(t)
+	t.Setenv("HOST_TEST_SENTINEL", "real")
+	// A .env that tries to override a variable the process already has must not
+	// win, and must not be re-read per session (docs/parallel-sessions.md §4
+	// item 2): LoadGlobalEnv is guarded so a second Open cannot mutate the
+	// environment a first session's shells are snapshotting.
+	if _, err := config.EnsureConfigDir(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config.GlobalConfigFile(), []byte("HOST_TEST_SENTINEL=from-dotenv\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.LoadGlobalEnv()
+	p.LoadGlobalEnv()
+	if got := os.Getenv("HOST_TEST_SENTINEL"); got != "real" {
+		t.Errorf("sentinel = %q, want the pre-existing value to win", got)
+	}
+}
+
+func waitForHost(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestHooksReceiveTheSession guarantees the seam a front end needs is actually
+// wired: a session opened with Hooks drives them, and one opened without does
+// not prompt, which is what a batch run and a subagent want.
+func TestHooksReceiveTheSession(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	h := &countingHooks{}
+	s := openSession(t, p, merged, base, 0, func(sp *Spec) { sp.Hooks = h })
+	s.Loop.Model = &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{turn("echo hi"), done("done")}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := s.Run(ctx, "task"); err != nil {
+		t.Fatal(err)
+	}
+	if h.before == 0 || h.messages == 0 {
+		t.Errorf("hooks saw before=%d messages=%d, want both non-zero", h.before, h.messages)
+	}
+
+	plain := openSession(t, p, merged, base, 1, nil)
+	if plain.Loop.Hooks != nil {
+		t.Error("a session opened without Hooks inherited one anyway")
+	}
+}
+
+type countingHooks struct {
+	mu       sync.Mutex
+	before   int
+	messages int
+}
+
+func (h *countingHooks) BeforeExecute(context.Context, []model.Action, map[string]any) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.before++
+	return nil
+}
+func (h *countingHooks) OnSubmit(context.Context, model.Message) error { return nil }
+func (h *countingHooks) OnLimits(context.Context, *agent.Config, *model.Interrupt) error {
+	return nil
+}
+func (h *countingHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
+func (h *countingHooks) OnMessage(model.Message) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.messages++
+}
+func (h *countingHooks) OnInterrupt(context.Context) error { return nil }
+
+// TestNewEnvironmentReadsTheConfigSection moved here with the function it
+// covers: building the interpreter is host's job now, so the rule about which
+// config keys it honors belongs beside it rather than in the CLI that no longer
+// calls it.
+func TestNewEnvironmentReadsTheConfigSection(t *testing.T) {
+	dir := t.TempDir()
+	e := NewEnvironment(map[string]any{
+		"cwd":     dir,
+		"timeout": float64(5),
+		"env":     map[string]any{"PAGER": "cat", "COUNT": 3},
+	})
+	if e.CWD != dir || e.Timeout.Seconds() != 5 {
+		t.Errorf("env = %+v", e)
+	}
+	if e.Env["PAGER"] != "cat" || e.Env["COUNT"] != "3" {
+		t.Errorf("env vars = %#v", e.Env)
+	}
+}
+
+// TestToolSetFollowsSessionKind is §5.6 reaching the assembly: the kind decides
+// the advertised set, and one value drives the client and the loop together, so
+// there is no way to give a subagent a tool its instructions do not mention - or
+// to describe a tool in the prompt that its requests never carried.
+//
+// It uses a real Sushi against a port nothing listens on rather than the scripted
+// model, for two reasons: only the HTTP client carries the set into the request
+// body and the parser, and a server that will not answer must fall through the
+// window chain rather than fail the open.
+func TestToolSetFollowsSessionKind(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	// A base URL that refuses immediately, so discovery costs no timeout.
+	dead := "http://127.0.0.1:1"
+	merged = config.Merge(merged, map[string]any{
+		"model": map[string]any{"model_name": "test-model", "base_url": dead},
+	})
+
+	parent, err := p.Open(Spec{Config: merged, Workdir: base, Project: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sushi, ok := parent.Model.(*model.Sushi)
+	if !ok {
+		t.Fatalf("expected a sushi client, got %T", parent.Model)
+	}
+	if got, want := strings.Join(sushi.Tools.Names(), ","), strings.Join(model.TopLevelTools().Names(), ","); got != want {
+		t.Errorf("parent tools = %q, want %q", got, want)
+	}
+	child, err := p.Open(Spec{
+		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
+		Name: "explore",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csushi, ok := child.Model.(*model.Sushi)
+	if !ok {
+		t.Fatalf("expected a sushi client, got %T", child.Model)
+	}
+	if got, want := strings.Join(csushi.Tools.Names(), ","), strings.Join(model.SubagentTools().Names(), ","); got != want {
+		t.Errorf("child tools = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(child.Loop.Tools.Names(), ","), strings.Join(csushi.Tools.Names(), ","); got != want {
+		t.Errorf("the child's prompt set %q differs from its request set %q", got, want)
+	}
+	// The two-level tree, seen from the tool sets rather than the store: only the
+	// parent is offered the spawn tool and the send that follows it, and the
+	// child keeps the job tools it needs for its own background work.
+	if !parent.Loop.Tools.Has(model.ToolAgent) {
+		t.Error("the parent was not offered the spawn tool")
+	}
+	if child.Loop.Tools.Has(model.ToolAgent) || child.Loop.Tools.Has(model.ToolJobSend) {
+		t.Error("a subagent was offered the spawn tool, or a send with no possible target")
+	}
+	if !child.Loop.Tools.Has(model.ToolBash) || !child.Loop.Tools.Has(model.ToolJobs) {
+		t.Error("a subagent lost a tool it needs")
+	}
+}
+
+// TestSpawnRunsAChildAndReportsToItsParent is feature 1 end to end: a parent's
+// `agent` call opens a child session, the child does its own work and submits,
+// and the report reaches the parent's conversation as a background result - with
+// the row in the parent's registry telling the truth about it the whole time.
+func TestSpawnRunsAChildAndReportsToItsParent(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+
+	// Each child gets its own scripted model: touch a file in the working
+	// directory it was handed, and report.
+	p.ChildModel = func(kind string) model.Model {
+		if kind != session.KindSubagent {
+			return nil
+		}
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+			turn(fmt.Sprintf("echo from-child > child.txt")),
+			done("REPORT: wrote child.txt and verified it"),
+		}}
+	}
+
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: &model.Deterministic{
+		CostPerCall: 1, Outputs: []model.Message{
+			spawnTurn("explore repo", "Look at the working directory and report what you wrote."),
+			done("waiting on the child"),
+			done("parent finished"),
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	info, err := parent.Run(ctx, "spawn a helper and wait for its report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// §9.10, in the flesh: the parent's run ends beside a child that is still
+	// going, because the child is not an *owed* result yet and a top-level
+	// session's exit semantics were not touched for anybody's subagents. What
+	// must not happen is the parent inventing a report or the row claiming the
+	// child finished.
+	// The parent got its own turn done and stopped. Whether the child had
+	// already reported by that instant is a race - a scripted child finishes in
+	// milliseconds - so the assertion is about what is always true: exactly one
+	// row, and no invented report in the parent's own submission.
+	if rows, err := parent.Sess.ListJobs(); err != nil || len(rows) != 1 {
+		t.Fatalf("parent jobs = %+v (%v), want exactly one", rows, err)
+	}
+	if got := fmt.Sprint(info["submission"]); strings.Contains(got, "REPORT") {
+		t.Errorf("the parent reported on the child's behalf: %q", got)
+	}
+
+	// Wait for the child to end, then take the parent's next turn - the resume
+	// the human would have triggered with `mini -r`, which is the delivery path
+	// this design reuses rather than replaces.
+	waitForHost(t, "the child's row to go terminal", func() bool {
+		rows, err := parent.Sess.ListJobs()
+		return err == nil && len(rows) == 1 && rows[0].State != session.JobRunning
+	})
+	if _, err := parent.runChildTurn(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// The child really ran, in the parent's directory, and left its evidence.
+	if _, err := os.Stat(filepath.Join(base, "child.txt")); err != nil {
+		t.Errorf("the child never did its work: %v", err)
+	}
+
+	// The child's row lives in the parent's registry, named, and is terminal.
+	rows, err := parent.Sess.ListJobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("parent jobs = %d, want the one subagent", len(rows))
+	}
+	row := rows[0]
+	if row.Kind != session.KindSubagent || row.Label != "explore repo" {
+		t.Errorf("row = kind %q label %q", row.Kind, row.Label)
+	}
+	if row.State == session.JobRunning {
+		t.Fatal("the agent row is still running after the child reported")
+	}
+
+	// The report text reached the parent's conversation - not a pointer to it.
+	// A parent that had to spend a turn reading a file to learn what its child
+	// found out hands back exactly the cost the child was meant to save.
+	var saw string
+	for _, m := range parent.Loop.Messages {
+		if c := fmt.Sprint(m["content"]); strings.Contains(c, "REPORT: wrote child.txt") {
+			saw = c
+		}
+	}
+	if saw == "" {
+		for _, m := range parent.Loop.Messages {
+			t.Logf("msg role=%v: %.140s", m["role"], m["content"])
+		}
+		t.Fatal("the subagent's report never reached the parent's conversation")
+	}
+	if !strings.Contains(saw, "explore repo") {
+		t.Errorf("the wake does not name the subagent it is about: %.200s", saw)
+	}
+
+	// And the full report is in the row's own file, where `jobs` points.
+	body, err := os.ReadFile(row.OutputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "REPORT: wrote child.txt") {
+		t.Errorf("job file holds %.120q", body)
+	}
+}
+
+// TestSubagentCannotSpawn is the two-level tree enforced at the seam as well as
+// by tool visibility (§5.6) and by the store (§5.3): three layers, all agreeing,
+// because the one that matters is the one a future caller forgets.
+func TestSubagentCannotSpawn(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent, err := p.Open(Spec{Config: merged, Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := p.Open(Spec{
+		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
+		Name: "leaf", Model: scripted(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := child.Spawn(context.Background(), agent.SpawnRequest{Name: "grandchild", Prompt: "try"}); err == nil {
+		t.Fatal("a subagent spawned a child")
+	} else if !strings.Contains(err.Error(), "cannot spawn another subagent") {
+		t.Errorf("refusal = %v", err)
+	}
+}
+
+// TestSendRefusesNonAgentJobs is §9.11's flat refusal, and §9.5's claim that
+// `job_send` needs no new listing: the id it takes is the one `jobs` prints.
+func TestSendRefusesNonAgentJobs(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent, err := p.Open(Spec{Config: merged, Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := parent.Jobs.Start(job.Spec{Command: "sleep 5; echo hi", Label: "build", TCNO: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { parent.Jobs.KillAll() })
+
+	if err := parent.Send(context.Background(), run.ID(), "stop that"); err == nil {
+		t.Fatal("a bash job accepted a send")
+	} else if !strings.Contains(err.Error(), "Cannot send to job") {
+		t.Errorf("refusal = %v, want the §9.11 wording", err)
+	}
+	if err := parent.Send(context.Background(), "j999", "hello"); err == nil {
+		t.Error("a send to an unknown job was accepted")
+	}
+}
+
+// TestAgentJobsAreExemptFromTheProcessCap is §5.7's consequence, tested rather
+// than asserted in prose: the cap bounds processes, and a parent at the cap can
+// still spawn, because the child holds no pid.
+func TestAgentJobsAreExemptFromTheProcessCap(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("child report")}}
+	}
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { parent.Jobs.KillAll() })
+
+	for i := 0; i < int(job.DefaultMaxJobs); i++ {
+		if _, err := parent.Jobs.Start(job.Spec{Command: "sleep 30", Label: "hog", TCNO: 10 + i}); err != nil {
+			t.Fatalf("bash job %d was refused early: %v", i, err)
+		}
+	}
+	if _, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "past the cap", Prompt: "do it"}); err != nil {
+		t.Errorf("an agent job was refused by the process cap: %v", err)
+	}
+}
+
+// TestConfirmModeParentCannotSpawnYet is §5.5 enforced rather than assumed. A
+// child runs with no Hooks, which means no prompts and no confirmations at all;
+// creating one from a session whose human approves every command would hand the
+// child more authority than that human granted, silently, one level down. Until
+// step 7 gives a parent a way to answer on its child's behalf, the honest answer
+// is no - and a refusal that names the switch to make is worth more than a
+// permission that quietly widened.
+func TestConfirmModeParentCannotSpawnYet(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	if mode := config.Sub(merged, "agent")["mode"]; mode == "yolo" {
+		t.Skip("the shipped config no longer defaults to confirm; the guard has nothing to refuse")
+	}
+	parent, err := p.Open(Spec{Config: merged, Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parent.Cfg.Mode == "yolo" {
+		t.Skip("this session was built yolo anyway")
+	}
+	_, err = parent.Spawn(context.Background(), agent.SpawnRequest{Name: "helper", Prompt: "do it"})
+	if err == nil {
+		t.Fatal("a confirm-mode parent spawned an unattended child")
+	}
+	for _, want := range []string{"cannot start a subagent", "confirm", "/y"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+	// A subagent may still spawn nothing at all, however it was created - the
+	// two-level rule does not depend on the mode guard.
+	child, err := p.Open(Spec{Config: merged, Workdir: base, Kind: session.KindSubagent,
+		ParentID: parent.ID.String(), Name: "leaf", Model: scripted(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := child.Spawn(context.Background(), agent.SpawnRequest{Name: "g", Prompt: "p"}); err == nil {
+		t.Error("a subagent spawned a grandchild")
+	}
+}
+
+func spawnTurn(name, prompt string) model.Message {
+	return model.Message{"role": "assistant", "content": "delegating", "extra": map[string]any{
+		"actions": []model.Action{{Tool: model.ToolAgent, Args: map[string]any{"name": name, "prompt": prompt}}},
+		"cost":    1.0,
+	}}
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/model"
+	"github.com/VictorLowther/mini/session"
 )
 
 func fixtureServer(t *testing.T, names ...string) *httptest.Server {
@@ -178,21 +179,6 @@ func TestExitCode(t *testing.T) {
 	}
 	if got := exitCode(nil, os.ErrClosed); got != 1 {
 		t.Errorf("error exit code = %d", got)
-	}
-}
-
-func TestNewEnvironmentReadsTheConfigSection(t *testing.T) {
-	dir := t.TempDir()
-	e := newEnvironment(map[string]any{
-		"cwd":     dir,
-		"timeout": float64(5),
-		"env":     map[string]any{"PAGER": "cat", "COUNT": 3},
-	})
-	if e.CWD != dir || e.Timeout.Seconds() != 5 {
-		t.Errorf("env = %+v", e)
-	}
-	if e.Env["PAGER"] != "cat" || e.Env["COUNT"] != "3" {
-		t.Errorf("env vars = %#v", e.Env)
 	}
 }
 
@@ -528,4 +514,61 @@ func sub(m map[string]any, key string) map[string]any {
 func str(m map[string]any, key string) string {
 	s, _ := m[key].(string)
 	return s
+}
+
+// TestApplyConcurrencyChain covers the knob's precedence: default, then the
+// stored preference a UI writes, then an explicit config value for this run.
+// It restores the shared DefaultGate afterwards because the bound is
+// process-wide state and no other test should inherit this one's opinion.
+func TestApplyConcurrencyChain(t *testing.T) {
+	t.Cleanup(func() { model.DefaultGate.SetLimit(model.DefaultMaxConcurrentRequests) })
+
+	dir := t.TempDir()
+	store, err := session.Open(filepath.Join(dir, "sessions.db"), filepath.Join(dir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 1. Nobody has said anything: the shipped default, and nothing written.
+	applyConcurrency(store, map[string]any{})
+	if got := model.DefaultGate.Limit(); got != model.DefaultMaxConcurrentRequests {
+		t.Errorf("default limit = %d, want %d", got, model.DefaultMaxConcurrentRequests)
+	}
+	if _, ok, _ := store.Setting(settingMaxConcurrentRequests); ok {
+		t.Error("a default got stored; a preference nobody expressed must stay absent")
+	}
+
+	// 2. The stored preference wins over the default.
+	if err := store.SetSetting(settingMaxConcurrentRequests, "2"); err != nil {
+		t.Fatal(err)
+	}
+	applyConcurrency(store, map[string]any{})
+	if got := model.DefaultGate.Limit(); got != 2 {
+		t.Errorf("limit from the stored setting = %d, want 2", got)
+	}
+
+	// 3. And an explicit config value wins over the stored preference: a script
+	//    that passes -c model.max_concurrent_requests=1 means it for this run.
+	applyConcurrency(store, map[string]any{"max_concurrent_requests": 1})
+	if got := model.DefaultGate.Limit(); got != 1 {
+		t.Errorf("limit from config = %d, want 1", got)
+	}
+
+	// 4. Garbage in the settings row is not an opinion, and it must not crash a
+	//    startup or wedge the gate at zero.
+	if err := store.SetSetting(settingMaxConcurrentRequests, "lots"); err != nil {
+		t.Fatal(err)
+	}
+	applyConcurrency(store, map[string]any{})
+	if got := model.DefaultGate.Limit(); got != model.DefaultMaxConcurrentRequests {
+		t.Errorf("limit with an unparseable setting = %d, want the default", got)
+	}
+	if err := store.SetSetting(settingMaxConcurrentRequests, "0"); err != nil {
+		t.Fatal(err)
+	}
+	applyConcurrency(store, map[string]any{})
+	if got := model.DefaultGate.Limit(); got < 1 {
+		t.Errorf("a stored zero produced limit %d; the gate must never be closed", got)
+	}
 }
