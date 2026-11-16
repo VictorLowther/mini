@@ -253,6 +253,39 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 		return nil, errors.New("the agent config needs system_template and instance_template")
 	}
 
+	// A subagent takes as long as it takes. No step budget, no dollar budget, no
+	// wall clock - cleared here, at the one place that decides what a child is,
+	// so no caller has to remember and no config can leak one in.
+	//
+	// The trigger was a revival: a child's spend belongs to its session and is
+	// not reset by another run of it, so a helper re-driven for a second pass
+	// could be stopped partway through by the first pass's cost. The alternative
+	// fixes were to hand revivals a fresh ledger - which is no ledger at all,
+	// since anything could then be finished in n+1 passes for the price of n - or
+	// to raise the parent's number on the child's behalf, which is the human's
+	// decision to make and not the harness's. Removing the budget from the case
+	// that cannot use it is the smaller machine.
+	//
+	// What bounds a child instead is the machinery that already exists and is
+	// honest about it: the parent can `job_kill` it, `Quit` ends it, closing the
+	// process ends it and its whole subtree (§9.2), and the in-flight-request
+	// bound is the one cost that actually matters on a single GPU (§5.7). A
+	// runaway is visible in `jobs` with a name, an elapsed time and an output
+	// path - which is a thing a human can act on, where a silent budget cut is a
+	// thing that merely stops.
+	//
+	// Top-level sessions keep their budgets. Those limits are the human's control
+	// over a run they are watching, and `OnLimits` exists so they can be lifted
+	// deliberately mid-flight; a subagent has nobody watching it in that sense, so
+	// the same mechanism stops being a guardrail and becomes a second, invisible
+	// author of the report - "the subagent ended on its cost limit" is an answer
+	// the parent got because of a number in a file nobody meant as a task spec.
+	if spec.Kind == session.KindSubagent {
+		agentCfg.StepLimit = 0
+		agentCfg.CostLimit = 0
+		agentCfg.WallTimeLimitSeconds = 0
+	}
+
 	sess, err := p.row(spec, modelCfg)
 	if err != nil {
 		return nil, err

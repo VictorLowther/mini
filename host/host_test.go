@@ -1008,45 +1008,86 @@ func waitJobDone(t *testing.T, s *Session, id string) *session.JobRow {
 	return row
 }
 
-// TestLimitEndedSubagentReportsWhereItStopped holds §9.9's promise that a child
-// which did not submit still produces a report naming what happened. The first
-// version of the wrapper wrote "(the subagent ended without a report)" for every
-// such ending, which is a summary of nothing: a parent cannot tell a helper that
-// ran out of money from one that ran out of turns, and both look identical to one
-// that simply had nothing to say.
-func TestLimitEndedSubagentReportsWhereItStopped(t *testing.T) {
+// TestSubagentOutlivesItsParentsBudget is the ruling that subagents take as long
+// as they take, asserted as behaviour rather than commented. The shipped
+// cost_limit is $3 and the step budget is off; a child that used to be stopped by
+// its own ledger is now allowed to finish, which is what "how long did the task
+// need" means when the answer is longer than a number in a config file.
+//
+// It replaces a test that asserted the opposite - that a child ended on
+// LimitsExceeded and reported so - and that test's failure was the proof the
+// carve-out works: the report is the child's real submission now, not a budget
+// notice.
+func TestSubagentOutlivesItsParentsBudget(t *testing.T) {
 	p, base := newProcess(t)
 	merged := testConfig(t)
-	// A budget the child cannot finish inside: $1 is under the two turns its
-	// script needs, so it ends on LimitsExceeded rather than by submitting.
+	// A budget the child cannot finish inside if limits apply to it.
 	parent, err := p.Open(Spec{Config: withCost(t, merged, 1), Workdir: base, Project: base, Model: scripted(0)})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if parent.Cfg.CostLimit != 1 {
+		t.Fatal("the test's own budget did not apply to the parent")
+	}
 	p.ChildModel = func(string) model.Model {
 		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
-			turn("echo a > a.txt"), done("never reached"),
+			turn("echo a > a.txt"), turn("echo b > b.txt"), turn("echo c > c.txt"),
+			done("REPORT: three passes, one dollar budget"),
 		}}
 	}
-	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "cheap", Prompt: "do a little"})
+	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "unbounded", Prompt: "do all of it"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	_ = ctx
 	row := waitJobDone(t, parent, reply.JobID)
-	if row.State == session.JobRunning {
-		t.Fatal("still running")
+	if row.State != session.JobCompleted {
+		t.Errorf("state = %s, want completed", row.State)
 	}
 	body := string(mustRead(t, row.OutputPath))
-	for _, want := range []string{"limitsexceeded", "model calls", "$"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the report does not name %q: %q", want, body)
+	if !strings.Contains(body, "REPORT: three passes") {
+		t.Errorf("child reported %.120q", body)
+	}
+	if strings.Contains(strings.ToLower(body), "limit") {
+		t.Errorf("a limit ended the child after all: %.160q", body)
+	}
+	// And the child's spend is still recorded, because the ledger is accounting
+	// and only the enforcement is gone - the parent's human still wants to know
+	// what the delegation cost (§5.8).
+	kid, ok := p.childOfJob(parent.ID.String(), reply.JobID)
+	if !ok {
+		t.Fatal("child not mapped")
+	}
+	if kid.Loop.Cost <= 0 {
+		t.Errorf("child cost = %v, want its spend recorded even though nothing bounded it", kid.Loop.Cost)
+	}
+}
+
+// TestEndingOfNamesTheEnding keeps §9.9's promise for the endings a child can
+// still meet without a budget: killed, or a run that stopped without submitting.
+func TestEndingOfNamesTheEnding(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid, err := p.Open(Spec{
+		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
+		Name: "worker", Model: scripted(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid.Loop.NCalls, kid.Loop.Cost = 4, 2.5
+	got := endingOf(kid, map[string]any{"exit_status": model.KindRepeatedFormatErr})
+	for _, want := range []string{"worker", "repeatedformaterr", "4 model calls", "$2.50"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("ending does not name %q: %q", want, got)
 		}
 	}
-	if strings.Contains(body, "ended without a report") {
-		t.Errorf("the empty-summary path is back: %q", body)
+	// An empty info map is not a crash and not a blank either.
+	if !strings.Contains(endingOf(kid, nil), "without a report") {
+		t.Error("the no-information ending lost its wording")
 	}
 }
 
