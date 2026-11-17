@@ -46,6 +46,12 @@ type GUIOptions struct {
 	// thread. nil means the window has no way to end a job, and running job cards
 	// then carry no control at all rather than one that lies.
 	JobEnd func(id string) error
+	// Exporter writes one session's trajectory out of the store and returns the
+	// path it wrote - the only way a trajectory file appears, since running a
+	// session saves nothing but the store. nil means this window has nowhere to
+	// export through, and export then says so instead of writing something nobody
+	// asked for to a path nobody chose.
+	Exporter func(id, path string) (string, error)
 	// Opener assembles a session for another working directory. It belongs to the
 	// window rather than to the session that carried it first: opening a session
 	// writes to the session store and asks the server for its context window, so
@@ -642,6 +648,29 @@ func (g *GUI) togglePause() bool {
 // actually stopping at the boundary - the ⏸ says "will stop", which is what the
 // human needs to know either way.
 func (g *GUI) paused() bool { return g.loop != nil && g.loop.Paused() }
+
+// export writes this session's trajectory where the human asked, and says so in the
+// tab. Export is an act the human takes: nothing writes a transcript file because a
+// session ran, which is why the document is rebuilt from the store rather than from
+// a per-step file, and why a subagent's tab can export itself as easily as its
+// parent's.
+func (g *GUI) export(path string) {
+	path = strings.TrimSpace(path)
+	if g.sh.exporter == nil {
+		g.v.noteLocal("this window cannot export a trajectory")
+		return
+	}
+	if g.sessionID == "" {
+		g.v.noteLocal("this session has no stored id to export yet")
+		return
+	}
+	written, err := g.sh.exporter(g.sessionID, path)
+	if err != nil {
+		g.v.noteLocal("could not export this session: " + err.Error())
+		return
+	}
+	g.v.noteLocal("exported this session's trajectory to " + written)
+}
 
 // loopRunning reports whether the agent is inside Loop.Run.
 func (g *GUI) loopRunning() bool { return g.loop != nil && g.loop.Running() }

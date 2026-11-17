@@ -204,10 +204,14 @@ func TestChildSessionLineage(t *testing.T) {
 	}
 }
 
-// TestTrajectoryPathsDoNotCollide is §4 item 3 and §9.8 together: the default is
-// named after the session, and a child does not quietly inherit the parent's
-// chosen file.
-func TestTrajectoryPathsDoNotCollide(t *testing.T) {
+// TestTrajectoryFilesAreOnlyWhatWasAskedFor is the rule §4 item 3 used to encode,
+// rewritten for the one that replaces it: nothing writes a trajectory because a
+// session happened to run. An explicit -o (or agent.output_path, or a spec that
+// names one) is honored and written; everything else gets an empty path, which
+// Loop.Save treats as "nowhere to write". The anti-clobber property the old test
+// defended is now stronger rather than weaker: a child has no path at all, so there
+// is nothing to collide with, and the state directory gains no files.
+func TestTrajectoryFilesAreOnlyWhatWasAskedFor(t *testing.T) {
 	p, base := newProcess(t)
 	merged := testConfig(t)
 
@@ -218,6 +222,8 @@ func TestTrajectoryPathsDoNotCollide(t *testing.T) {
 		t.Errorf("explicit path not honored: %q", parent.Cfg.OutputPath)
 	}
 
+	// A child asks for none of it: the parent's request does not reach a session
+	// whose config was derived from it (§9.8), whatever the spec carries.
 	child, err := p.Open(Spec{
 		Config: merged, Workdir: base, Kind: session.KindSubagent, ParentID: parent.ID.String(),
 		Model: scripted(1), OutputPath: parent.Cfg.OutputPath,
@@ -225,20 +231,27 @@ func TestTrajectoryPathsDoNotCollide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.Cfg.OutputPath == parent.Cfg.OutputPath {
-		t.Fatal("a child was given the parent's trajectory file; both would write it")
+	if child.Cfg.OutputPath != "" {
+		t.Errorf("a child inherited a trajectory path: %q", child.Cfg.OutputPath)
 	}
 
-	// Two defaults differ, and both sit under the state directory.
+	// Two sessions with no request write nothing, and share nothing.
 	a := openSession(t, p, merged, base, 2, nil)
 	b := openSession(t, p, merged, base, 3, nil)
-	if a.Cfg.OutputPath == b.Cfg.OutputPath {
-		t.Errorf("two sessions share a default trajectory: %q", a.Cfg.OutputPath)
+	if a.Cfg.OutputPath != "" || b.Cfg.OutputPath != "" {
+		t.Errorf("unasked sessions were given trajectory files: %q and %q", a.Cfg.OutputPath, b.Cfg.OutputPath)
 	}
-	for _, s := range []*Session{a, b, child} {
-		if !strings.Contains(s.Cfg.OutputPath, s.ID.String()) && s.Cfg.OutputPath == parent.Cfg.OutputPath {
-			t.Errorf("session %s trajectory %q is not its own", s.ID, s.Cfg.OutputPath)
+	for _, s := range []*Session{parent, a, b, child} {
+		if _, err := s.Run(context.Background(), "do the thing"); err != nil {
+			t.Fatalf("run: %v", err)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(base, "trajectories")); !os.IsNotExist(err) {
+		t.Errorf("a trajectories directory exists under the state dir (%v); nothing was asked to write there", err)
+	}
+	// The one file that was asked for is the one that exists.
+	if _, err := os.Stat(parent.Cfg.OutputPath); err != nil {
+		t.Errorf("the explicit trajectory was not written: %v", err)
 	}
 }
 

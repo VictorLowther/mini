@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
+	"path/filepath"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/env"
@@ -627,9 +629,27 @@ func TestGUIPauseHoldsItsOwnSession(t *testing.T) {
 
 // jobLister is a registry holding one handed-off run, still burning until a card's
 // End control stops it.
+//
+// The live flag is guarded because the ender runs on the goroutine the button
+// spawns - which is how it must run, since Kill waits through the unwind - while the
+// card and the tick read it from the toolkit goroutine. An unguarded bool here is
+// the race, not the code under test.
 type jobLister struct {
-	id    string
-	alive bool
+	id   string
+	mu   sync.Mutex
+	live bool
+}
+
+func (j *jobLister) running() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.live
+}
+
+func (j *jobLister) stop() {
+	j.mu.Lock()
+	j.live = false
+	j.mu.Unlock()
 }
 
 func (j *jobLister) JobCard(id string) (JobCard, bool) {
@@ -637,14 +657,14 @@ func (j *jobLister) JobCard(id string) (JobCard, bool) {
 		return JobCard{}, false
 	}
 	state := "killed"
-	if j.alive {
+	if j.running() {
 		state = "running"
 	}
-	return JobCard{ID: id, Running: j.alive, State: state, Label: "train"}, true
+	return JobCard{ID: id, Running: j.running(), State: state, Label: "train"}, true
 }
 
 func (j *jobLister) LiveJobs() (int, error) {
-	if j.alive {
+	if j.running() {
 		return 1, nil
 	}
 	return 0, nil
@@ -688,11 +708,11 @@ func jobCardBlock(id string) block {
 // without ending the session or arguing the model into calling job_kill.
 func TestGUIJobCardEndsItsOwnJob(t *testing.T) {
 	a := newTestWindow(t, "yolo", "alpha")
-	reg := &jobLister{id: "j1", alive: true}
+	reg := &jobLister{id: "j1", live: true}
 	ended := make(chan string, 4)
 	b := openWithOptions(t, a, GUIOptions{
 		TabLabel: "worker", Jobs: reg,
-		JobEnd: func(id string) error { ended <- id; reg.alive = false; return nil },
+		JobEnd: func(id string) error { ended <- id; reg.stop(); return nil },
 	})
 	b.committedForTest(jobCardBlock("j1"))
 
@@ -735,5 +755,52 @@ func TestGUIJobCardEndsItsOwnJob(t *testing.T) {
 	// action that would do nothing.
 	if got := findArea(b.newRowForTest(0)); len(got.actions.Objects) != 0 {
 		t.Errorf("a finished job's card still carries %d controls", len(got.actions.Objects))
+	}
+}
+
+// TestGUIExportWritesEachSessionsOwnTrajectory is the export surface: /export acts
+// on the session in the tab it was typed in, takes an optional path, and reports
+// where the file went. A window with no exporter says so rather than writing
+// something to a path nobody chose.
+func TestGUIExportWritesEachSessionsOwnTrajectory(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	a.sessionID = "11111111-1111-7000-8000-000000000000"
+	dir := t.TempDir()
+	type call struct{ id, path string }
+	requests := make(chan call, 4)
+	a.sh.exporter = func(id, path string) (string, error) {
+		requests <- call{id, path}
+		return filepath.Join(dir, "mini-"+id[:8]+".traj.json"), nil
+	}
+
+	if !a.v.commandOrSteer("/export") {
+		t.Fatal("/export was not handled as a command")
+	}
+	sel := <-requests
+	if sel.id != a.sessionID || sel.path != "" {
+		t.Errorf("export asked for %+v, want this session with no path of its own", sel)
+	}
+	if got := transcriptText(a.v.root()); !strings.Contains(got, "mini-11111111.traj.json") {
+		t.Errorf("the tab never said where the trajectory went:\n%s", got)
+	}
+
+	// A second tab exports itself, not the session whose tab the port was made on.
+	b := openWithOptions(t, a, GUIOptions{TabLabel: "worker"})
+	b.sessionID = "22222222-2222-7000-8000-000000000000"
+	chosen := filepath.Join(dir, "chosen.json")
+	if !b.v.commandOrSteer("/export " + chosen) {
+		t.Fatal("/export with a path was not handled as a command")
+	}
+	sel = <-requests
+	if sel.id != b.sessionID || sel.path != chosen {
+		t.Errorf("worker's export asked for %+v, want its own id and the given path", sel)
+	}
+
+	// A window that cannot export says so, and writes nothing.
+	quiet := newTestWindow(t, "yolo", "beta")
+	quiet.sessionID = "33333333"
+	quiet.export("")
+	if got := transcriptText(quiet.v.root()); !strings.Contains(got, "cannot export") {
+		t.Errorf("an unbacked export said:\n%s", got)
 	}
 }

@@ -1705,8 +1705,8 @@ const guiMultilineHint = "multi-line input is not a mode here: shift+enter adds 
 // into the transcript, and the transcript materializes a window, so a long note
 // here is the top of the help block scrolling out of sight.
 const guiScopeNote = `
-with tabs: /y /c /u /compact /pause /resume act on this session, /t and quitting on the
-whole window. ⌥→ / ⌥← switch sessions, ⌘. holds this one at its next step boundary,
+with tabs: /y /c /u /compact /pause /resume /export act on this session, /t and quitting
+on the whole window. ⌥→ / ⌥← switch sessions, ⌘. holds this one at its next step boundary,
 ⌘W or × closes it - and × and quitting both take a second press while work is running.`
 
 // slash applies the /y /c /u /h commands, printing their feedback into the
@@ -1740,6 +1740,12 @@ func (w viewWriter) Write(p []byte) (int, error) {
 // commandOrSteer handles the input affordances that work whether or not a
 // prompt is pending: /y /c /u /h /t /compact and /m.
 func (v *guiView) commandOrSteer(text string) bool {
+	// /export takes an optional path, so it is matched by prefix before the
+	// value-switch below rather than turned into another case in it.
+	if text == "/export" || strings.HasPrefix(text, "/export ") {
+		v.gui.export(strings.TrimPrefix(text, "/export"))
+		return true
+	}
 	switch text {
 	case "/pause":
 		v.gui.setPause(true)

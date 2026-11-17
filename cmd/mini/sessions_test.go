@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -607,4 +608,140 @@ func TestSessionsHidesAndProtectsSubagentSessions(t *testing.T) {
 	if _, err := st2.Get(child.ID); err == nil {
 		t.Error("the child row survived its parent's removal")
 	}
+}
+
+// TestSessionsExportWritesTrajectoryOnRequest is the whole rule from the front: a
+// run writes no trajectory file at all, and `sessions export` writes one when - and
+// only when - a human asks. The document comes out of the store, so it says what
+// the store actually knows; `info.config` is absent rather than filled in with the
+// configuration of the day the export ran.
+func TestSessionsExportWritesTrajectoryOnRequest(t *testing.T) {
+	stateDir, traj := cliEnv(t, "")
+	srv := fixtureServer(t, "toolcall.sse", "submit.sse")
+	defer srv.Close()
+	repo := repoDir(t)
+	runCLI(t, srv.URL, "export me a trajectory", traj)
+	sid := mustSessionID(t, stateDir)
+
+	// Nothing to find, anywhere, from a run that asked for nothing.
+	if files, err := filepath.Glob(filepath.Join(stateDir, "trajectories", "*.traj.json")); err != nil || len(files) != 0 {
+		t.Errorf("a run wrote %d trajectory files (%v, %v); the store is the record", len(files), files, err)
+	}
+	if files, err := filepath.Glob(filepath.Join(repo, "*.traj.json")); err != nil || len(files) != 0 {
+		t.Errorf("the working directory gained %d trajectory files (%v, %v)", len(files), files, err)
+	}
+
+	out := filepath.Join(t.TempDir(), "wanted.json")
+	var msg strings.Builder
+	if err := runSessionsCommand([]string{"export", "-o", out}, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg.String(), "wanted.json") {
+		t.Errorf("export said %q, want the path it wrote", msg.String())
+	}
+	doc := readTrajectory(t, out)
+	info, _ := doc["info"].(map[string]any)
+	if got, _ := doc["trajectory_format"].(string); got != "mini-swe-agent-1.1" {
+		t.Errorf("trajectory_format = %v", got)
+	}
+	if got, _ := info["session_id"].(string); got != sid {
+		t.Errorf("session_id = %q, want %s", got, sid)
+	}
+	if _, ok := info["config"]; ok {
+		t.Error("the export carries a config block the store never recorded")
+	}
+	if status, _ := info["exit_status"].(string); status == "" {
+		t.Error("exit_status is missing from the exported info")
+	}
+	msgs, _ := doc["messages"].([]any)
+	if len(msgs) < 4 {
+		t.Fatalf("%d messages exported, want system, instance, the tool turn and its result", len(msgs))
+	}
+	// The tool call and its observation are both in there, which is the point of
+	// an export: the conversation as it happened, not just what it ended saying.
+	var all strings.Builder
+	for _, m := range msgs {
+		msg, _ := m.(map[string]any)
+		fmt.Fprintf(&all, "%v|%v ", msg["role"], msg["content"])
+	}
+	for _, want := range []string{"system", "assistant", "tool", "Everything verified"} {
+		if !strings.Contains(all.String(), want) {
+			t.Errorf("the exported transcript is missing %q; it reads:\n%s", want, all.String())
+		}
+	}
+	if sub, _ := info["submission"].(string); !strings.Contains(sub, "Everything verified") {
+		t.Errorf("info.submission = %q, want the text the run ended on", sub)
+	}
+
+	// No -o: named after the session, in the directory the human is standing in.
+	if err := runSessionsCommand([]string{"export"}, &msg); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(repo, "mini-"+sid[:8]+".traj.json")
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("default export path %s: %v", want, err)
+	}
+
+	if err := runSessionsCommand([]string{"export", "-o", out, sid[:8]}, &msg); err != nil {
+		t.Errorf("export by uuid prefix failed: %v", err)
+	}
+	// A prefix no session can carry. Not a fresh uuid: v7 ids start with the
+	// millisecond, so a "random" prefix generated here routinely turns out to be
+	// a real session's first eight characters.
+	if err := runSessionsCommand([]string{"export", "-o", out, "ffffffff"}, &msg); err == nil {
+		t.Error("exporting an unknown session succeeded")
+	}
+}
+
+// TestSessionsExportsSubagentTranscripts is why the lookup behind export is not the
+// one behind -r and rm: a child's transcript is worth having, and writing it out
+// neither resumes it nor deletes it.
+func TestSessionsExportsSubagentTranscripts(t *testing.T) {
+	stateDir, traj := cliEnv(t, "")
+	srv := fixtureServer(t, "submit.sse")
+	defer srv.Close()
+	repoDir(t)
+	runCLI(t, srv.URL, "the human's task", traj)
+
+	st, err := session.Open(filepath.Join(stateDir, "sessions.db"), filepath.Join(stateDir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.List("", true, 1)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("list: %v %d", err, len(rows))
+	}
+	child, err := st.Create(session.Row{
+		ID: uuid.NewV7(), ParentID: rows[0].ID.String(), Kind: session.KindSubagent,
+		Title: "quantise 70b", Workdir: rows[0].Workdir, Project: rows[0].Project, ModelName: "test-model",
+	})
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(t.TempDir(), "child.json")
+	var msg strings.Builder
+	if err := runSessionsCommand([]string{"export", "-o", out, child.ID.String()}, &msg); err != nil {
+		t.Fatalf("export of a subagent: %v", err)
+	}
+	info, _ := readTrajectory(t, out)["info"].(map[string]any)
+	if got, _ := info["kind"].(string); got != session.KindSubagent {
+		t.Errorf("exported kind = %q, want %q", got, session.KindSubagent)
+	}
+}
+
+// readTrajectory parses an exported document, failing the test if it is not the
+// JSON the command promised to write.
+func readTrajectory(t *testing.T, path string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc
 }

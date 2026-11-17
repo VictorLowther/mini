@@ -35,7 +35,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -337,7 +336,7 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 		// stands.
 		agentCfg.ContextWindow, _ = sushi.DiscoverContextWindow(p.processCtx(), agentCfg.ContextWindow)
 	}
-	agentCfg.OutputPath = p.trajectoryPath(spec, sess, agentCfg.OutputPath)
+	agentCfg.OutputPath = p.explicitOutputPath(spec, agentCfg.OutputPath)
 
 	l := &agent.Loop{
 		Cfg: agentCfg, Model: m, Env: e, Logger: log, Recorder: sess, Hooks: spec.Hooks,
@@ -432,30 +431,26 @@ func (p *Process) row(spec Spec, modelCfg map[string]any) (*session.Session, err
 	})
 }
 
-// trajectoryPath resolves the trajectory file. A subagent always gets a path of
-// its own, even when its spec carries one: the parent's trajectory is the human's
-// artifact, and §9.8's whole worry is that a child's config is derived from the
-// parent's, so any path that survives that derivation is inherited by accident
-// rather than chosen. A caller that genuinely wants to redirect one child's
-// record asks with a path the parent is not using; nothing here can tell those
-// two cases apart, so the safe reading wins and the leak becomes impossible.
-func (p *Process) trajectoryPath(spec Spec, sess *session.Session, configured string) string {
-	kind := spec.Kind
-	if kind == "" {
-		kind = session.KindTop
+// explicitOutputPath is the only way a trajectory file gets written: a path the
+// human asked for, through -o, agent.output_path, or a spec that names one.
+// Nothing derives a path any more - writing a conversation out to a file is a
+// request, not a side effect of running a session - and Loop.Save no-ops on an
+// empty path, so the per-step rewrites of the whole transcript stop with it.
+//
+// A spawned child needs no special protection here, which is the change from the
+// rule this replaces: Spawn derives the child's config with cloneConfig, which
+// deletes agent.output_path (§9.8), and sets no Spec.OutputPath, so a child lands
+// on "" and cannot write even the file it was once given a path of its own to
+// dodge. Its transcript is in the store either way, and exporting it is a name and
+// a command away.
+func (p *Process) explicitOutputPath(spec Spec, configured string) string {
+	if spec.Kind == session.KindSubagent {
+		return ""
 	}
-	if kind == session.KindTop {
-		if spec.OutputPath != "" {
-			return spec.OutputPath
-		}
-		if configured != "" {
-			return configured
-		}
+	if spec.OutputPath != "" {
+		return spec.OutputPath
 	}
-	if _, err := config.EnsureStateDir(); err != nil {
-		return "mini-" + sess.ID.String() + ".traj.json"
-	}
-	return filepath.Join(config.StateDir(), "trajectories", sess.ID.String()+".traj.json")
+	return configured
 }
 
 // Sessions lists the live sessions in the order they were opened.

@@ -20,7 +20,7 @@ prompts driving agents like the one reading this file.
 | `model` | HTTP/SSE client for the sushi server: streaming (`stream.go`), tool-call → action parsing (`actions.go`), cost stats (`stats.go`), the transcript→context projection and token estimation (`compaction.go`), the startup model-info lookup that decides the context window (`info.go`: what `GET /v1/models` reports for this model, else `agent.context_window`, else `model.DefaultContextWindow`), and a scriptable `testmodel`. |
 | `tpl` | Prompt rendering: a `text/template` engine for the prompt templates in `mini.yaml`, plus the custom filters they use (`toJSON`, `head`/`tail`/`charlen`, arithmetic). |
 | `config` | mini-swe-agent's config layering: recursive merge with an UNSET sentinel, config-spec resolution (file / embedded name / `key=value`), global `.env` handling. Embedded configs live in `config/configs/`; `mini.yaml` is the only supported system config. |
-| `session` | The SQLite session store: sessions, turns, and per-call tool records in `$HOME/.mini`; `mini -r` resumes from it. Its `settings` table is the global half — one row per key of interface state (thinking visibility, window size) that must outlive every session. |
+| `session` | The SQLite session store: sessions, turns, and per-call tool records in `$HOME/.mini`; `mini -r` resumes from it, and `mini sessions export` rebuilds a trajectory document from it — running a session writes no trajectory file of its own. Its `settings` table is the global half — one row per key of interface state (thinking visibility, window size) that must outlive every session. |
 | `ui` | The human end. The interactive UI is the Fyne desktop GUI (`fyneui.go`/`fyneview.go`); `print.go` is the headless `--print` front end. `blocks.go` is the transcript model both render from — the `block` type and the one `messageBlock` mapping every message-to-card conversion passes through, so live and resumed turns cannot drift — and `slash.go`/`interactive.go` carry the slash-commands, modes, and `Interactive`, which adapts a UI to `agent.Hooks` (confirm/yolo modes, whitelists); `prefs.go` is the sticky interface state both front ends share (thinking, window size), read and written through a two-method seam so the UI never imports `session`. The GUI mutes the process logger (`logtarget.go`) while a run is in flight, because nobody reads a terminal the window has superseded. |
 | `testdata` | Offline fixtures: hand-written SSE scripts and `fakesushi`, an HTTP replay server for GPU-free testing. See `testdata/README.md`. |
 
@@ -32,7 +32,15 @@ go build ./cmd/mini
 ./mini -p -y -t "run 'echo hi' then submit" -o traj.json   # headless yolo run
 ./mini -c mini.yaml -c model.max_tokens=2048               # config overrides
 ./mini -cpuprofile cpu.pprof -memprofile heap.pprof -r     # profile the whole run
+./mini sessions export -o traj.json                        # write a stored session out
 ```
+
+Running a session saves nothing but the store: no trajectory file appears unless
+you asked for one with `-o` (written after every step, so a crash still leaves the
+last complete one) or exported it afterwards with `mini sessions export` / the
+GUI's `/export`. An export carries what the store kept — the session's own facts
+and its full message list — and no `config` block, because the configuration a
+session ran under was never recorded.
 
 By default the config comes from the embedded `mini.yaml`; passing `-c`
 replaces that default file. Point `-m`/`--url` at a sushi server (default

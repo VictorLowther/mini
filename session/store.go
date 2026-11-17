@@ -545,6 +545,44 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 	return &Session{Row: r, store: s}, nil
 }
 
+// FindAny is Find without the kind filter: it resolves a prefix to any session,
+// a top-level conversation or a subagent alike.
+//
+// It exists for export only, and the separation is the point. `kind = 'top'` is
+// what makes a subagent neither resumable nor removable by a human (§5.4, §5.11),
+// and both `-r` and `mini sessions rm` resolve through Find - so widening Find to
+// answer "which session should I rewrite" would quietly undo those two rules while
+// answering a third question that never needed them, "whose transcript may I write
+// out to a file?".
+func (s *Store) FindAny(project, prefix string) (*Session, error) {
+	rows, err := s.db.Query(`SELECT `+sessionColumns+` FROM sessions
+WHERE (? = '' OR project = ? OR root_id = ? OR parent_id = ?) AND substr(id, 1, length(?)) = ?
+ORDER BY updated_at DESC, id DESC LIMIT 2`, project, project, project, project, prefix, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("session store: find any: %w", err)
+	}
+	defer rows.Close()
+	var found []Row
+	for rows.Next() {
+		r, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		found = append(found, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	switch len(found) {
+	case 0:
+		return nil, sql.ErrNoRows
+	case 2:
+		return nil, fmt.Errorf("session store: ambiguous session prefix %q (at least %s and %s)",
+			prefix, found[0].ID, found[1].ID)
+	}
+	return &Session{Row: found[0], store: s}, nil
+}
+
 // Get fetches a session by full id; unknown ids give sql.ErrNoRows.
 func (s *Store) Get(id uuid.UUID) (*Session, error) {
 	row, err := scanSession(s.db.QueryRow(`SELECT `+sessionColumns+` FROM sessions WHERE id = ?`, id.String()))

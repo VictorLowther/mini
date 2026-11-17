@@ -1283,7 +1283,9 @@ Four consequences worth writing down, because three are bugs waiting:
    **attribution, not survival** - the `session=` log attribute (§7 step 2) makes
    the crash name the session that caused it - and §9.12 asks the one scope
    question left, about the `recover` that already exists in the runtime path.
-4. **Per-session trajectory path** - prevents sibling runs overwriting each
+4. **Per-session trajectory path** *(superseded by §8.10: nothing writes a
+   trajectory automatically; the collision it prevented cannot occur when no file
+   is created, and the sibling that needed a path can be exported by name)* - prevents sibling runs overwriting each
    other's records; `defaultOutputPath` is one function.
 5. **`Process.Open` extracted from `buildRun`** - the actual prerequisite;
    everything else is already callable concurrently.
@@ -1319,7 +1321,7 @@ push).
    leak is the one that never stops costing.
 2. `Loop` single-flight turn mutex (refuse, and name `QueueMessage` as the
    supported path, §9's settled note); `runCtx` under `l.mu`; per-session
-   trajectory path; global env applied once per process; a `session=` attr on
+   trajectory path (since replaced, §8.10); global env applied once per process; a `session=` attr on
    every record a session logs.
 3. **Built.** `host` package, including §5.6's per-session tool set: `Process`,
    `Spec`, `Open` (no `recover` at the session boundary - panics stay fatal by
@@ -2267,6 +2269,39 @@ twice during this work, in whole-package runs. Measured in isolation it was 0/10
 after this change and 1/10 before it, which is not enough to attribute it either
 way; it is the pre-existing flake recorded above until someone catches its
 goroutine dump, and nothing here touches the code it waits on.
+### 8.10 Nothing writes a trajectory because a session ran
+
+Maintainer's ruling: the `.traj.json` file at session end should be an explicit
+export, not a side effect. The side effect was worse than "at session end" sounds -
+`host.trajectoryPath` derived a path for **every** session, children included, and
+`Loop.save()` rewrote that whole file after every step, so a run quietly produced a
+growing JSON document in `~/.mini/trajectories/` whether or not anyone wanted it.
+
+Now `Process.explicitOutputPath` returns a path only when the human named one -
+`Spec.OutputPath`, `-o`, or `agent.output_path` - and "" otherwise, which `Loop.Save`
+already treats as nowhere to write. `mini -p -o traj.json` keeps working exactly as
+before, per-step and crash-durable, because that path was asked for. A child gets
+nothing even if its spec carries a path: the parent's artifact is the parent's, and
+the collision §4 item 3 was written to prevent is now prevented by there being
+nothing to collide rather than by giving each sibling its own file.
+
+`mini sessions export [-o FILE] [uuid-prefix]` and the window's `/export [path]` (plus
+`Session ▸ Export this session's trajectory`) produce the document **from the store**,
+which is the transcript's source of truth. That is what lets one code path export a
+live tab, a session that ended last week, and a subagent - and it is also why the
+exported `info` block has no `config`: the store never recorded the configuration a
+session ran under, and filling that field with today's config would attach a document
+to the past that the past never had. `Loop.Serialize`'s richer shape, config included,
+is what an explicit `-o` writes, for the run doing it right now.
+
+The lookup is `Store.FindAny`, which is `Find` without the `kind = 'top'` filter, and
+the separation is deliberate: that filter is the whole enforcement that a subagent is
+not resumable and not removable by a human (§5.4, §5.11), and both `-r` and
+`sessions rm` resolve through `Find`. Export is a third question - *whose transcript
+may I write out* - which those rules never spoke to, so it gets its own door instead
+of a widened one. The window reaches it through one more `GUIOptions` port
+(`Exporter`), so `ui` still does not know a store exists, and a tab exports the
+session it shows rather than the session that happens to be visible.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

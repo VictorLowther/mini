@@ -53,6 +53,10 @@ type shell struct {
 	// capability, taken from whichever GUIOptions first carried one, so every tab's
 	// "+" opens a session the same way and a spawned child needs none of it.
 	opener func(dir string) (GUIOptions, error)
+	// exporter writes a session's trajectory out, from whichever GUIOptions first
+	// carried one: like the opener it belongs to the window, and every tab - a
+	// spawned child included - can use it.
+	exporter func(id, path string) (string, error)
 	// quitArmed is when quit() last refused to tear down a window with work in
 	// flight; a second press inside closeArmWindow is allowed to.
 	quitArmed time.Time
@@ -93,6 +97,7 @@ func newShell(o GUIOptions) *shell {
 		// transcript opens collapsed, as it always did.
 		thinking: loadThinkingShown(o.Settings),
 		opener:   o.Opener,
+		exporter: o.Exporter,
 	}
 	sh.window = a.NewWindow("mini")
 	sh.tabs = container.NewDocTabs()
@@ -582,6 +587,11 @@ func (sh *shell) menus() *fyne.MainMenu {
 	next.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyRight, Modifier: fyne.KeyModifierAlt}
 	prev := fyne.NewMenuItem("Previous session", func() { sh.selectOffset(-1) })
 	prev.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyLeft, Modifier: fyne.KeyModifierAlt}
+	export := fyne.NewMenuItem("Export this session's trajectory", func() {
+		if g := sh.selected(); g != nil {
+			g.export("")
+		}
+	})
 	pause := fyne.NewMenuItem("Pause/resume this session", func() {
 		if g := sh.selected(); g != nil {
 			g.togglePause()
@@ -596,7 +606,7 @@ func (sh *shell) menus() *fyne.MainMenu {
 	closeItem.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyW, Modifier: fyne.KeyModifierShortcutDefault}
 
 	return fyne.NewMainMenu(run, fyne.NewMenu("Edit", copyItem),
-		fyne.NewMenu("Session", next, prev, pause, fyne.NewMenuItemSeparator(), closeItem),
+		fyne.NewMenu("Session", next, prev, pause, export, fyne.NewMenuItemSeparator(), closeItem),
 		fyne.NewMenu("View", thinking), fyne.NewMenu("Help", commands))
 }
 

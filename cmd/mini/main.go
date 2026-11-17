@@ -330,10 +330,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 			o.task = ans.Text
 		}
 		info, err := r.Loop.Run(ctx, o.task)
-		reportRun(r.Loop, info, err)
-		fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", r.AgentCfg.OutputPath)
-		fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", r.Sess.ID, r.Sess.ID)
-		return exitCode(info, err)
+		return reportEnd(stdout, stderr, r, info, err)
 	}
 
 	// `o` is the parsed CLI options here, so the front end's own gets a word.
@@ -341,6 +338,12 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	guiOpts.LogWriter, guiOpts.App, guiOpts.Settings = logTarget, a, r.Store
 	// What the strip's "+" does: opens another top-level session beside this one.
 	guiOpts.Opener = r.openSibling
+	// And what /export does: rebuilds one session's trajectory from the store. The
+	// project the session belongs to is fixed here rather than passed from the
+	// window, so a tab can only ever export its own conversation.
+	guiOpts.Exporter = func(id, path string) (string, error) {
+		return exportSession(r.Store, r.Sess.Project, id, path)
+	}
 	g := ui.NewGUI(guiOpts)
 	// A stalled window with no explanation is indistinguishable from a crash,
 	// so the retry schedule goes into the transcript.
@@ -368,8 +371,19 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	g.Resume(r.ResumeMsgs, r.ResumeNote)
 
 	info, err := g.Run(ctx, o.task)
+	return reportEnd(stdout, stderr, r, info, err)
+}
+
+// reportEnd closes both front ends the same way: how the run ended, where its
+// trajectory went if one was asked for, and how to resume it. The trajectory line
+// is conditional because nothing writes that file unless the human named a path
+// now - "Saved trajectory to ”" for a run that saved nothing is exactly the
+// misunderstanding this change removes.
+func reportEnd(stdout, stderr io.Writer, r *miniRun, info map[string]any, err error) int {
 	reportRun(r.Loop, info, err)
-	fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", r.AgentCfg.OutputPath)
+	if r.AgentCfg.OutputPath != "" {
+		fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", r.AgentCfg.OutputPath)
+	}
 	fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", r.Sess.ID, r.Sess.ID)
 	return exitCode(info, err)
 }
