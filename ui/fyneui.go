@@ -9,6 +9,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
 
 	"github.com/VictorLowther/mini/agent"
@@ -66,7 +67,15 @@ type GUI struct {
 	app       fyne.App
 	window    fyne.Window
 	logWriter *LogTarget
-	v         *guiView
+	// tabs is the session strip. It holds exactly one item until the per-session
+	// state moves out of GUI (docs/parallel-sessions.md §5.15). The container is
+	// DocTabs and not AppTabs because, verified against Fyne 2.8.2, AppTabs has
+	// no close affordance, no create button and no scroller, and a tab per
+	// session needs all three; its mutation API is otherwise identical to
+	// DocTabs', which is why this was a cheap bet to make at the seam.
+	tabs *container.DocTabs
+	tab  *container.TabItem
+	v    *guiView // one session's view; N of these is what tabs is for
 	// jobs backs the live cards for calls that handed off. See GUIOptions.Jobs.
 	jobs JobReader
 	// asks serializes prompts so exactly one question is on screen at a time.
@@ -153,7 +162,25 @@ func NewGUI(o GUIOptions) *GUI {
 	w := a.NewWindow("mini")
 	g.window = w
 	g.v = newGUIView(g, w)
-	w.SetContent(g.v.root())
+	// The tab strip wraps the existing view unchanged, which is what makes this
+	// increment behaviour-neutral: nothing else in the file reaches for the
+	// window's content object, so every current path - banner, transcript,
+	// question panel, live cards - runs inside the one tab exactly as before.
+	g.tabs = container.NewDocTabs(container.NewTabItem(g.tabLabel(), g.v.root()))
+	g.tab = g.tabs.Items[0]
+	g.tabs.SetTabLocation(container.TabLocationTop)
+	// CloseIntercept is set, and it refuses. This is the §5.15 gotcha that turns
+	// a half-wired close into a lost session: DocTabs' renderer puts an × on
+	// every tab, and close() calls the intercept *instead of* removing the item
+	// and firing OnClosed. With no intercept at all, a stray hover click would
+	// delete the only tab and leave an empty window holding a live session -
+	// worse than any way mini currently has of losing work. The per-tab quit
+	// guard that makes × mean "stop this session, or cancel" is a later step, so
+	// until it exists the × says so rather than acting.
+	g.tabs.CloseIntercept = func(*container.TabItem) {
+		g.v.noteLocal("a tab closes its session once the per-tab quit guard lands; leave with /quit for now")
+	}
+	w.SetContent(g.tabs)
 	w.SetMainMenu(g.menus())
 	// The saved size is the user's, and it is applied before Show so the
 	// window opens at the size it closed at instead of cascading one resize
@@ -166,6 +193,19 @@ func NewGUI(o GUIOptions) *GUI {
 		o.Loop.Handler = &model.Handler{Content: g.Content, Reasoning: g.Reasoning}
 	}
 	return g
+}
+
+// tabLabel is the tab's title. It names the model because that is the only
+// per-session identity GUI holds today: agent.Loop carries no session pointer,
+// and the name and working directory that would actually tell three tabs apart
+// live on host.Session, arriving with the steps that let a human open a second
+// one (§5.15). Until then a second tab would read the same, which is honest
+// about what is wired rather than a placeholder someone forgets to replace.
+func (g *GUI) tabLabel() string {
+	if g.modelName != "" {
+		return g.modelName
+	}
+	return "session"
 }
 
 // Interactive: the GUI always has a human on the other end.
@@ -435,6 +475,8 @@ func (g *GUI) Write(p []byte) (int, error) {
 	g.note(string(p))
 	return len(p), nil
 }
+
+// ---------------------------------------------------------------- in-flight calls ---
 
 // ---------------------------------------------------------------- the ask loop ---
 

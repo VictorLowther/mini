@@ -322,12 +322,12 @@ or missing, and they are the reason the survey was worth doing:
    queued, not refused, and certainly not concurrent.
 6. It said nothing about turn serialization, and mini's `Loop.Running()` is
    **advisory only** - the UI checks it to grey out buttons
-   (`ui/fyneui.go:507`), but `Loop.Run` itself happily lets a second caller in,
+   (`ui/fyneui.go:560`), but `Loop.Run` itself happily lets a second caller in,
    where both write `l.Messages` and fight over `l.cancelTurn`. zero's
    `turnMu` and crush's `subSessions` refcount exist for exactly this.
 7. It proposed nothing about resume safety, and mini has a live bug waiting:
    `findResumable` with no prefix takes `store.List(project, false, 1)` - the
-   newest session in the project by `updated_at` (`cmd/mini/main.go:691-793`).
+   newest session in the project by `updated_at` (`cmd/mini/main.go:691`, ordered `updated_at DESC` at `session/store.go:568`).
    A finished subagent updates more recently than the parent that spawned it in
    that same directory, so `mini -r` would resume **the subagent's transcript
    instead of the human's**. zero's `IsResumableKind` refusal is the fix, and it
@@ -817,7 +817,7 @@ only some future, write-heavy use of feature 1 will.
 **10. Endings are reported, including the ones nobody witnessed.** A bash job's
 end is a process exit; an agent job's end is a loop returning, so it needs no
 stopper and `job`'s registry is already written to tolerate a kind with none
-(`job/job.go:9-10`). On restart, `Sweep` marks it and the host writes the
+(`job/job.go:416-10`). On restart, `Sweep` marks it and the host writes the
 firing *itself*, with text that says what happened and what is still recoverable
 - the shape crush settled on: *"Interrupted: mini exited while this subagent was
 running. Its session is kept; ... resumes it with its work in context."*
@@ -869,7 +869,7 @@ listing rather than a mystery process, the same reason §4 makes the registry th
 source of truth.
 
 What survives from that analysis is the plumbing: mini's state machine already
-separates `finished` from `delivered` (`agent/agent.go:1135`), and `job_events`
+separates `finished` from `delivered` (`agent/agent.go:1127`), and `job_events`
 already carries firings that are not exits - `monitor_id` and `reason`
 (`session/jobs.go:399-400`), where `exit` is only the column's default. That is
 precisely what lets a killed job wake a waiting child, so the two-stage
@@ -1179,6 +1179,91 @@ report at all, because the process dies by ruling (§9.9), and both cases follow
 mini's existing truncate-and-spill rule: cap the body, point at the child's
 output path for the rest.
 
+**15. Sessions get tabs, one per session, top-level or subagent.** *Ruled by the
+maintainer, and it overrides §3.7's recommendation and step 7's first draft.*
+Each tab wraps the whole current UI for its session - its own transcript, input,
+status and permission prompt - and the strip is the window's content.
+
+The recommendation this replaces was "a roster and a parent/child tree, not
+browser tabs", drawn from omp-Agent-Hub. That advice is right for what it was
+measured against: a roster optimizes for *scanning many* sessions, which is what
+a farm of short batch runs needs. mini's realistic workload is the other case - a
+handful of long-lived sessions, each in its own repository, where the human
+*works in* one at a time and wants the others to keep running beside it. For
+that, a tab per session is the better shape, and the roster's real virtue -
+seeing every session's state at once - moves into the tab labels rather than
+disappearing. What the roster still owes, and tabs must keep, is listed in step 7.
+
+Three earlier rulings change shape because of this, and each is recorded with
+what happens to it rather than quietly rewritten:
+
+- **§9.4's one-at-a-time queue becomes per-tab.** It exists so two questions
+  cannot interleave in one shared input area. Tabs remove the shared input area,
+  so serializing unrelated repositories behind one prompt would be a regression
+  bought at the wrong price. Attribution moves from a string to the tab itself;
+  `Question.Origin` and `displayTitle` stay, because print mode and a resumed
+  transcript have no tabs to attribute through.
+- **§5.5's bubbling becomes routing.** A child's confirmation no longer travels
+  to whoever gates its parent; it appears where the child is, and
+  `host.bubblingHooks` shrinks to "ask this session's own front end".
+- **Decision 13's unattended child needs re-reading.** It ruled a child of an
+  unattended parent unattended, "because there is nobody to bubble to". With a
+  tab, a child *is* attendable - the human can click it - so a child of an
+  attended parent should get the parent's real hooks. That changes what
+  `SpawnReply.Unattended` means, so it needs re-ruling before it is coded, not
+  discovered afterwards in a diff.
+
+### Which Fyne container: the check, and why it is DocTabs
+
+Verified against the vendored source (Fyne 2.8.2, `fyne.io/fyne/v2/container`),
+not against documentation. The mutation API is identical in both - `Append`,
+`Remove`, `RemoveIndex`, `Select`, `SelectIndex`, `Selected`, `SelectedIndex`,
+`SetItems`, `SetTabLocation`, and `Enable`/`Disable` by item or index - so the
+choice is entirely about interaction, which is what this feature is.
+
+| | `AppTabs` | `DocTabs` |
+|---|---|---|
+| `CreateTab func() *TabItem`, a native "+" | absent | `doctabs.go:26`, built at `:303`, hidden when nil (`:466`) |
+| `CloseIntercept func(*TabItem)` | absent | `doctabs.go:27`, consulted at `:179` |
+| `OnClosed func(*TabItem)` | absent | `doctabs.go:28` |
+| per-tab close icon | never wired (`onClosed` unset) | `doctabs.go:333`; hover on desktop, always on mobile (`tabs.go:751`) |
+| scrollable strip | no scroller at all (0 references) | yes (15 references, `r.scroller.Content`) |
+| "all tabs" jump menu | absent | `buildAllTabsButton`, `:279-300` |
+| `OnUnselected` | yes | `doctabs.go:30` |
+
+`AppTabs`' struct carries `OnChanged` (deprecated), `OnSelected`, `OnUnselected`
+and a `popUpMenu` field it never populates. It is a section switcher for a fixed,
+small set of destinations - exactly the assumption mini does not have: these tabs
+come and go, are opened by the human and by a spawn, and can outnumber the strip.
+
+Four consequences worth writing down, because three are bugs waiting:
+
+1. **`CloseIntercept` suppresses removal entirely.** `close()` at
+   `doctabs.go:178` reads `if f := t.CloseIntercept; f != nil { f(item) } else {
+   t.Remove(item); t.OnClosed(item) }`. The moment mini sets an intercept - which
+   it must, to put §5.13's quit guard per tab - the container removes nothing and
+   fires nothing, and the intercept owns both the confirmation *and* the
+   teardown. Set the guard, forget the removal, and every close silently does
+   nothing, which is indistinguishable from a frozen UI. So all removals funnel
+   through one `closeTab`.
+2. **The jump menu is text-only.** `doctabs.go:285` carries an upstream FIXME:
+   "MenuItem doesn't support icons (#1752)". With `TabItem` limited to
+   `{Text, Icon fyne.Resource, Content}` and no slot for a widget, status has to
+   be encoded in `Text` whatever the container. Settling that now avoids
+   designing a glyph system the toolkit cannot carry.
+3. **Neither container reorders.** No `Move`/`Insert` in either method set, so
+   "children beside their parent" is insertion order plus `SetItems` - which
+   `Refresh()`es without re-resolving `current` by identity. Any reorder needs an
+   explicit `Select` afterwards, or the highlighted tab can point at a different
+   session than the content being shown.
+4. **`CreateTab` is synchronous and returns the item**, but opening a session is
+   not: it needs a working directory (mini has no picker of any kind) and
+   `proc.Open` does store writes plus a context-window discovery. None of that
+   belongs on the canvas thread inside a widget callback, against the `GUI.post`
+   discipline the whole view obeys. So `CreateTab` returns a *picker* tab whose
+   `Content` is a small form, and the session opens from the pump after the human
+   commits.
+
 ## 6. Cross-cutting components, by value-per-line for mini
 
 1. **Lineage columns + resume filter + recursive removal** - a few lines of
@@ -1280,17 +1365,74 @@ push).
    an unattributed permission prompt in front of a human, and §9.4 makes
    unattributed questions the normal case rather than the corner.
 
-7. Then feature 2's UI half: a session strip and per-session view state in
-   `ui`, modelled on the Hub's roster/tree rather than browser tabs, **with
-   pause and kill per session** - the accepted mitigation for §5.7's starvation,
-   and the reason that ruling was affordable. The roster has to reach one level
-   further than it first appears to: killing a session is not enough when a
-   finished child left jobs burning, so the residue §5.10 deliberately leaves to
-   the human is only actionable if the roster shows a session's outstanding jobs
-   and can end them independently of the session that made them. That is what
-   turns §5.10's "no auto-kill" from a shrug into a judgement.
+7. Then feature 2's UI half, **rewritten as tabs** - see decision 15. The first
+   draft of this step said "a session strip modelled on the Hub's roster/tree
+   rather than browser tabs"; the maintainer overrode it, and the reasoning that
+   made the roster the survey's answer is kept in decision 15 rather than
+   deleted, because it still describes what the strip has to show. Increments,
+   each shippable:
+
+   1. `DocTabs` around the existing view, one tab, no new behaviour. **Done.**
+   2. Extract the per-session state `GUI` currently holds singularly - above all
+      `stream streamState`, which decides which transcript streamed text lands
+      in, plus `pending`, `lastQ`, `contextNote` - into a `tab`, and move the ask
+      queue with it. The risky step: leave `streamState` shared and a background
+      session writes into the transcript the human is reading.
+   3. `CreateTab` to open a top-level session, with a working-directory picker,
+      because a tab whose repository you cannot choose is a tab you cannot use.
+   4. A child-created callback on `Process`, so a spawn opens its tab. Polling
+      `Children()` would work and is wrong: it makes the UI guess.
+   5. Status and attention markers in the label, `⌥→`/`⌥←`, and the per-tab quit
+      guard through `CloseIntercept` - which per decision 15 must own the removal
+      and the cascade itself.
+   6. Split the slash commands into tab-level and window-level, and re-issue
+      §5.13's batched cancel across N sessions instead of one `runCtx`.
+
+   Still owed to the roster, and tabs must not lose it: per-session **pause and
+   kill** (§5.7's starvation mitigation is what made that ruling affordable), and
+   a view of a session's **outstanding jobs** endable independently of the
+   session that started them. Without the second, §5.10's deliberate "no
+   auto-kill" residue is invisible, and an invisible residue is not a judgement -
+   it is a leak.
 
 ## 8. What is built
+
+### 8.0 The tab strip exists, with one tab (step 7 increment 1)
+
+`ui/fyneui.go` now builds `container.NewDocTabs` around the existing `guiView` at
+the single place the window's content is set, with the tab labelled by model name
+and nothing else moved. The choice of container, and the four source-level
+traps that follow from it, are decision 15.
+
+Two deliberate omissions, both because the later steps own them:
+
+- **`CreateTab` is left nil.** The "+" would open a session, and a session needs
+  a working directory the UI has no way to ask for yet (increment 3).
+- **`CloseIntercept` is set to a refusal, not a teardown.** DocTabs puts an × on
+  every tab whether or not anything handles it, and `close()` runs the intercept
+  *instead of* removing the item - so with no intercept a mis-click would delete
+  the only tab and leave an empty window holding a live session, which is a worse
+  way to lose work than anything mini had before. The intercept notes that in the
+  transcript and leaves. When increment 5 lands the per-tab quit guard, this is
+  the one function that changes, and it must then own both the removal and the
+  `proc.Close` cascade - decision 15, consequence 1.
+
+Two flakes surfaced while landing this, one real and one not:
+
+- **`host`'s `TestSpawnRunsAChildAndReportsToItsParent` failed about one full-suite
+  run in two**, at clean `59e37ca` with no UI change involved, as `deterministic
+  model ran out of outputs after 3 calls`. Not a product bug: the parent's script
+  had exactly three outputs, and whether the child's report is owed *before* the
+  parent submits decides how many turns the first run spends - so `runChildTurn`
+  sometimes needed a call the script no longer had. Fixed by giving the script
+  slack for both orderings, with the reason in the test. The assertion was always
+  about the child reporting and the row settling, never about turn count.
+- **`ui` once hit the suite's 400s package deadline.** It passed in 2.7-2.8s in
+  four other full-suite runs, in a deliberately loaded five-package run, and
+  isolated, and the shape matches the pre-existing link/CGO contention recorded
+  above rather than anything DocTabs does - a tab container whose renderer is a
+  scroller and a row of buttons is not 150x of anything. Left as an observation,
+  not a fix, because the mechanism never reproduced.
 
 §7 steps 1 and 2 - the prerequisite's schema and loop-safety half - are in the
 tree, with the survey and the rulings behind them.
@@ -1703,7 +1845,7 @@ what step 6 contains. The items keep their full reasoning below.
 - **§9.5 - the send tool is job-addressed.** The ruling's own words are "a tool
   to send text to a running job", which for an agent injects a user message at
   the next appropriate boundary - **the path user input already takes**
-  (`QueueMessage`, `agent/agent.go:789`, drained at `:1120`), and omp's
+  (`QueueMessage`, `agent/agent.go:807`, drained at `:1120`), and omp's
   semantics exactly: "Steering uses the normal prompt path, so the message and
   response are written to the subagent's persisted session history"
   (`docs/agent-hub.md:80`). Standard jobs accepting input the same way is
@@ -1923,7 +2065,7 @@ what step 6 contains. The items keep their full reasoning below.
 
    So feature 1 is one new tool, `agent`, and the only capability genuinely
    missing is `agent_send` - steering a running child. Recommend deferring it:
-   mini has the mechanism (`Loop.QueueMessage`, `agent/agent.go:789`, which
+   mini has the mechanism (`Loop.QueueMessage`, `agent/agent.go:807`, which
    is exactly omp's "Steering uses the normal prompt path", `agent-hub.md:80`)
    but no way for the *model* to address a child, and adding one parameter later
    is not a redesign.
@@ -2076,7 +2218,7 @@ what step 6 contains. The items keep their full reasoning below.
 
     - The child's `Loop.Run` behaves exactly as it does today. A turn with no
       tool call and jobs still running still breaks out of the loop after logging
-      (`agent/agent.go:1114`); `deliverOwed` is not amended, `exit_status`
+      (`agent/agent.go:1130`); `deliverOwed` is not amended, `exit_status`
       gains nothing, and no exit-contract audit is needed. The three sub-
       decisions this item used to carry - a `Waiting` status, its exit code in
       `-p` mode, what `--exit-immediately` means, and rewording "Agent is ready"
