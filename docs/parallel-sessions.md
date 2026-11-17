@@ -1448,9 +1448,27 @@ selection tracks the pointer and ignores the delta, and an unsized text widget
 collapses every position onto one character, so a selection test needs the widget
 laid out or it reports the feature broken for the wrong reason.
 
-Prose bubbles are still `RichText`, because they render markdown and there is no
-selectable markdown widget; making the report text copyable means choosing
-between formatting and the clipboard. That is still open.
+The second pass made **every** card body selectable, which the first did not:
+`blockCards` routes a styled turn, thinking, a user or system message, a note, an
+error and the compaction summary through `mdBody`, and `mdBody` was markdown all
+the way down. It now asks a per-block question instead - `mdOrLabel` renders the
+block as a selectable `Label` unless the text carries markdown that would visibly
+change the rendering, in which case it keeps `RichText`. The predicate errs
+toward formatting (an asterisk or an underscore anywhere sends the block to
+markdown, even where the markdown would have rendered the same), because the two
+ways to get it wrong are not equal: guessing "plain" silently drops a heading's
+formatting and reads as a broken renderer, while guessing "markdown" costs one
+styled paragraph its drag-select.
+
+Why not select over the markdown widget directly, since selection is *built* on
+one? `widget.selectable` holds a `*RichText` provider and drives it through
+unexported methods - `row`, `rows`, `rowLength`, `rowAlignOffset`, `charMinSize` -
+so nothing outside package `widget` can attach it to a `RichText` of its own. The
+reachable move is to give the text to the widget that already embeds the
+selection, and reserve the markdown path for the blocks that need it.
+
+Still not selectable, both on purpose: the `exit` row, which paints two colours
+in one line and is a status marker rather than output, and inline-styled prose.
 
 - **`TestGUITrajectoryMatchesPrintMode` intermittently deadlocks, and the first
   write-up of this got the attribution wrong.** It was recorded above as

@@ -815,12 +815,29 @@ func dimRT(text string) *widget.RichText {
 	return rt
 }
 
-func errorRT(text string) *widget.RichText {
-	rt := widget.NewRichText(&widget.TextSegment{Text: text, Style: widget.RichTextStyle{ColorName: theme.ColorNameError}})
-	rt.Wrapping = fyne.TextWrapWord
-	return rt
+// selectableLabel is card text that the mouse can select and ⌘C can copy. It is
+// the body for every block that carries no inline formatting, which turns out to
+// be most of what a session says: prose paragraphs, the human's own messages,
+// notes, tool-call-only turns.
+//
+// The reason this exists rather than one selectable RichText: Fyne builds
+// selection in widget.selectable over a *RichText* provider, so the formatting
+// widget is the one the selection machinery reads - but the methods it calls are
+// unexported (row, rows, rowLength, rowAlignOffset, charMinSize), so nothing
+// outside package widget can attach it to a RichText of its own. What a caller
+// can do is hand the text to the widget that already embeds the selection, and
+// keep the markdown path only where the markup actually changes the picture.
+func selectableLabel(text string, imp widget.Importance) *widget.Label {
+	l := widget.NewLabel(text)
+	l.Selectable = true
+	l.Wrapping = fyne.TextWrapWord
+	l.Importance = imp
+	return l
 }
 
+// markdownRT renders a block as markdown. Not selectable: see selectableLabel
+// for why a RichText cannot carry selection from outside the widget package, and
+// mdOrLabel for the rule that keeps this path to blocks whose formatting shows.
 func markdownRT(text string) *widget.RichText {
 	rt := widget.NewRichTextFromMarkdown(text)
 	rt.Wrapping = fyne.TextWrapWord
@@ -1193,9 +1210,13 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		// one continuous scroll across the boundary.
 		return []fyne.CanvasObject{areaCard(b.title, metrics{}, mdBody(b.text), fyne.TextAlignLeading)}
 	case "error":
-		return []fyne.CanvasObject{errorRT(b.text)}
+		// A Label, so a traceback can be lifted straight out of the transcript
+		// - the text most likely to be pasted somewhere, and the one that used
+		// to need retyping. HighImportance is the same signal colour errorRT
+		// painted with.
+		return []fyne.CanvasObject{selectableLabel(b.text, widget.HighImportance)}
 	default: // notes: UI feedback, the session header, command results
-		return []fyne.CanvasObject{dimRT(b.text)}
+		return []fyne.CanvasObject{selectableLabel(b.text, widget.LowImportance)}
 	}
 }
 

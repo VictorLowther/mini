@@ -1298,17 +1298,15 @@ func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if _, _, _, a := fillRGBA(uc); a != 0xffff {
 		t.Errorf("user bubble fill alpha = %#x, want opaque (translucent fills rendered invisible in the real driver)", a)
 	}
-	rt := uc.body.(*widget.RichText)
-	if rt.Wrapping != fyne.TextWrapWord {
+	wrap, align := bodyTextProps(uc.body)
+	if wrap != fyne.TextWrapWord {
 		t.Error("user body must wrap words")
 	}
 	if !uc.bubble.mine {
 		t.Error("user bubble must point its tail to our side")
 	}
-	for _, s := range rt.Segments {
-		if ts, ok := s.(*widget.TextSegment); ok && ts.Style.Alignment != fyne.TextAlignTrailing {
-			t.Error("user text is not right-justified")
-		}
+	if align != fyne.TextAlignTrailing {
+		t.Error("user text is not right-justified")
 	}
 
 	// Harness-authored feedback with the same role stays on the left under a
@@ -1326,10 +1324,8 @@ func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if hr == ur && hg == ug && hbl == ub {
 		t.Error("harness and user bubbles need distinguishable fills")
 	}
-	for _, s := range hc.body.(*widget.RichText).Segments {
-		if ts, ok := s.(*widget.TextSegment); ok && ts.Style.Alignment != fyne.TextAlignLeading {
-			t.Error("harness feedback must be left-justified")
-		}
+	if _, al := bodyTextProps(hc.body); al != fyne.TextAlignLeading {
+		t.Error("harness feedback must be left-justified")
 	}
 
 	asst := blockCards(block{kind: "assistant", text: "out", reasoning: "why", stats: metrics{Tokens: 7}}, true)
@@ -1342,10 +1338,8 @@ func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if got := headerText(asst[1].(*area)); got != "LLM output · 7 tok" {
 		t.Errorf("output header = %q", got)
 	}
-	for _, s := range asst[1].(*area).body.(*widget.RichText).Segments {
-		if ts, ok := s.(*widget.TextSegment); ok && ts.Style.Alignment != fyne.TextAlignLeading {
-			t.Error("LLM output must stay left-justified")
-		}
+	if _, al := bodyTextProps(asst[1].(*area).body); al != fyne.TextAlignLeading {
+		t.Error("LLM output must stay left-justified")
 	}
 
 	tool := blockCards(block{kind: "tool", transcript: []string{"$ echo hi", "exit 0"}}, false)
@@ -1585,4 +1579,95 @@ func TestGUICardTextSelectsAndCopies(t *testing.T) {
 			t.Errorf("clipboard holds %q, want %q", cb, want)
 		}
 	})
+}
+
+// bodyTextProps reads the two properties the RichText-only assertions used to
+// reach for, from whichever body kind the block got: a styled block is a
+// RichText whose alignment lives on its segments, an unstyled one is a
+// selectable Label with a single alignment field. Written as one helper because
+// every card body can now be either, and a test that assumes one of the two is
+// how the last copy-paste regression stayed invisible.
+func bodyTextProps(o fyne.CanvasObject) (fyne.TextWrap, fyne.TextAlign) {
+	switch b := o.(type) {
+	case *widget.RichText:
+		for _, seg := range b.Segments {
+			if ts, ok := seg.(*widget.TextSegment); ok {
+				return b.Wrapping, ts.Style.Alignment
+			}
+		}
+		return b.Wrapping, fyne.TextAlignLeading
+	case *widget.Label:
+		return b.Wrapping, b.Alignment
+	}
+	return 0, 0
+}
+
+// TestGUICardBodiesAreSelectable is the assertion the user asked for, and the
+// one the first fix could not make: every card in the transcript has to yield its
+// text to the mouse, not only the running card. It goes through blockCards - the
+// function that decides what each card is built from - rather than through the
+// helpers, because the last attempt failed precisely by testing a helper that no
+// card called.
+func TestGUICardBodiesAreSelectable(t *testing.T) {
+	kinds := []struct {
+		what string
+		blk  block
+	}{
+		{"tool output", block{kind: "tool", transcript: []string{"$ echo hi", "hi", "exit 0"}}},
+		{"assistant prose", block{kind: "assistant", text: "the build passed cleanly"}},
+		{"thinking", block{kind: "assistant", text: "out", reasoning: "because the flag was set", stats: metrics{Tokens: 3}}},
+		{"user message", block{kind: "user", text: "please rerun the tests"}},
+		{"system message", block{kind: "system", text: "context compacted"}},
+		{"note", block{kind: "note", text: "cancelling this turn"}},
+		{"error", block{kind: "error", text: "panic: something broke"}},
+		{"compaction", block{kind: "compaction", title: "compacted", text: "summary of earlier turns"}},
+	}
+	for _, k := range kinds {
+		objs := blockCards(k.blk, true)
+		if len(objs) == 0 {
+			t.Fatalf("%s rendered nothing", k.what)
+		}
+		var body fyne.CanvasObject
+		switch o := objs[0].(type) {
+		case *area:
+			body = o.body
+		case fyne.CanvasObject:
+			body = o
+		}
+		// Cards whose body is a scroll or an accordion hold a Label inside;
+		// dig one level so the check is about the text, not the container.
+		if sc, ok := body.(*container.Scroll); ok {
+			body = sc.Content
+		}
+		lb, ok := body.(*widget.Label)
+		if !ok {
+			t.Errorf("%s: body is %T, want a *widget.Label so it can select", k.what, body)
+			continue
+		}
+		if !lb.Selectable {
+			t.Errorf("%s: body label is not Selectable", k.what)
+		}
+	}
+}
+
+// TestGUIStyledMarkdownStaysRichText records the boundary the conservative rule
+// draws: a block whose markdown would change the rendering keeps the formatting
+// and gives up selection, and that is a decision rather than an oversight.
+func TestGUIStyledMarkdownStaysRichText(t *testing.T) {
+	for _, raw := range []string{"a **bold** claim", "a `code span`", "- one item", "# heading"} {
+		if _, ok := mdOrLabel(raw).(*widget.RichText); !ok {
+			t.Errorf("mdOrLabel(%q) = %T, want RichText: this block renders differently as markdown",
+				raw, mdOrLabel(raw))
+		}
+	}
+	for _, raw := range []string{"the build passed, 12 tests ok", "no markers here at all"} {
+		lb, ok := mdOrLabel(raw).(*widget.Label)
+		if !ok {
+			t.Errorf("mdOrLabel(%q) = %T, want a selectable Label", raw, mdOrLabel(raw))
+			continue
+		}
+		if !lb.Selectable {
+			t.Errorf("mdOrLabel(%q): Label is not Selectable", raw)
+		}
+	}
 }
