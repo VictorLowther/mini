@@ -92,10 +92,14 @@ type guiView struct {
 	// committed is the transcript source of truth the widgets are rendered
 	// from; the thinking toggle rebuilds every block from it.
 	committed []block
-	// pinned tracks whether the transcript was scrolled to the bottom before
-	// the last content change, so new output keeps the view at the bottom and
-	// scrolled-back history stays put.
+	// pinned is the human's intent to watch the working edge, not a geometry
+	// reading: it changes only when a scroll they caused lands away from the
+	// bottom (see the scroll callback in root), and it is acted on by follow().
 	pinned bool
+	// following guards the programmatic trips to the bottom, because the scroller
+	// reports them through the same callback as a drag - and an unguarded one
+	// would read our own follow as the human scrolling up.
+	following bool
 
 	// live is the streaming turn's incremental renderer; liveRow is its place
 	// in the transcript - a row of the same virtual scroll the committed cards
@@ -183,11 +187,22 @@ func (v *guiView) root() fyne.CanvasObject {
 	v.row = fixed
 	v.rootC = container.NewBorder(nil, fixed, nil, nil, v.center)
 	// Every scroll movement may cross a window boundary; the window is the
-	// tree, so the tree follows the thumb. Caveat from the scroller: a
-	// programmatic ScrollToOffset assigns the offset without calling back -
-	// everything mini does programmatically goes through ScrollToBottom
-	// (scrollBy) instead, and so does all real input.
+	// tree, so the tree follows the thumb. The same callback is where the reader's
+	// hold on the working edge is read: a programmatic ScrollToOffset assigns the
+	// offset without calling back, but ScrollToBottom goes through scrollBy and
+	// DOES fire this - so every bottom we cause ourselves travels inside follow(),
+	// which holds `following` across the call, or our own follow would read as a
+	// drag upward.
 	v.scroll.OnScrolled = func(fyne.Position) {
+		if !v.following {
+			// Only a human scroll arrives here unguarded, so this is the one
+			// place the hold may be lost - and it must be the only one. Deriving
+			// pinned from geometry on every content change un-pinned a transcript
+			// nobody had touched: a card measured taller than its estimate, or the
+			// question card taking a strip of viewport, both move the bottom away
+			// from an offset that was the bottom a moment ago.
+			v.pinned = v.atBottom()
+		}
 		v.recomputeWindow()
 		v.repaint(v.scroll)
 	}
@@ -572,7 +587,7 @@ func (v *guiView) start() {
 	// The transcript was built before the scroll had a height, so it is
 	// stacked above the fold; land on the newest turn.
 	v.pinned = true
-	v.scroll.ScrollToBottom()
+	v.follow()
 	v.refreshStatus()
 }
 
@@ -592,18 +607,28 @@ func (v *guiView) noteLocal(text string) {
 	}
 }
 
-// updatePinned records whether the view sat at the bottom before the next
-// content change. A scroll that has not been laid out yet (zero height, e.g.
-// during the pre-Show transcript build) must not count as "scrolled up" - the
-// transcript starts pinned so it follows new turns, which is the whole point.
-func (v *guiView) updatePinned() {
+// atBottom reports whether the transcript is showing its newest row.
+//
+// A scroll that has not been laid out yet - zero height, as during the pre-Show
+// transcript build - counts as at the bottom: the transcript opens pinned so it
+// follows new turns, and reading an unmeasured viewport as "scrolled up" is the
+// bug that once left the view showing two cards forever. The tolerance is a line
+// rather than a pixel, because the last row can measure a hair above the fold and
+// demanding equality would drop the hold over it.
+func (v *guiView) atBottom() bool {
 	view := v.scroll.Size().Height
 	if view <= 0 {
-		v.pinned = true
-		return
+		return true
 	}
-	bottom := v.body.MinSize().Height - view
-	v.pinned = v.scroll.Offset.Y >= bottom-4
+	return v.scroll.Offset.Y >= v.body.MinSize().Height-view-theme.TextSize()
+}
+
+// follow moves the transcript to the working edge without letting the scroll
+// callback mistake it for the human scrolling.
+func (v *guiView) follow() {
+	v.following = true
+	v.scroll.ScrollToBottom()
+	v.following = false
 }
 
 // relayoutTranscript re-establishes the scroll after the content grew - by
@@ -625,7 +650,7 @@ func (v *guiView) relayoutTranscript() {
 		v.body.Resize(fyne.NewSize(max(min.Width, vs.Width), max(min.Height, vs.Height)))
 	}
 	if v.pinned {
-		v.scroll.ScrollToBottom() // keep the newest row - live or committed - in view
+		v.follow() // keep the newest row - live or committed - in view
 	}
 	v.repaint(v.scroll)
 }
@@ -660,7 +685,6 @@ func (v *guiView) repaint(o fyne.CanvasObject) {
 
 func (v *guiView) appendBlock(b block) {
 	v.committed = append(v.committed, b)
-	v.updatePinned()
 	v.blockH = append(v.blockH, estimateBlockHeight(b))
 	v.afterContentChange()
 }
@@ -712,7 +736,7 @@ func (v *guiView) refreshCommitted() {
 	v.winRows = nil
 	v.winFirst, v.winLast = -1, -1 // defeat setWindow's no-change shortcut
 	v.recomputeWindow()
-	v.layoutCenter()
+	v.centerResized()
 	v.repaint(v.scroll)
 }
 
@@ -779,7 +803,6 @@ func (v *guiView) streamChunk() {
 	}
 	if v.live == nil {
 		v.live = newLiveArea()
-		v.updatePinned()
 		// The streaming turn is the transcript's newest row - same scroll,
 		// same gutter, same tail the pinned view follows. It grows the
 		// scroll's content, never the viewport that holds it.
@@ -828,6 +851,22 @@ func (v *guiView) layoutCenter() {
 	}
 }
 
+// centerResized is what the callers that *change* the center column want: re-lay
+// it, then keep holding the working edge. The question card taking or giving back
+// its share of the column changes the transcript's viewport, so an offset that was
+// the bottom stops being one - and a view following the tail must not lose it
+// because a prompt went up or came down. That happens several times a turn, which
+// is how the old geometry-derived pin came to read the panel as the human scrolling
+// away. It is a separate call rather than a rule inside layoutCenter because
+// layoutCenter is also how the column is re-laid from inside a layout pass, and a
+// scroll is not the place to mutate the tree.
+func (v *guiView) centerResized() {
+	v.layoutCenter()
+	if v.pinned {
+		v.follow()
+	}
+}
+
 // rebuildAll re-renders every block (the thinking toggle changes how past
 // turns look): heights return to estimates - visibility was exactly what
 // changed them - and the window rebuilds its rows from the new state.
@@ -845,13 +884,12 @@ func (v *guiView) rebuildAll() {
 	v.winRows = nil
 	v.winFirst, v.winLast = -1, -1 // defeat setWindow's no-change shortcut
 	v.recomputeWindow()
-	v.layoutCenter()
-	v.repaint(v.scroll)
 	// Re-stream the turn in flight from its buffers, if any.
 	v.streamChunk()
-	if v.pinned {
-		v.scroll.ScrollToBottom()
-	}
+	// A rebuild replaces every row, so the content is taller or shorter than what
+	// was there before: re-lay the column and stay on the tail if that is what the
+	// view has been doing.
+	v.centerResized()
 }
 
 func (v *guiView) toggleThinking() {
@@ -1510,9 +1548,11 @@ func (v *guiView) setPanel(objs ...fyne.CanvasObject) {
 	}
 	v.panel.Refresh()
 	v.card.Refresh()
-	// The card's share of the center column depends on whether it is up and
-	// how tall its content is; layout-only, the same rule as flushLive.
-	v.layoutCenter()
+	// The card's share of the center column depends on whether it is up and how
+	// tall its content is; layout-only, the same rule as flushLive - but the
+	// transcript's viewport just changed size, so a view that is holding the
+	// working edge follows it again.
+	v.centerResized()
 }
 
 func (v *guiView) showQuestion(q Question) {

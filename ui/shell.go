@@ -201,7 +201,7 @@ func (sh *shell) run(g *GUI, ctx context.Context, task string) (map[string]any, 
 	// The transcript was built before the scroll had a height, so it is stacked
 	// above the fold; land on the newest turn.
 	g.v.pinned = true
-	g.v.scroll.ScrollToBottom()
+	g.v.follow()
 	g.v.refreshStatus()
 
 	runCtx, cancelRun := context.WithCancel(ctx)

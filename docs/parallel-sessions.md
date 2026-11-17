@@ -2212,6 +2212,61 @@ pass writes the row's actual height back into `blockH` (`fyneview.go:217`) - but
 control that changes a card's height must be expected to shift the scrollbar by a
 few pixels the first time the row is seen.
 
+### 8.9 Sticking to the working edge is intent, not geometry
+
+Reported by the maintainer: scrolling to the bottom of the transcript no longer
+sticks, and it comes un-done both by cards growing past the bottom of a tab and by
+the transient running/question screens. Both halves of that diagnosis were right,
+and they were the same bug.
+
+`updatePinned` answered the question *"was the view at the bottom before this
+content change?"* using **current** geometry: `Offset.Y >= body.MinSize().Height -
+viewport - 4`. Anything that moves the bottom away from an offset that was the
+bottom a moment ago is then read as "the human scrolled up", and the hold is dropped
+- permanently, until the human happens to drag back to the tail:
+
+- the question or running card takes a strip of the center column, so the viewport
+  shrinks and the bottom moves down by exactly the card's height;
+- a card's measured height replacing the estimate it was placed by - which every
+  card does now that they all carry chrome (§8.8), and job cards do continuously as
+  the elapsed time and log tail update.
+
+The `-4` tolerance was the wrong knob: the discrepancy is a panel's worth of pixels,
+not four.
+
+**So `pinned` is now intent, and exactly one thing may change it.** The scroll
+callback - which only a human gesture reaches unguarded - sets it from `atBottom()`;
+every programmatic trip to the tail goes through `follow()`, which sets
+`following` because Fyne's `ScrollToBottom` calls `scrollBy` and fires `OnScrolled`
+*on the way* (`internal/widget/scroller.go`), so an unguarded follow would be
+indistinguishable from a drag upward. `updatePinned` is gone; `atBottom` is a
+question, not a side effect, and it keeps the rule that an unmeasured viewport
+counts as at the bottom (§8's two-cards bug).
+
+**Where a change alters the viewport, the view follows again.** `setPanel`,
+`rebuildAll` and `refreshCommitted` call `centerResized()` rather than
+`layoutCenter()`: re-lay the column, and if the transcript was holding the working
+edge, take it back. A reader must not lose the tail because a prompt went up or came
+down - that happens several times a turn. The follow is in `centerResized` and not
+inside `layoutCenter` deliberately: the latter is also how the column is re-laid from
+within a layout pass, and mutating the materialized row set mid-layout is a different
+kind of trouble.
+
+**Tests** (`ui/scroll_test.go`) run the view at real geometry - a scroll with no
+viewport reports "at the bottom" by definition, which is the pre-Show case, not the
+one under test. The panel test was checked against the old logic restored in both
+halves and fails there with exactly the reported symptom, `the running card un-pinned
+the transcript`; the release-and-restore test was checked by making the callback
+always pin. Honest limit: the *growth* half passes under the old logic in isolation,
+because `relayoutTranscript` still followed while pinned - what killed the hold in
+practice was a viewport change preceding it, and the two are indistinguishable to the
+reader.
+
+`TestGUITrajectoryMatchesPrintMode`'s documented intermittent deadlock appeared
+twice during this work, in whole-package runs. Measured in isolation it was 0/10
+after this change and 1/10 before it, which is not enough to attribute it either
+way; it is the pre-existing flake recorded above until someone catches its
+goroutine dump, and nothing here touches the code it waits on.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that
