@@ -36,16 +36,6 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 	if err := s.nameAvailable(req.Name); err != nil {
 		return agent.SpawnReply{}, err
 	}
-	// A child's prompts reach the human who owns the parent, through the parent's
-	// own hooks - decision 13. Before that existed this refused outright rather
-	// than spawn an unattended child from a confirm-mode parent, because the
-	// widening was invisible; now the widening is impossible instead, since the
-	// only way a child gets past a confirmation is the same human approval that
-	// gates its parent. Where the parent has no hooks - a batch run, or a parent
-	// whose human already chose yolo - the child is unattended by inheritance and
-	// anything that would prompt rejects with a reason (§3.7, omp's posture)
-	// rather than waiting for a person who will never arrive.
-	// (Built just below, once the child exists to point at.)
 
 	child, err := s.proc.Open(Spec{
 		// A copy, never the parent's map: a child's config is constructed here,
@@ -64,6 +54,47 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 		return agent.SpawnReply{}, err
 	}
 
+	// Wiring the child's identity and its route to a person happens BEFORE the job
+	// starts, and the ordering - not any locking - is what makes it safe:
+	// Jobs.Start launches the run goroutine, whose loop reads Loop.Hooks and
+	// Loop.Origin with nothing guarding them, so an assignment made after it races
+	// the child's first tool call. The losing order is a child running with no
+	// confirmation gate, which is §5.5's widening reached by timing rather than by
+	// design. (A comment here used to claim the opposite, about a job it thought
+	// was started below rather than above.)
+	child.Loop.Origin = req.Name
+	// The child's registry is what decides whether the child is done, so its quiet
+	// has to reach the wrapper - and a send that arrives later uses the same
+	// channel, which is why the wake lives on the session rather than on the job.
+	child.Jobs.OnQuiescent = child.notify
+
+	// A window that shows the child attends it directly: its own transcript, its
+	// own input, its own prompts (decision 15: "bubbling becomes routing", and a
+	// child with a tab *is* attendable). An error here means the child could not be
+	// given one, and an unanswerable child does not get to run.
+	attended := false
+	if hook := s.proc.OnChild; hook != nil {
+		if err := hook(child); err != nil {
+			_ = child.Close()
+			return agent.SpawnReply{}, fmt.Errorf("the subagent could not be given a front end: %w", err)
+		}
+		attended = true
+	}
+	if !attended {
+		// No front end of its own, so the child's prompts reach the human who owns
+		// the parent through the parent's hooks - decision 13. Before that existed
+		// this refused outright rather than spawn a confirm-mode parent's child,
+		// because the widening was invisible; now the widening is impossible, since
+		// the only way a child gets past a confirmation is the same human approval
+		// that gates its parent. Where the parent has no hooks either - a batch run,
+		// or a human who chose yolo - the child has no asker at all, and anything
+		// that would prompt rejects with a reason (§3.7, omp's posture) rather than
+		// wait for a person who will never arrive.
+		if parent := s.Loop.Hooks; parent != nil {
+			child.Loop.Hooks = &bubblingHooks{parent: parent, child: child, label: req.Name}
+		}
+	}
+
 	run, err := s.Jobs.Start(job.Spec{
 		Kind:        session.KindSubagent,
 		Label:       req.Name,
@@ -76,21 +107,6 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 		_ = child.Close()
 		return agent.SpawnReply{}, err
 	}
-	// Wiring the child's own identity and its route to a person. Nothing has run
-	// yet at this point - the job below is what starts the loop - so these two
-	// assignments are race-free by ordering rather than by locking, and that is
-	// worth the comment because a later caller that opened a child and ran it
-	// somewhere else would break both silently.
-	child.Loop.Origin = req.Name
-	if parent := s.Loop.Hooks; parent != nil {
-		child.Loop.Hooks = &bubblingHooks{parent: parent, child: child, label: req.Name}
-	}
-
-	// The child's registry is what decides whether the child is done, so its
-	// quiet has to reach the wrapper - and a send that arrives later uses the
-	// same channel, which is why the wake lives on the session rather than on
-	// the job.
-	child.Jobs.OnQuiescent = child.notify
 	s.proc.registerAgentJob(s.ID.String(), run.ID(), child)
 	return agent.SpawnReply{JobID: run.ID(), OutputPath: run.OutputPath(), Name: req.Name}, nil
 }

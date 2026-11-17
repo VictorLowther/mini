@@ -74,13 +74,6 @@ type Session struct {
 	closed       bool
 	born         time.Time
 
-	// unattended marks a session that was never going to prompt anyone - a
-	// subagent, or a batch run nobody attached a terminal to. It is what lets
-	// §5.5's "authority never widens" rule be enforced honestly rather than by
-	// accident: a child of an unattended parent inherits the unattendedness,
-	// while a child of a confirm-mode session is refused until step 7 gives a
-	// parent a way to answer on its child's behalf.
-	unattended bool
 	// parked says a wrapper for this session is waiting in waitQuiet, so a send
 	// can tell "somebody will re-drive this" from "nobody is left to". Cleared
 	// before the wrapper acts on a wake, so a send that arrives during a live

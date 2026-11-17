@@ -1383,8 +1383,11 @@ push).
       already the per-session contract; same seam, one fifth of the renaming.
    3. `CreateTab` to open a top-level session, with a working-directory picker,
       because a tab whose repository you cannot choose is a tab you cannot use.
-   4. A child-created callback on `Process`, so a spawn opens its tab. Polling
-      `Children()` would work and is wrong: it makes the UI guess.
+   4. **Built (§8.4).** A child-created callback on `Process`, so a spawn opens its
+      tab. Polling `Children()` would work and is wrong: it makes the UI guess.
+      This is also where decision 13 was re-ruled (attended-ness follows the front
+      end), where `Session.unattended` went, and where `Spawn`'s hook-assignment
+      race - and the comment that denied it - were fixed.
    5. Status and attention markers in the label, `⌥→`/`⌥←`, and the per-tab quit
       guard through `CloseIntercept` - which per decision 15 must own the removal
       and the cascade itself.
@@ -1966,6 +1969,59 @@ marker and `⌥→`/`⌥←` and the real `CloseIntercept` teardown (7.5), and s
 the slash commands into tab-level and window-level with the batched cancel across
 N sessions (7.6). `/quit` is still window-level: it cancels every session's run in
 flight, which is what it always did with one.
+
+### 8.4 Step 7.4: a spawn opens a tab, and the child's prompts go to the child
+
+Decision 15's "bubbling becomes routing" is wired, and with it the re-ruling that
+decision 15 demanded of decision 13: **attended-ness follows the front end, not the
+parent.** A child session is attended when the process can give it a window, and
+`host.Process.OnChild func(*Session) error` is how the GUI says so: `cmd/mini`
+installs it, `GUI.OpenSession` builds the child's front end, and the child's
+confirmation prompts, transcript, input and tabs are its own from its first step.
+Where no `OnChild` is installed - print mode, a batch run, every existing `host`
+test - the child still bubbles to its parent's human through `bubblingHooks`, which
+is unchanged behaviour rather than a fallback nobody meant to keep working.
+
+**The ordering was the finding, and the old comment was false.** `Session.Spawn`
+used to call `Jobs.Start` and *then* assign `child.Loop.Origin` and
+`child.Loop.Hooks`, with a comment asserting "Nothing has run yet at this point -
+the job below is what starts the loop". The job below was the one started above:
+`Jobs.Start` launches the run goroutine, and `agent.Loop` reads `Hooks` and
+`Origin` with nothing guarding them, so the child could win the race and run its
+first steps with **no confirmation gate at all** - §5.5's authority widening,
+reached by timing rather than by design, and invisible in a test that never loses
+the race. Everything the child needs before it can be asked to run is now bound
+before `Jobs.Start`, and `OnChild` fires inside that window; three assertions in
+`TestOnChildAttendsASpawnedSession` pin it (origin already set, hooks still nil,
+session not yet running), each of which fails when the assignment moves back down.
+
+Two more decisions fell out of the same seam:
+
+- **`Session.unattended` is deleted.** It was written for every subagent and read
+  by nothing, while its comment claimed the inheritance rule this step replaces.
+  Attended-ness is now a property of the routing that exists, not a flag nobody
+  consults.
+- **A child that cannot be given a front end does not run.** `OnChild` returns an
+  error, `Spawn` closes the half-built child and hands the reason back to the model
+  as a refused tool call - decision 13's "no asker means refuse", applied to a front
+  end that failed to open rather than one absent by configuration
+  (`TestSpawnRefusesAChildItCannotAttend`).
+
+`GUI.OpenSession` is callable from any goroutine, because that is what a spawn is:
+the session's state, its streaming handler and its hooks are bound synchronously on
+the caller's goroutine, and only the view and the tab item are posted to the canvas.
+So there is a real window - a few milliseconds, one drained queue - in which the
+child is attendable but has no tab yet, and that ordering is asserted rather than
+assumed (`TestGUIChildSessionIsAttendedInItsOwnTab`, which calls `OpenSession` from
+another goroutine and checks the hooks landed before the widgets did).
+
+The strip's label is the only surface a background session has: `TabItem` carries
+text and an icon and no widget, and DocTabs' jump menu is text-only upstream
+(consequence 2), so a prompt waiting in an unselected tab puts **⚠** on its label,
+raised when the question is published and cleared when it is answered or when the
+human selects the tab. Nothing else will tell a person that a child is parked
+waiting on them - which is what makes routing affordable over bubbling in the first
+place.
 
 ## 9. Open questions
 

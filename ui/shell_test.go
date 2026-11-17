@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 
 	"github.com/VictorLowther/mini/agent"
@@ -48,13 +49,18 @@ func settle() {
 	drainPosts()
 }
 
-// openSession adds another session to the same window.
-func openSession(a *GUI, mode, modelName string) *GUI {
+// openSession adds another session to the same window, through the same entry
+// point a spawned subagent arrives by.
+func openSession(t *testing.T, a *GUI, mode, modelName string) *GUI {
+	t.Helper()
 	cfg := newConfig(mode)
 	l := &agent.Loop{Cfg: cfg, Model: &model.Deterministic{}, Env: &env.Local{}}
-	g := a.sh.open(GUIOptions{
+	g, err := a.sh.openSession(GUIOptions{
 		Cfg: cfg, Loop: l, Model: &model.Sushi{Model: modelName}, ConfigName: "mini",
 	})
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
 	drainPosts()
 	return g
 }
@@ -64,7 +70,7 @@ func openSession(a *GUI, mode, modelName string) *GUI {
 // whichever tab repaints first.
 func TestGUISessionsStreamIntoTheirOwnTranscripts(t *testing.T) {
 	a := newTestWindow(t, "yolo", "alpha")
-	b := openSession(a, "yolo", "beta")
+	b := openSession(t, a, "yolo", "beta")
 
 	a.Reasoning("alpha thinking")
 	a.Content("alpha prose")
@@ -107,7 +113,7 @@ func TestGUISessionsStreamIntoTheirOwnTranscripts(t *testing.T) {
 // unrelated repository's confirmation waited behind a prompt nobody was looking at.
 func TestGUISessionAnswersItsOwnQuestion(t *testing.T) {
 	a := newTestWindow(t, "yolo", "alpha")
-	b := openSession(a, "confirm", "beta")
+	b := openSession(t, a, "confirm", "beta")
 
 	asked := make(chan Answer, 1)
 	go func() {
@@ -168,7 +174,7 @@ func TestGUISessionAnswersItsOwnQuestion(t *testing.T) {
 // and taking the keyboard back for its own input.
 func TestGUIWindowChromeFollowsTheVisibleTab(t *testing.T) {
 	a := newTestWindow(t, "yolo", "alpha")
-	b := openSession(a, "confirm", "beta")
+	b := openSession(t, a, "confirm", "beta")
 	win := a.sh.window
 
 	a.v.refreshStatus()
@@ -216,4 +222,91 @@ func TestGUIWindowChromeFollowsTheVisibleTab(t *testing.T) {
 	if f := win.Canvas().Focused(); f == fyne.Focusable(a.v.editor) {
 		t.Error("the hidden tab reclaimed the caret; the visible one cannot be typed into")
 	}
+}
+
+// TestGUIChildSessionIsAttendedInItsOwnTab is step 7.4 from the front end's side:
+// a spawn opens a tab, and from that moment the child's prompts are the child's
+// own. It is also the ordering test - OpenSession is called from another
+// goroutine, as a spawn calls it, and the child must be attendable before the
+// window has had a turn to draw it.
+func TestGUIChildSessionIsAttendedInItsOwnTab(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+
+	cfg := newConfig("confirm")
+	l := &agent.Loop{Cfg: cfg, Model: &model.Deterministic{}, Env: &env.Local{}}
+	opened := make(chan error, 1)
+	var kid *GUI
+	go func() {
+		g, err := a.OpenSession(GUIOptions{
+			Cfg: cfg, Loop: l, Model: &model.Sushi{Model: "beta"}, TabLabel: "worker",
+		})
+		kid = g
+		opened <- err
+	}()
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+	// The route to a human exists the instant the session does, and the widgets
+	// have not been built yet: the tab is posted, the hooks are not.
+	if kid == nil || kid.loop.Hooks == nil {
+		t.Fatal("the child was opened without a route to a human")
+	}
+	if kid.item != nil {
+		t.Error("the tab was built off the toolkit goroutine")
+	}
+	drainPosts()
+
+	if n := len(a.sh.sessions); n != 2 {
+		t.Fatalf("%d sessions in the window, want 2", n)
+	}
+	items := a.sh.tabs.Items
+	if len(items) != 2 || items[1].Text != "worker" {
+		t.Fatalf("strip = %v, want the child labelled by the name its parent gave it", labels(items))
+	}
+
+	// The child asks; the parent's transcript, panel and pending slot stay clean.
+	asked := make(chan Answer, 1)
+	go func() {
+		ans, err := kid.Ask(context.Background(), Question{Kind: AskConfirm,
+			Title: "run rm -rf build/?", Cfg: kid.cfg})
+		if err != nil {
+			asked <- Answer{Text: "ask failed: " + err.Error()}
+			return
+		}
+		asked <- ans
+	}()
+	waitFor(t, "the child's tab to be marked as waiting",
+		func() bool { return items[1].Text == "⚠ worker" })
+	if a.HasQuestion() {
+		t.Error("a child with its own tab bubbled its prompt into its parent")
+	}
+	if !kid.v.card.Visible() {
+		t.Error("the child's prompt never reached the child's panel")
+	}
+	if got := transcriptText(a.v.root()); strings.Contains(got, "rm -rf") {
+		t.Errorf("the parent's transcript carries a child's prompt:\n%s", got)
+	}
+
+	kid.resolve(Answer{})
+	select {
+	case ans := <-asked:
+		if ans.Reject || ans.Text != "" {
+			t.Errorf("the child's asker got %+v, want the plain approval it was given", ans)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the child's asker never woke")
+	}
+	if got := items[1].Text; got != "worker" {
+		t.Errorf("the marker outlived the answer: label is %q", got)
+	}
+}
+
+// labels spells the strip out for a failure message; a []TabItem prints as
+// pointers, which tells nobody which label went wrong.
+func labels(items []*container.TabItem) []string {
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.Text
+	}
+	return out
 }

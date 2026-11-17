@@ -77,6 +77,20 @@ type Process struct {
 	// (docs/parallel-sessions.md §7 step 2).
 	Logger *slog.Logger
 
+	// OnChild is a spawned session's chance to get a front end *before it runs*,
+	// and the seam step 7.4 of docs/parallel-sessions.md exists for: the GUI opens
+	// a tab for the child and installs the hooks that gate it. It fires on the
+	// spawning goroutine with the child created and nothing of its own started yet,
+	// so what it binds cannot be raced by the child's loop.
+	//
+	// An error fails the spawn: the child is closed and the model is given the
+	// reason, because a child that cannot be answered must not run - decision 13's
+	// "no asker means refuse", applied to a front end that could not be built
+	// rather than absent by configuration. Where OnChild is nil the child keeps its
+	// parent's route (bubblingHooks), which is the whole of print mode's behaviour
+	// and was, until tabs, the whole of the GUI's.
+	OnChild func(*Session) error
+
 	// ProcessCtx is the ancestor of every job every session starts. nil means
 	// context.Background(). Cancelling it is how the whole process winds down;
 	// per-session cancellation is Session.Quit.
@@ -379,14 +393,6 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 	// claim about a process this mini does not own, so it becomes orphaned and
 	// the human is told, which is the honest version of "still running".
 	s.SweepWarn = jobs.Sweep()
-	// A child is unattended by definition: it has no front end, and the
-	// confirmation bubbling of §5.5 does not exist until step 7. Marking it here
-	// is what lets a subagent delegate nothing while not pretending a batch run
-	// has a human it never got.
-	if sess.Kind == session.KindSubagent {
-		s.unattended = true
-	}
-
 	l.Spawner = s
 
 	p.mu.Lock()

@@ -100,6 +100,9 @@ func newShell(o GUIOptions) *shell {
 		if g == nil {
 			return
 		}
+		// Looking at a tab is how a prompt gets answered, so the marker comes off
+		// the moment the human arrives.
+		g.setAttention(false)
 		g.v.focusEditor()
 		g.v.refreshStatus()
 	}
@@ -113,16 +116,6 @@ func newShell(o GUIOptions) *shell {
 }
 
 // ------------------------------------------------------------------ sessions --
-
-// addTab installs a session's view as a tab and returns its GUI. Selecting it is
-// the caller's business: a child that starts streaming in the background must not
-// yank the strip away from whatever the human is reading.
-func (sh *shell) addTab(g *GUI) *GUI {
-	g.item = container.NewTabItem(g.label(), g.v.root())
-	sh.sessions = append(sh.sessions, g)
-	sh.tabs.Append(g.item)
-	return g
-}
 
 // selectTab shows a session and gives its input the keyboard, which is the only
 // way the newly visible tab is typeable - focus does not follow the content.

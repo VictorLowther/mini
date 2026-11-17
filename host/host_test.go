@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1143,5 +1144,93 @@ func TestKillStopsALiveSubagent(t *testing.T) {
 	// parent's registry view.
 	if n := parent.LiveJobs(); n != 0 {
 		t.Errorf("parent live jobs = %d after the kill, want 0", n)
+	}
+}
+
+// TestOnChildAttendsASpawnedSession is step 7.4, and the ordering it exists to
+// guarantee. A front end that can show a child gives the child its own hooks
+// instead of bubbling into the parent's transcript (decision 15: "bubbling becomes
+// routing"), and it gets the chance while the child is still not running - because
+// a hook installed after the run starts is a gate the child may already have
+// walked through.
+func TestOnChildAttendsASpawnedSession(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parentHooks := &recordingHooks{}
+	parent, err := p.Open(Spec{
+		Config: merged, Workdir: base, Project: base, Model: scripted(0), Hooks: parentHooks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("child report")}}
+	}
+
+	childHooks := &recordingHooks{}
+	var sawOrigin string
+	var sawHooks agent.Hooks
+	var alreadyRunning bool
+	p.OnChild = func(cs *Session) error {
+		sawOrigin, sawHooks, alreadyRunning = cs.Loop.Origin, cs.Loop.Hooks, cs.Running()
+		cs.Loop.Hooks = childHooks
+		return nil
+	}
+	if _, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "worker", Prompt: "go"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The callback saw a child that had its identity and no route yet: that is the
+	// window in which a front end must be allowed to install one.
+	if sawOrigin != "worker" {
+		t.Errorf("at the callback the child's origin was %q, want its name", sawOrigin)
+	}
+	if sawHooks != nil {
+		t.Errorf("at the callback the child already had %T, want the callback to be first", sawHooks)
+	}
+	if alreadyRunning {
+		t.Error("the child was already running when its front end was being asked to attend it")
+	}
+
+	kid := p.Children(parent.ID)[0]
+	if kid.Loop.Hooks != childHooks {
+		t.Errorf("the child kept %T, want the hooks its front end installed", kid.Loop.Hooks)
+	}
+	// And a gate asked of the child reaches the child's own front end, not its
+	// parent's human: the tab it is sitting in is the attribution now.
+	if err := kid.Loop.Hooks.BeforeExecute(context.Background(),
+		[]model.Action{{Command: "rm -rf build/"}}, kid.Loop.TemplateVars()); err != nil {
+		t.Fatalf("BeforeExecute: %v", err)
+	}
+	if parentHooks.before != 0 {
+		t.Errorf("the parent's human was asked about a child with a front end of its own (%d asks)", parentHooks.before)
+	}
+	if childHooks.before != 1 {
+		t.Errorf("the child's own front end saw %d gates, want 1", childHooks.before)
+	}
+}
+
+// TestSpawnRefusesAChildItCannotAttend is decision 13's rule with the tabbed
+// front end in place: a child nobody can answer does not run. The refusal comes
+// from the front end failing to open, and the half-built session is reaped rather
+// than left in the roster with no window.
+func TestSpawnRefusesAChildItCannotAttend(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("never runs")}}
+	}
+	p.OnChild = func(*Session) error { return errors.New("the window is full") }
+
+	_, err = parent.Spawn(context.Background(), agent.SpawnRequest{Name: "orphan", Prompt: "go"})
+	if err == nil || !strings.Contains(err.Error(), "the window is full") {
+		t.Fatalf("spawn err = %v, want the front end's reason", err)
+	}
+	if n := len(p.Children(parent.ID)); n != 0 {
+		t.Errorf("%d children left after a refused spawn, want none reaped into the roster", n)
 	}
 }

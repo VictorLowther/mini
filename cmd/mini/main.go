@@ -350,11 +350,24 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// The window is the UI, not the confirmation logic: without the same
 	// Interactive adapter --print gets, the loop never calls OnMessage and
 	// the transcript never commits a turn.
-	h, err := ui.New(g, r.AgentCfg, r.Loop)
-	if err != nil {
+	if err := g.InstallHooks(); err != nil {
 		return g.ShowError(err)
 	}
-	r.Loop.Hooks = h
+	// A subagent gets a tab of its own, and its prompts go to that tab: a child the
+	// human can see is a child they can answer, which is what decision 15's
+	// "bubbling becomes routing" means, and what retires the old reasoning that a
+	// child of an unattended parent must be unattended (decision 13, re-ruled). The
+	// callback is installed here rather than in host because host still does not
+	// know a UI exists; an error refuses the spawn rather than running a child
+	// nobody can answer.
+	r.Proc.OnChild = func(cs *host.Session) error {
+		m, _ := cs.Model.(*model.Sushi)
+		_, err := g.OpenSession(ui.GUIOptions{
+			Cfg: cs.Cfg, Loop: cs.Loop, Model: m, ConfigName: r.ConfigName,
+			Jobs: jobReader(cs.Jobs), TabLabel: cs.Name,
+		})
+		return err
+	}
 	g.SetSessionID(r.Sess.ID.String())
 	g.Resume(r.ResumeMsgs, r.ResumeNote)
 
@@ -388,10 +401,10 @@ type miniRun struct {
 	// open, the handoff from a promoted foreground command, the jobs and
 	// job_kill tools, and the reap on exit.
 	Jobs *job.Manager
-	// Proc is the process-level owner this session was opened by. The front ends
-	// do not need it yet; step 7's session strip enumerates it (§7 step 7), and
-	// holding it here is what lets a second session be opened without one CLI
-	// invocation per conversation.
+	// Proc is the process-level owner this session was opened by, and the GUI's
+	// handle on it: `Proc.OnChild` is what opens a tab when the model spawns a
+	// subagent (§7 step 7.4). Holding it here is what lets a second session be
+	// opened without one CLI invocation per conversation.
 	Proc       *host.Process
 	ResumeMsgs []model.Message
 	ResumeNote string

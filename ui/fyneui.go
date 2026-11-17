@@ -29,6 +29,9 @@ type GUIOptions struct {
 	// and the window's size - and is read once, at construction. nil is a
 	// valid value (a GUI with no store opens collapsed at the default size).
 	Settings Settings
+	// TabLabel names this session's tab when the caller has a better name than the
+	// model: a spawned subagent is known by the name its parent gave it.
+	TabLabel string
 	// Jobs reads the registry for the cards of calls that handed off, so the
 	// window can keep them live until the job ends. nil leaves the cards
 	// truthful but static.
@@ -63,7 +66,14 @@ type GUI struct {
 	// item is this session's tab in sh.tabs; the strip has no way to reorder, so
 	// the shell keeps sessions and items in the same order (consequence 3).
 	item *container.TabItem
-	v    *guiView
+	// tabLabel is the session's own name for its tab, when its caller has a better
+	// one than the model: a subagent is known by the name its parent gave it.
+	tabLabel string
+	// needsAttention marks a tab holding a prompt nobody has answered, which the
+	// label says with a leading marker because a tab is the only surface a
+	// background session has.
+	needsAttention bool
+	v              *guiView
 
 	cfg        *agent.Config
 	loop       *agent.Loop
@@ -120,12 +130,33 @@ func (g *GUI) post(fn func()) { g.sh.post(fn) }
 // path; the GUI must still be able to show a message.
 func NewGUI(o GUIOptions) *GUI {
 	sh := newShell(o)
-	return sh.open(o)
+	// The window's first session is attached on the spot: NewGUI runs on the main
+	// goroutine before app.Run, where touching widgets is already legal.
+	return sh.attach(newSession(sh, o))
 }
 
-// open adds one more session to the window: the whole of what a second
-// repository or a spawned subagent needs is a GUIOptions and a tab.
-func (sh *shell) open(o GUIOptions) *GUI {
+// OpenSession adds one more session to this window: the whole of what a second
+// repository or a spawned subagent needs is a GUIOptions and a tab. Safe from any
+// goroutine, which is what lets `host` call it from a spawn - the state and the
+// loop bindings are made here, synchronously, and only the widgets are posted to
+// the canvas thread. So the child is attendable the moment its loop can run, and
+// its tab appears as soon as the window gets a turn.
+func (g *GUI) OpenSession(o GUIOptions) (*GUI, error) { return g.sh.openSession(o) }
+
+func (sh *shell) openSession(o GUIOptions) (*GUI, error) {
+	g := newSession(sh, o)
+	if err := g.InstallHooks(); err != nil {
+		return nil, err
+	}
+	sh.post(func() { sh.attach(g) })
+	return g, nil
+}
+
+// newSession is a session's front end without any widgets: the state, and the two
+// bindings that must exist before its loop runs anywhere - the streaming handler
+// and, for a caller that opens a session through OpenSession, nothing else is
+// needed to be attendable.
+func newSession(sh *shell, o GUIOptions) *GUI {
 	cfg := o.Cfg
 	if cfg == nil {
 		cfg = &agent.Config{}
@@ -136,6 +167,7 @@ func (sh *shell) open(o GUIOptions) *GUI {
 		loop:       o.Loop,
 		configName: o.ConfigName,
 		jobs:       o.Jobs,
+		tabLabel:   o.TabLabel,
 		runDone:    make(chan struct{}),
 	}
 	if o.Model != nil {
@@ -149,12 +181,36 @@ func (sh *shell) open(o GUIOptions) *GUI {
 			g.contextNote = o.Model.ContextWindowNote()
 		}
 	}
-	g.v = newGUIView(g, sh.window)
-	sh.addTab(g)
 	if o.Loop != nil {
 		o.Loop.Handler = &model.Handler{Content: g.Content, Reasoning: g.Reasoning}
 	}
 	return g
+}
+
+// attach builds the session's view and its tab. Call on the toolkit goroutine.
+func (sh *shell) attach(g *GUI) *GUI {
+	g.v = newGUIView(g, sh.window)
+	g.item = container.NewTabItem(g.label(), g.v.root())
+	sh.sessions = append(sh.sessions, g)
+	sh.tabs.Append(g.item)
+	return g
+}
+
+// InstallHooks makes this session's front end the one its loop asks: the
+// confirmation gate, the submit prompt, the message announcements. A method
+// rather than a line of construction because its two callers fail differently -
+// the CLI reports a bad whitelist and exits, a spawn refuses to run a child nobody
+// can answer (decision 13) - and in both cases it must land before the loop runs.
+func (g *GUI) InstallHooks() error {
+	if g.loop == nil {
+		return nil
+	}
+	h, err := New(g, g.cfg, g.loop)
+	if err != nil {
+		return err
+	}
+	g.loop.Hooks = h
+	return nil
 }
 
 // label is the tab's title: what actually tells two tabs apart. A top-level
@@ -163,10 +219,36 @@ func (sh *shell) open(o GUIOptions) *GUI {
 // a subagent is named by the spawner, and that name is the only thing the human
 // has to go on.
 func (g *GUI) label() string {
-	if g.modelName != "" {
-		return g.modelName
+	text := g.tabLabel
+	if text == "" {
+		text = g.modelName
 	}
-	return "session"
+	if text == "" {
+		text = "session"
+	}
+	if g.needsAttention {
+		// The strip's labels are text only - TabItem has no slot for a widget and
+		// its jump menu cannot carry an icon - so attention has to be a character
+		// (decision 15, consequence 2).
+		text = "⚠ " + text
+	}
+	return text
+}
+
+// setAttention raises or drops the tab's "somebody is waiting here" marker. It
+// runs on the toolkit goroutine, like everything that touches the strip; before a
+// session's tab exists (OpenSession posts the attach) it only records the state,
+// which attach then renders with the tab itself.
+func (g *GUI) setAttention(on bool) {
+	if g.needsAttention == on {
+		return
+	}
+	g.needsAttention = on
+	if g.v == nil {
+		return // no tab yet: attach renders the label with the marker already on it
+	}
+	g.item.Text = g.label()
+	g.sh.tabs.Refresh()
 }
 
 // Interactive reports whether a human is on the other end. A GUI exists because a
@@ -423,7 +505,10 @@ func (g *GUI) Ask(ctx context.Context, q Question) (Answer, error) {
 	g.pending = reply
 	g.lastQ = q
 	g.mu.Unlock()
-	g.post(func() { g.v.showQuestion(q) })
+	g.post(func() {
+		g.v.showQuestion(q)
+		g.setAttention(true)
+	})
 	select {
 	case ans := <-reply:
 		return ans, nil
@@ -431,7 +516,10 @@ func (g *GUI) Ask(ctx context.Context, q Question) (Answer, error) {
 		g.mu.Lock()
 		g.pending = nil
 		g.mu.Unlock()
-		g.post(func() { g.v.hideQuestion() })
+		g.post(func() {
+			g.v.hideQuestion()
+			g.setAttention(false)
+		})
 		return Answer{}, ctx.Err()
 	}
 }
@@ -444,6 +532,7 @@ func (g *GUI) resolve(a Answer) {
 	g.pending = nil
 	g.mu.Unlock()
 	g.v.questionResolved()
+	g.setAttention(false)
 	if ch != nil {
 		ch <- a
 	}
