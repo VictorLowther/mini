@@ -1033,6 +1033,9 @@ func areaCard(label string, m metrics, body fyne.CanvasObject, align fyne.TextAl
 		Style: widget.RichTextStyle{ColorName: areaColor(label), Alignment: align},
 	})
 	header.Wrapping = fyne.TextWrapWord
+	if lb, ok := body.(*widget.Label); ok {
+		lb.Alignment = align
+	}
 	if rt, ok := body.(*widget.RichText); ok {
 		alignRT(rt, align)
 	} else if align != fyne.TextAlignLeading {
@@ -1093,15 +1096,23 @@ func alignRT(rt *widget.RichText, align fyne.TextAlign) {
 // widest real line; the horizontal scroller owns the overflow, so long
 // output never pushes the transcript (or the window) wider than it is.
 func monoBlock(lines []string) fyne.CanvasObject {
-	rt := widget.NewRichText(&widget.TextSegment{
-		Text: strings.Join(lines, "\n"),
-		Style: widget.RichTextStyle{
-			TextStyle: fyne.TextStyle{Monospace: true},
-			Alignment: fyne.TextAlignLeading,
-		},
-	})
-	rt.Wrapping = fyne.TextWrapOff
-	return container.NewHScroll(rt)
+	// A selectable Label, not a RichText. Fyne 2.8 puts selection in
+	// widget.selectable and embeds it in Label and Entry only - RichText has no
+	// selection at all - and card text is the one thing in this UI a person
+	// routinely wants to lift out and paste somewhere. The Label keeps the whole
+	// rendering contract monoBlock had: monospace, no reflow, leading-aligned,
+	// MinSize reporting the widest real line so the horizontal scroller owns the
+	// overflow. What it gives back is drag-select, double-click word select,
+	// right-click Copy and the system copy shortcut, all of them standard.
+	//
+	// TextGrid remains the wrong tool for the reason this file already records:
+	// a canvas.Text and a rectangle per *cell*, walked every frame.
+	l := widget.NewLabel(strings.Join(lines, "\n"))
+	l.TextStyle = fyne.TextStyle{Monospace: true}
+	l.Wrapping = fyne.TextWrapOff
+	l.Alignment = fyne.TextAlignLeading
+	l.Selectable = true
+	return container.NewHScroll(l)
 }
 
 // transcriptGrid renders a tool block's lines as fixed-width text inside a
@@ -1347,6 +1358,14 @@ func (v *guiView) refreshStatus() {
 		v.win.SetTitle(title)
 	}
 	if running := g.loopRunning(); running != v.wasRunning {
+		if !running {
+			// Belt for the paths that never produce a result message: a
+			// cancelled step, a refused action, a run that ended on an error.
+			// Without this the last thing a stopped session shows is a card
+			// claiming work is happening, which is the exact confusion the
+			// card exists to remove (Issuer).
+			g.SettleCalls()
+		}
 		v.wasRunning = running
 		// The menu bar draws its dropdowns when opened, so the field alone
 		// carries the state; there is nothing to invalidate.
@@ -1357,6 +1376,36 @@ func (v *guiView) refreshStatus() {
 }
 
 // ---------------------------------------------------------------- questions ---
+
+// runningCardTitle is the panel heading for an in-flight step. No elapsed
+// counter, deliberately: a live one needs a per-second timer of its own, and a
+// timer that outlives the step it describes is the class of bug this file
+// already documents around the card pump - a stale "3s" is also worse than an
+// honest "running", because it reads as a measurement of the command rather than
+// of the moment the card was drawn.
+const runningCardTitle = "running \u2026"
+
+// showRunning puts the issued-but-unfinished calls in the panel card, so a long
+// command is visible the moment it starts instead of when it returns. It yields
+// to a pending question, which owns the same panel and is strictly more urgent:
+// nobody is served by a running-card hiding the prompt they were about to answer.
+// The confirm panel and the running card therefore never collide, and in the
+// unattended case that motivated this - yolo mode, nothing on screen - the panel
+// is free.
+func (v *guiView) showRunning(lines []string) {
+	if len(lines) == 0 || v.gui.HasQuestion() {
+		return
+	}
+	v.setPanel(dimRT(runningCardTitle), monoBlock(lines))
+}
+
+// hideRunning takes the card back down. Same courtesy about a live question.
+func (v *guiView) hideRunning() {
+	if v.gui.HasQuestion() {
+		return
+	}
+	v.setPanel()
+}
 
 func (v *guiView) setPanel(objs ...fyne.CanvasObject) {
 	v.panel.Objects = objs

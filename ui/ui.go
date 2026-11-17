@@ -78,3 +78,26 @@ type UI interface {
 	// prompt on). Limits are never lifted without one.
 	Interactive() bool
 }
+
+// Issuer is the optional half of UI that a step announces to when its actions
+// actually start running, and again when the results come back. It exists
+// because the transcript is derived from messages: a card can only be drawn once
+// the tool result exists, so a command that runs for two minutes shows *nothing*
+// for two minutes. A human watching an idle-looking window cannot tell "thinking"
+// from "hung", and this one could not - they stopped and resumed a session that
+// was working fine.
+//
+// Optional rather than a UI method because only a front end with a canvas has
+// anything to say: Print streams text and needs no such notice, and forcing an
+// empty method on it and on every test fake to satisfy an interface nobody calls
+// it through is the dead-code shape this package has been deleting elsewhere.
+type Issuer interface {
+	// IssueCalls is called as the step's actions begin executing, after any
+	// confirmation has been answered.
+	IssueCalls(actions []model.Action)
+	// SettleCalls is called when a message enters the history, which is the
+	// earliest point the results can have arrived - and it also fires on the
+	// cancel and error paths, so a card cannot be left running over a session
+	// that already stopped.
+	SettleCalls()
+}

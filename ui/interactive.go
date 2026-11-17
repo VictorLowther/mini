@@ -47,6 +47,12 @@ func (h *Interactive) shouldAskConfirmation(command string) bool {
 
 // BeforeExecute implements the confirm mode.
 func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action, tvars map[string]any) error {
+	// Announce the calls first, and before the prompt: "issued" is the moment a
+	// card should exist, and a human deciding whether to approve something is
+	// exactly when they want to see what is already running behind it.
+	if is, ok := h.UI.(Issuer); ok {
+		is.IssueCalls(actions)
+	}
 	ask := false
 	for _, a := range actions {
 		// The job tools never reach the prompt: reading the registry asks
@@ -154,7 +160,19 @@ func (h *Interactive) OnInterrupt(ctx context.Context) error {
 }
 
 // OnMessage forwards every history addition to the UI.
-func (h *Interactive) OnMessage(m model.Message) { h.UI.Message(m) }
+func (h *Interactive) OnMessage(m model.Message) {
+	// Settle before forwarding: the forward is what rebuilds the transcript with
+	// the real card, and the running placeholder has to be gone by then or the
+	// step appears twice. It runs for every role rather than only tool results,
+	// because the paths that end a step without a result - cancellation, an
+	// interpreter panic, a refused action - are precisely the ones that would
+	// otherwise strand a card reading "running" on a session that already
+	// stopped.
+	if is, ok := h.UI.(Issuer); ok {
+		is.SettleCalls()
+	}
+	h.UI.Message(m)
+}
 
 // askerOf pulls the origin label out of a loop's template variables. The loop
 // owns that map, so the seam that already carries the prompt context carries the

@@ -1443,3 +1443,87 @@ func TestGUIShowRunDoneLifecycle(t *testing.T) {
 		t.Errorf("leaving instructions missing:\n%s", scroll)
 	}
 }
+
+// TestGUIRunningCardIsPaintedAtIssueTime is the regression the user hit: a long
+// foreground command produced nothing on screen until it returned, so an
+// ordinary two-minute build was indistinguishable from a hung UI and they
+// stopped a session that was working. The card has to exist while the command
+// runs, not when its result lands.
+func TestGUIRunningCardIsPaintedAtIssueTime(t *testing.T) {
+	c := newConfig("yolo")
+	// No exit prompt: this test wants the run to finish at the submission, and
+	// confirm_exit would park the loop on a question nobody is answering.
+	c.ConfirmExit = false
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "sleep 0.7 && echo late", submit("done")),
+		Env: &env.Local{Timeout: 10 * time.Second}}
+	p := newGUIForTest(t, c, l)
+	done := make(chan struct{})
+	go func() { _, _ = l.Run(context.Background(), "T"); close(done) }()
+
+	waitFor(t, "the running card while the command is still in flight", func() bool {
+		s := p.panel()
+		return strings.Contains(s, "running") && strings.Contains(s, "sleep 0.7")
+	})
+	<-done
+	waitFor(t, "the running card to go when the step settles", func() bool {
+		return !strings.Contains(p.panel(), "running")
+	})
+}
+
+// TestGUIRunningCardYieldsToAPrompt pins the priority: the running card and a
+// question share the panel, and a prompt the human has not answered yet is
+// strictly more urgent than a status. Silently replacing a confirm question with
+// a running card would strand the run behind a panel that no longer asks.
+func TestGUIRunningCardYieldsToAPrompt(t *testing.T) {
+	c := newConfig("confirm")
+	l := &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}}
+	p := newGUIForTest(t, c, l)
+	p.do(func() { p.prepareTranscript() })
+
+	asked := make(chan struct{})
+	go func() {
+		_, _ = p.Ask(context.Background(), Question{Kind: AskConfirm, Title: "confirm one command"})
+		close(asked)
+	}()
+	waitFor(t, "the prompt to reach the panel", p.HasQuestion)
+	// The issued step now tries to paint its running card over the prompt.
+	p.IssueCalls([]model.Action{{Command: "echo later"}})
+	p.do(func() {}) // drain the posted closures, both ways
+
+	if got := p.panel(); !strings.Contains(got, "confirm one command") {
+		t.Errorf("the running card displaced the prompt; panel reads:\n%s", got)
+	} else if strings.Contains(got, "running") {
+		t.Errorf("the prompt was overwritten:\n%s", got)
+	}
+	p.enter() // empty answer confirms a pending AskConfirm
+	<-asked
+}
+
+// TestGUICardTextIsSelectable guards the widget choice behind copy: Fyne puts
+// selection in widget.selectable, embedded by Label and Entry only, and card
+// text used to render as RichText, which cannot select. A future "cleanup" that
+// swaps the mono body back to RichText would quietly take clipboard copy away
+// again, and no test would notice except a human trying to paste a path.
+func TestGUICardTextIsSelectable(t *testing.T) {
+	p := newGUIForTest(t, newConfig("yolo"), &agent.Loop{Cfg: newConfig("yolo"),
+		Model: &model.Deterministic{}, Env: &env.Local{}})
+	p.do(func() {
+		hx, ok := monoBlock([]string{"$ echo hi", "hi"}).(*container.Scroll)
+		if !ok {
+			t.Fatal("monoBlock no longer returns a horizontal scroller")
+		}
+		lb, ok := hx.Content.(*widget.Label)
+		if !ok {
+			t.Fatalf("card body is %T, want a *widget.Label: only Label and Entry can select", hx.Content)
+		}
+		if !lb.Selectable {
+			t.Error("card body label is not Selectable: copy would be mouse-only with no shortcut")
+		}
+		if !lb.TextStyle.Monospace {
+			t.Error("card body lost monospace: column-aligned output would reflow")
+		}
+		if lb.Wrapping != fyne.TextWrapOff {
+			t.Errorf("Wrapping = %v, want TextWrapOff so the scroller owns overflow", lb.Wrapping)
+		}
+	})
+}

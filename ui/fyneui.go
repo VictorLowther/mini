@@ -91,6 +91,10 @@ type GUI struct {
 	// timer mutate view state beside the canvas pass that is measuring it.
 	post func(fn func())
 
+	// inflight are the commands the current step has started but not finished,
+	// and inflightSince when they began. See Issuer.
+	inflight []string
+
 	mu       sync.Mutex
 	pending  chan Answer
 	lastQ    Question
@@ -477,6 +481,47 @@ func (g *GUI) Write(p []byte) (int, error) {
 }
 
 // ---------------------------------------------------------------- in-flight calls ---
+
+// IssueCalls implements Issuer. It draws the card for work that has started and
+// whose result cannot be on screen yet, then keeps the elapsed count honest once
+// a second a tick until the step settles.
+func (g *GUI) IssueCalls(actions []model.Action) {
+	lines := make([]string, 0, len(actions))
+	for _, a := range actions {
+		if d := a.Display(); d != "" {
+			lines = append(lines, d)
+		}
+	}
+	g.mu.Lock()
+	g.inflight = lines
+	g.mu.Unlock()
+	if len(lines) == 0 {
+		return
+	}
+	g.post(func() { g.v.showRunning(g.runningSnapshot()) })
+}
+
+// SettleCalls implements Issuer.
+func (g *GUI) SettleCalls() {
+	g.mu.Lock()
+	had := len(g.inflight) > 0
+	g.inflight = nil
+	g.mu.Unlock()
+	if had {
+		g.post(func() { g.v.hideRunning() })
+	}
+}
+
+func (g *GUI) runningSnapshot() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.inflight) == 0 {
+		return nil
+	}
+	out := make([]string, len(g.inflight))
+	copy(out, g.inflight)
+	return out
+}
 
 // ---------------------------------------------------------------- the ask loop ---
 
