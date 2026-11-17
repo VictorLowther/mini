@@ -111,6 +111,21 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 	return agent.SpawnReply{JobID: run.ID(), OutputPath: run.OutputPath(), Name: req.Name}, nil
 }
 
+// OpenSibling opens another top-level session beside this one - the same merged
+// configuration, a different working directory, and no lineage: a sibling is a
+// second conversation the human chose to start, not a delegation, so it is
+// resumable by name and it inherits nothing but the config. The copy is the
+// point (§9.8): the new session's trajectory path and any resume id are set by the
+// caller's spec and by Open, never carried over from the session beside it.
+func (s *Session) OpenSibling(workdir, project string) (*Session, error) {
+	return s.proc.Open(Spec{
+		Config:  cloneConfig(s.Configs),
+		Workdir: workdir,
+		Project: project,
+		Kind:    session.KindTop,
+	})
+}
+
 // nameAvailable holds a name open until the work it labels has left the box.
 // Uniqueness is scoped to the top-level session, which for a two-level tree is
 // this parent's children, live or finished - and finished ones still hold the

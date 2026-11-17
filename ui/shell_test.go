@@ -9,6 +9,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/env"
@@ -52,18 +53,40 @@ func settle() {
 // openSession adds another session to the same window, through the same entry
 // point a spawned subagent arrives by.
 func openSession(t *testing.T, a *GUI, mode, modelName string) *GUI {
-	t.Helper()
-	cfg := newConfig(mode)
-	l := &agent.Loop{Cfg: cfg, Model: &model.Deterministic{}, Env: &env.Local{}}
-	g, err := a.sh.openSession(GUIOptions{
-		Cfg: cfg, Loop: l, Model: &model.Sushi{Model: modelName}, ConfigName: "mini",
+	return openWithOptions(t, a, GUIOptions{
+		Cfg: newConfig(mode), Model: &model.Sushi{Model: modelName},
 	})
+}
+
+// openWithOptions opens a session with the caller's own wiring; the "+" and a
+// spawn both arrive here, so a test that needs a directory, a closer or a busy job
+// registry can ask for one. Zero fields get the same scripted defaults every other
+// test session uses.
+func openWithOptions(t *testing.T, a *GUI, o GUIOptions) *GUI {
+	t.Helper()
+	if o.Cfg == nil {
+		o.Cfg = newConfig("yolo")
+	}
+	if o.Model == nil {
+		o.Model = &model.Sushi{Model: "beta"}
+	}
+	if o.Loop == nil {
+		o.Loop = &agent.Loop{Cfg: o.Cfg, Model: &model.Deterministic{}, Env: &env.Local{}}
+	}
+	g, err := a.sh.openSession(o)
 	if err != nil {
 		t.Fatalf("open session: %v", err)
 	}
 	drainPosts()
 	return g
 }
+
+// busyJobs is a registry with work still burning in it, which is how a test says
+// "this session is not safe to close" without running a turn for five seconds.
+type busyJobs struct{ live int }
+
+func (b busyJobs) JobCard(string) (JobCard, bool) { return JobCard{}, false }
+func (b busyJobs) LiveJobs() (int, error)         { return b.live, nil }
 
 // TestGUISessionsStreamIntoTheirOwnTranscripts is the hazard the step was named
 // for: one shared streamState interleaves two turns, and the merged text lands in
@@ -309,4 +332,176 @@ func labels(items []*container.TabItem) []string {
 		out[i] = it.Text
 	}
 	return out
+}
+
+// TestGUIPickerTabOpensASessionWhereTheHumanAsked is step 7.3: the "+" cannot
+// build a session on the canvas thread, so it puts a form in the strip and the
+// session opens - and takes its tab with it - after the commit. Enter in the entry
+// is the path a keyboard-first user takes, so that is what the test presses.
+func TestGUIPickerTabOpensASessionWhereTheHumanAsked(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	// The opener is called off the canvas thread, so its answer travels by channel:
+	// a captured string here is the race, not the code under test.
+	asked := make(chan string, 1)
+	a.sh.opener = func(dir string) (GUIOptions, error) {
+		asked <- dir
+		return GUIOptions{Dir: dir, TabLabel: "second repo"}, nil
+	}
+
+	// DocTabs' "+" button appends what CreateTab returns and selects it; the
+	// contract is reproduced here because the button itself is renderer-internal.
+	item := a.sh.createTab()
+	if item == nil {
+		t.Fatal("the + gave no tab")
+	}
+	a.sh.tabs.Append(item)
+	a.sh.tabs.SelectIndex(len(a.sh.tabs.Items) - 1)
+	if len(a.sh.sessions) != 1 {
+		t.Fatalf("a picker is not a session, but %d sessions are registered", len(a.sh.sessions))
+	}
+
+	entry := findEntry(t, item.Content)
+	// The entry holds what the human typed and Enter submits it; open() reads the
+	// field rather than the callback's argument, exactly as a real keystroke does.
+	entry.SetText("/tmp/second/checkout")
+	entry.OnSubmitted(entry.Text)
+	// The opening runs on a goroutine, so wait for the session and then let the
+	// posted widgets land.
+	select {
+	case got := <-asked:
+		if got != "/tmp/second/checkout" {
+			t.Fatalf("opener got %q, want the directory that was typed", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the typed directory never reached the opener")
+	}
+	waitFor(t, "the new session's tab", func() bool { return len(a.sh.sessions) == 2 })
+	if got := labels(a.sh.tabs.Items); len(got) != 2 || got[1] != "second repo" {
+		t.Errorf("strip = %v, want the picker gone and the new session in its place", got)
+	}
+	if a.sh.selected() != a.sh.sessions[1] {
+		t.Error("the tab the human asked for is not the one on screen")
+	}
+}
+
+// TestGUITabCloseStopsItsOwnSessionOnly is decision 13's per-session authority
+// surface in the strip: × ends one conversation, its jobs and its children, and
+// never a sibling.
+func TestGUITabCloseStopsItsOwnSessionOnly(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	closed := make(chan string, 2)
+	b := openWithOptions(t, a, GUIOptions{
+		TabLabel: "beta",
+		Closer:   func() error { closed <- "beta"; return nil },
+	})
+	if len(a.sh.tabs.Items) != 2 {
+		t.Fatalf("strip = %v, want two tabs", labels(a.sh.tabs.Items))
+	}
+
+	a.sh.closeTab(b.item)
+	select {
+	case got := <-closed:
+		if got != "beta" {
+			t.Errorf("closed %q, want beta", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the closed session's own closer never ran")
+	}
+	if len(a.sh.sessions) != 1 || a.sh.selected() != a {
+		t.Errorf("%d sessions left, selected %v; want alpha alone", len(a.sh.sessions), a.sh.selected())
+	}
+	if got := labels(a.sh.tabs.Items); len(got) != 1 || got[0] != "alpha" {
+		t.Errorf("strip = %v, want the closed tab removed", got)
+	}
+
+	// The last tab is the window: closing it leaves nothing to type into.
+	a.sh.closeTab(a.item)
+	if len(a.sh.sessions) != 0 || len(a.sh.tabs.Items) != 0 {
+		t.Errorf("after the last close: %d sessions, %d tabs", len(a.sh.sessions), len(a.sh.tabs.Items))
+	}
+}
+
+// TestGUITabCloseGuardsAWorkingSession is why × is not simply a removal: closing
+// cascades to a session's jobs and children, so a stray click must not end a run
+// that is twenty minutes into a training job. The second press inside the window
+// is the human meaning it.
+func TestGUITabCloseGuardsAWorkingSession(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	closed := make(chan string, 1)
+	b := openWithOptions(t, a, GUIOptions{
+		TabLabel: "busy", Jobs: busyJobs{live: 1},
+		Closer: func() error { closed <- "busy"; return nil },
+	})
+
+	a.sh.closeTab(b.item)
+	if len(a.sh.sessions) != 2 {
+		t.Fatal("a working session closed on the first press")
+	}
+	select {
+	case got := <-closed:
+		t.Fatalf("the session was stopped (%q) while the close was still being confirmed", got)
+	default:
+	}
+	if got := transcriptText(b.v.root()); !strings.Contains(got, "still working") {
+		t.Errorf("the guard said nothing to the session being closed:\n%s", got)
+	}
+
+	a.sh.closeTab(b.item)
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the second press did not close the session")
+	}
+	if len(a.sh.sessions) != 1 {
+		t.Errorf("%d sessions left after the confirming press", len(a.sh.sessions))
+	}
+}
+
+// TestGUISelectOffsetCycles: the chords exist because a narrow window scrolls tab
+// labels out of sight, and a cycle that dead-ends at the edge is not a cycle.
+func TestGUISelectOffsetCycles(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	b := openSession(t, a, "yolo", "beta")
+	c := openSession(t, a, "yolo", "gamma")
+
+	a.sh.selectOffset(1)
+	if a.sh.selected() != b {
+		t.Errorf("+1 from alpha selected %v", a.sh.selected().label())
+	}
+	a.sh.selectOffset(1)
+	if a.sh.selected() != c {
+		t.Errorf("+1 from beta selected %v", a.sh.selected().label())
+	}
+	a.sh.selectOffset(1)
+	if a.sh.selected() != a {
+		t.Errorf("+1 from the last tab did not wrap to the first")
+	}
+	a.sh.selectOffset(-1)
+	if a.sh.selected() != c {
+		t.Errorf("-1 from the first tab did not wrap to the last")
+	}
+}
+
+// findEntry digs the directory entry out of a widget tree the way the keyboard
+// would reach it.
+func findEntry(t *testing.T, o fyne.CanvasObject) *widget.Entry {
+	t.Helper()
+	if e, ok := o.(*widget.Entry); ok {
+		return e
+	}
+	if c, ok := o.(*fyne.Container); ok {
+		for _, ch := range c.Objects {
+			if e := findEntry(t, ch); e != nil {
+				return e
+			}
+		}
+	}
+	if v, ok := o.(interface{ CreateRenderer() fyne.WidgetRenderer }); ok {
+		for _, ch := range v.CreateRenderer().Objects() {
+			if e := findEntry(t, ch); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
 }

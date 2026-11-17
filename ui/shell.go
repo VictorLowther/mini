@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -9,6 +11,8 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 )
 
 // shell is the window: one Fyne app, one canvas, one tab strip, and N sessions
@@ -44,6 +48,15 @@ type shell struct {
 	// cancel that stops the wrong turn.
 	cancelItem *fyne.MenuItem
 
+	// opener assembles a session for another directory; it is the window's
+	// capability, taken from whichever GUIOptions first carried one, so every tab's
+	// "+" opens a session the same way and a spawned child needs none of it.
+	opener func(dir string) (GUIOptions, error)
+	// picker is the "+" tab awaiting a directory, or nil. It is not a session, so
+	// it lives outside sh.sessions and is the only thing removeItem may take out of
+	// the strip on its own.
+	picker *container.TabItem
+
 	// lastTitle is the window title last applied. It lives on the shell because
 	// it describes the window: a tab that is not visible may not mark its own
 	// title as applied, or it would never publish it when the human selects it.
@@ -75,21 +88,20 @@ func newShell(o GUIOptions) *shell {
 		// The thinking toggle comes back from the store; with nothing stored the
 		// transcript opens collapsed, as it always did.
 		thinking: loadThinkingShown(o.Settings),
+		opener:   o.Opener,
 	}
 	sh.window = a.NewWindow("mini")
 	sh.tabs = container.NewDocTabs()
 	sh.tabs.SetTabLocation(container.TabLocationTop)
-	// CloseIntercept is a refusal, not a teardown. DocTabs puts an × on every tab
+	// CloseIntercept is a refusal, not a teardown: DocTabs puts an × on every tab
 	// whether or not anything handles it, and close() runs the intercept
-	// *instead of* removing the item - so an unwired × deletes a tab and leaves a
-	// live session with nowhere to be seen. The per-tab quit guard owns the
-	// removal and the cascade when it lands (§7 step 7.5, decision 15,
-	// consequence 1); until then the × says so.
-	sh.tabs.CloseIntercept = func(*container.TabItem) {
-		if g := sh.selected(); g != nil {
-			g.v.noteLocal("a tab closes its session once the per-tab quit guard lands; leave with /quit for now")
-		}
-	}
+	// *instead of* removing the item (decision 15, consequence 1). So the intercept
+	// owns the whole of closing - the guard, the removal and the cascade - and
+	// nothing else in this file may remove a tab.
+	sh.tabs.CloseIntercept = sh.closeTab
+	// The "+" is a trigger, not a factory: createTab returns nil, so DocTabs
+	// appends nothing, and the tab appears when the session behind it does.
+	sh.tabs.CreateTab = sh.createTab
 	// Selecting a tab - by click, by ⌥→, by a spawn - is the moment the window's
 	// two shared resources change hands: the keyboard and the title. Without this
 	// the newly visible transcript has no focus owner (its predecessor was
@@ -306,6 +318,171 @@ func (sh *shell) toggleThinking() bool {
 	return on
 }
 
+// ------------------------------------------------------- opening and closing --
+
+// closeArmWindow is how long the first × stays remembered: long enough to press
+// again after reading the note, short enough that an old press cannot close a run
+// that started later.
+const closeArmWindow = 10 * time.Second
+
+// createTab is the strip's "+", and it returns a *picker* tab rather than a
+// session: opening one writes to the session store and asks the server for its
+// context window, none of which belongs on the canvas thread inside a widget
+// callback (decision 15, consequence 4). So the tab carries the form, and the
+// session opens from here once the human commits - which also means a failed open
+// leaves somewhere to say so, instead of a dialog that has already vanished.
+//
+// (A `dialog.NewForm` would be two fewer widgets and no picker state, but Fyne's
+// dialog package drags in a whole virtual-filesystem dependency for a one-field
+// form; the tab is the cheaper neighbour.)
+func (sh *shell) createTab() *container.TabItem {
+	if sh.opener == nil {
+		if g := sh.selected(); g != nil {
+			g.v.noteLocal("this window cannot open another session")
+		}
+		return nil
+	}
+	if sh.picker != nil {
+		sh.tabs.Select(sh.picker) // one picker at a time; show the one already open
+		return nil
+	}
+	dir := widget.NewEntry()
+	dir.PlaceHolder = "/path/to/another/checkout"
+	if g := sh.selected(); g != nil {
+		dir.Text = g.dir
+	}
+	open := func() {
+		text := strings.TrimSpace(dir.Text)
+		if text == "" {
+			dir.SetText("")
+			dir.PlaceHolder = "a directory is needed to open a session"
+			return
+		}
+		item := sh.picker
+		sh.picker = nil
+		sh.removeItem(item)
+		go sh.openSessionAt(text)
+	}
+	dir.OnSubmitted = func(string) { open() }
+	buttons := container.NewHBox(
+		widget.NewButtonWithIcon("Open", theme.ConfirmIcon(), open),
+		widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
+			item := sh.picker
+			sh.picker = nil
+			sh.removeItem(item)
+			sh.restoreFocus()
+		}),
+	)
+	content := container.NewBorder(nil, buttons, nil, nil,
+		container.NewVBox(widget.NewLabel("Open a session in this working directory:"), dir))
+	sh.picker = container.NewTabItem("new session", content)
+	return sh.picker
+}
+
+// openSessionAt opens one session in dir and puts it in a tab. Any goroutine: the
+// opening blocks, so it is never called from the canvas, and only the widget work
+// is posted back - the same shape a spawned child arrives by, except that the
+// human asked for this tab and so it is selected.
+func (sh *shell) openSessionAt(dir string) {
+	o, err := sh.opener(dir)
+	if err == nil {
+		var g *GUI
+		g, err = sh.openSession(o)
+		if err == nil {
+			sh.post(func() { sh.selectTab(g) })
+			return
+		}
+	}
+	msg := "could not open a session in " + dir + ": " + err.Error()
+	sh.post(func() {
+		sh.restoreFocus()
+		if g := sh.selected(); g != nil {
+			g.v.noteLocal(msg)
+		}
+	})
+}
+
+// closeTab is a tab's ×, and it owns the teardown: the guard, the removal, and the
+// session's own ending. × on a session that is still working needs a second press,
+// because closing cascades - the session's turn, its background jobs and its
+// children all go with it (decision 11) - and a stray click must not end a run
+// twenty minutes into a training job. The transcript survives either way: it is in
+// the store, and the tab is only a view of it.
+func (sh *shell) closeTab(item *container.TabItem) {
+	g := sh.sessionOf(item)
+	if g == nil {
+		if item == sh.picker { // an abandoned picker closes like the form it is
+			sh.picker = nil
+			sh.removeItem(item)
+			sh.restoreFocus()
+		}
+		return
+	}
+	if (g.loopRunning() || g.liveJobs() > 0) && time.Since(g.closeArmed) > closeArmWindow {
+		g.closeArmed = time.Now()
+		g.v.noteLocal("this session is still working: press × again to stop it and close its tab")
+		return
+	}
+	sh.removeTab(g)
+	if g.closer != nil {
+		// Quit blocks through the unwind; the window stays responsive and the
+		// session's ending is recorded by host, not by this view.
+		go func() { _ = g.closer() }()
+	}
+}
+
+// removeItem takes one item out of the strip. Every removal goes through here,
+// including the ones DocTabs would otherwise do itself, so the strip and
+// sh.sessions cannot drift apart (decision 15, consequence 1).
+func (sh *shell) removeItem(item *container.TabItem) {
+	if item == nil {
+		return
+	}
+	sh.tabs.RemoveIndex(slices.Index(sh.tabs.Items, item))
+}
+
+// removeTab takes the tab out and lands the strip on a neighbour, or ends the
+// window when nothing is left to show. Selecting before DocTabs has finished
+// reshuffling is deliberate: consequence 3 of decision 15 is that a removal leaves
+// the highlighted item and the content to be re-resolved by the caller.
+func (sh *shell) removeTab(g *GUI) {
+	i := slices.Index(sh.sessions, g)
+	if i < 0 {
+		return
+	}
+	sh.sessions = slices.Delete(sh.sessions, i, i+1)
+	sh.removeItem(g.item)
+	g.item = nil
+	if len(sh.sessions) == 0 {
+		sh.quit()
+		return
+	}
+	sh.selectTab(sh.sessions[min(i, len(sh.sessions)-1)])
+}
+
+// restoreFocus puts the caret back in the visible session's input, which is what a
+// dismissed dialog needs: Fyne leaves focus nowhere when the modal goes away, and
+// the tab's own deferred reclaim cannot see a loss it did not cause.
+func (sh *shell) restoreFocus() {
+	if g := sh.selected(); g != nil {
+		g.v.focusEditor()
+	}
+}
+
+// selectOffset moves the strip by d tabs and wraps, so ⌥→ and ⌥← cycle instead of
+// dead-ending at the last tab.
+func (sh *shell) selectOffset(d int) {
+	n := len(sh.sessions)
+	if n < 2 {
+		return
+	}
+	i := slices.Index(sh.sessions, sh.selected())
+	if i < 0 {
+		i = 0
+	}
+	sh.selectTab(sh.sessions[(i+d+n)%n])
+}
+
 // ------------------------------------------------------------------- menus --
 
 func (sh *shell) menus() *fyne.MainMenu {
@@ -352,7 +529,23 @@ func (sh *shell) menus() *fyne.MainMenu {
 		}
 		g.v.noteLocal("Current mode: " + g.cfg.Mode + "\n" + helpText)
 	})
+	// Session is the strip's own commands. The chords exist because the labels
+	// scroll out of sight on a narrow window, and closing needs a keyboard path
+	// now that × answers to it (decision 13's "this session only, never a
+	// sibling").
+	next := fyne.NewMenuItem("Next session", func() { sh.selectOffset(1) })
+	next.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyRight, Modifier: fyne.KeyModifierAlt}
+	prev := fyne.NewMenuItem("Previous session", func() { sh.selectOffset(-1) })
+	prev.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyLeft, Modifier: fyne.KeyModifierAlt}
+	closeItem := fyne.NewMenuItem("Close session", func() {
+		if g := sh.selected(); g != nil {
+			sh.closeTab(g.item)
+		}
+	})
+	closeItem.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyW, Modifier: fyne.KeyModifierShortcutDefault}
+
 	return fyne.NewMainMenu(run, fyne.NewMenu("Edit", copyItem),
+		fyne.NewMenu("Session", next, prev, fyne.NewMenuItemSeparator(), closeItem),
 		fyne.NewMenu("View", thinking), fyne.NewMenu("Help", commands))
 }
 

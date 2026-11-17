@@ -1381,16 +1381,18 @@ push).
       session writes into the transcript the human is reading. It landed as
       `shell` (the window) plus a `GUI` that *is* one tab, because `ui.UI` was
       already the per-session contract; same seam, one fifth of the renaming.
-   3. `CreateTab` to open a top-level session, with a working-directory picker,
-      because a tab whose repository you cannot choose is a tab you cannot use.
+   3. **Built (§8.5).** `CreateTab` to open a top-level session, with a
+      working-directory picker, because a tab whose repository you cannot choose is
+      a tab you cannot use.
    4. **Built (§8.4).** A child-created callback on `Process`, so a spawn opens its
       tab. Polling `Children()` would work and is wrong: it makes the UI guess.
       This is also where decision 13 was re-ruled (attended-ness follows the front
       end), where `Session.unattended` went, and where `Spawn`'s hook-assignment
       race - and the comment that denied it - were fixed.
-   5. Status and attention markers in the label, `⌥→`/`⌥←`, and the per-tab quit
-      guard through `CloseIntercept` - which per decision 15 must own the removal
-      and the cascade itself.
+   5. **Built (§8.4, §8.5)** the attention marker came with the routing; the rest
+      here too: status and attention markers in the label, `⌥→`/`⌥←`, and the
+      per-tab quit guard through `CloseIntercept` - which per decision 15 owns the
+      removal and the cascade itself.
    6. Split the slash commands into tab-level and window-level, and re-issue
       §5.13's batched cancel across N sessions instead of one `runCtx`.
 
@@ -2023,6 +2025,63 @@ human selects the tab. Nothing else will tell a person that a child is parked
 waiting on them - which is what makes routing affordable over bubbling in the first
 place.
 
+### 8.5 Step 7.3 and 7.5: the "+" opens a repository, and × closes one
+
+The strip is now reversible in both directions: a human can start a session they
+did not type a command for, and stop one without stopping its siblings.
+
+**Two ports, no `host` import in `ui`.** `GUIOptions.Closer func() error` and
+`GUIOptions.Opener func(dir string) (GUIOptions, error)` are the whole seam, and
+`cmd/mini`'s `sessionGUI(hs, configName)` is the single mapping from a
+`host.Session` to a front end. Three paths go through it - the CLI's own session, a
+spawned subagent, and a second repository picked in the window - so none of them
+can be wired differently by accident, and `ui` still does not know what a `Process`
+is. `host.Session.OpenSibling(workdir, project)` is `Spawn`'s existing config clone
+(`cloneConfig`, §9.8) with the intent named: same merged config, no lineage,
+top-level and resumable, no inherited trajectory path or resume id.
+
+**The "+" is a picker tab, as decision 15 prescribed.** `CreateTab` returns the tab
+and DocTabs appends-and-selects it; the session opens on a goroutine after the
+commit, and its tab replaces the picker. The first attempt here used
+`dialog.NewForm`, which is two fewer widgets and no picker state - and pulls
+`github.com/FyshOS/fancyfs` into the build for a one-field form, because Fyne's
+dialog package carries the file choosers with it. The picker tab is both the
+plan's shape and the cheaper neighbour, so the dialog is gone.
+
+**Every removal funnels through `removeItem`**, because the intercept suppresses
+DocTabs' own removal (consequence 1) and two owners of the strip is how `sessions`
+and `tabs` start disagreeing. `removeTab` selects a neighbour after removing, which
+is the other half of consequence 3.
+
+**Closing is per session and needs a second press when the session is working.**
+× on a session with a turn in flight or live jobs notes it in *that* session's
+transcript and arms for ten seconds; the next press removes the tab and runs the
+closer, which is `host.Session.Quit` - turn, jobs and children together (decision
+11), recorded by `host` rather than by the view. An idle session closes on one
+press: its transcript is already durable in the store, and the tab is only a view of
+it. The closer runs on a goroutine because `Quit` blocks through the batched unwind,
+and the window must not freeze while a session's processes are herded. Closing the
+last tab ends the window, which is the only way × reaches `app.Quit`.
+
+`Session` menu: **⌥→** / **⌥←** cycle the strip (wrapping - a dead end at the last
+tab is not a cycle) and **⌘W** closes the visible one. Chords exist because a
+narrow window scrolls labels out of the strip, and because × now means something a
+stray click should not be able to do silently.
+
+Tests (`ui/shell_test.go`): the picker's Enter reaches the opener with the typed
+directory and the new session's tab lands selected; × calls *only* the closed
+session's closer and the last close empties the strip; a working session survives
+the first press and dies on the second; `selectOffset` wraps in both directions.
+The guard and the closer are each verified by disabling them and watching the
+corresponding test fail.
+
+Still owed by step 7: **7.6** - the slash commands split into tab-level and
+window-level, and §5.13's batched cancel expressed across N sessions rather than the
+one `runCtx` `shell.quit` cancels today - plus the roster's remaining debts:
+per-session **pause** (`CancelTurn` exists on the session; nothing exposes it as a
+pause) and a view of a session's **outstanding jobs** endable independently of the
+session that started them, which is what makes §5.10's deliberate "no auto-kill"
+residue visible.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

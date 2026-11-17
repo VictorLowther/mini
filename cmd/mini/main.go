@@ -336,12 +336,12 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return exitCode(info, err)
 	}
 
-	g := ui.NewGUI(ui.GUIOptions{
-		Cfg: r.AgentCfg, Loop: r.Loop, Model: r.Model,
-		ConfigName: r.ConfigName, LogWriter: logTarget, App: a,
-		Settings: r.Store,
-		Jobs:     jobReader(r.Jobs),
-	})
+	// `o` is the parsed CLI options here, so the front end's own gets a word.
+	guiOpts := sessionGUI(r.HS, r.ConfigName)
+	guiOpts.LogWriter, guiOpts.App, guiOpts.Settings = logTarget, a, r.Store
+	// What the strip's "+" does: opens another top-level session beside this one.
+	guiOpts.Opener = r.openSibling
+	g := ui.NewGUI(guiOpts)
 	// A stalled window with no explanation is indistinguishable from a crash,
 	// so the retry schedule goes into the transcript.
 	r.Model.OnRetry = func(attempt, max int, err error, wait time.Duration) {
@@ -361,11 +361,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// know a UI exists; an error refuses the spawn rather than running a child
 	// nobody can answer.
 	r.Proc.OnChild = func(cs *host.Session) error {
-		m, _ := cs.Model.(*model.Sushi)
-		_, err := g.OpenSession(ui.GUIOptions{
-			Cfg: cs.Cfg, Loop: cs.Loop, Model: m, ConfigName: r.ConfigName,
-			Jobs: jobReader(cs.Jobs), TabLabel: cs.Name,
-		})
+		_, err := g.OpenSession(sessionGUI(cs, r.ConfigName))
 		return err
 	}
 	g.SetSessionID(r.Sess.ID.String())
@@ -376,6 +372,35 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "Saved trajectory to '%s'\n", r.AgentCfg.OutputPath)
 	fmt.Fprintf(stderr, "Session %s — resume with mini -r %s\n", r.Sess.ID, r.Sess.ID)
 	return exitCode(info, err)
+}
+
+// sessionGUI is how any session in this process reaches the window: the top-level
+// one at startup, a spawned subagent, and a second repository the human picked
+// from the strip all come through here, so no path can wire a session differently
+// by accident. Window-level options - app, log target, settings, the opener - are
+// the shell's and are set once, where the window is built.
+func sessionGUI(hs *host.Session, configName string) ui.GUIOptions {
+	m, _ := hs.Model.(*model.Sushi)
+	return ui.GUIOptions{
+		Cfg: hs.Cfg, Loop: hs.Loop, Model: m, ConfigName: configName,
+		Jobs:     jobReader(hs.Jobs),
+		Dir:      hs.Workdir,
+		Closer:   hs.Quit,
+		TabLabel: hs.Name,
+	}
+}
+
+// openSibling starts another top-level session in the directory the human chose,
+// from the configuration this one was assembled with, and blocks doing it: the
+// session row is written and the context window discovered before anything can be
+// drawn. The window calls it from a goroutine for exactly that reason.
+func (r *miniRun) openSibling(dir string) (ui.GUIOptions, error) {
+	workdir, project := projectOf(dir)
+	hs, err := r.HS.OpenSibling(workdir, project)
+	if err != nil {
+		return ui.GUIOptions{}, err
+	}
+	return sessionGUI(hs, r.ConfigName), nil
 }
 
 // The store's settings table is the front ends' sticky state (ui/prefs.go):
@@ -405,7 +430,10 @@ type miniRun struct {
 	// handle on it: `Proc.OnChild` is what opens a tab when the model spawns a
 	// subagent (§7 step 7.4). Holding it here is what lets a second session be
 	// opened without one CLI invocation per conversation.
-	Proc       *host.Process
+	Proc *host.Process
+	// HS is this run's session inside Proc: what a second session is cloned from
+	// and how the tab's × stops this one.
+	HS         *host.Session
 	ResumeMsgs []model.Message
 	ResumeNote string
 	ConfigName string
@@ -509,7 +537,7 @@ func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTar
 
 	return &miniRun{
 		O: o, AgentCfg: hs.Cfg, Model: sushi, Env: hs.Env, Loop: hs.Loop,
-		Sess: hs.Sess, Store: store, Jobs: hs.Jobs, Proc: proc,
+		Sess: hs.Sess, Store: store, Jobs: hs.Jobs, Proc: proc, HS: hs,
 		ResumeMsgs: hs.ResumeMsgs, ResumeNote: hs.ResumeNote,
 		ConfigName: configName, LogTarget: logTarget,
 		// Reaping rides the one cleanup path both front ends already share, and

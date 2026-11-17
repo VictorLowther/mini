@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,19 @@ type GUIOptions struct {
 	// TabLabel names this session's tab when the caller has a better name than the
 	// model: a spawned subagent is known by the name its parent gave it.
 	TabLabel string
+	// Dir is the working directory this session runs in. It is what tells two
+	// top-level tabs apart, and what the strip's "+" opens a new session beside.
+	Dir string
+	// Closer ends this session - its turn, its jobs, its children - and blocks
+	// through the unwind, so its caller runs it off the canvas thread. nil means
+	// the window has no way to stop what it is showing, and closing the tab then
+	// only takes the tab away.
+	Closer func() error
+	// Opener assembles a session for another working directory. It belongs to the
+	// window rather than to the session that carried it first: opening a session
+	// writes to the session store and asks the server for its context window, so
+	// the caller must run it off the canvas thread and post what comes back.
+	Opener func(dir string) (GUIOptions, error)
 	// Jobs reads the registry for the cards of calls that handed off, so the
 	// window can keep them live until the job ends. nil leaves the cards
 	// truthful but static.
@@ -73,7 +87,14 @@ type GUI struct {
 	// label says with a leading marker because a tab is the only surface a
 	// background session has.
 	needsAttention bool
-	v              *guiView
+	// dir and closer come from GUIOptions: where this session runs, and how to
+	// stop it.
+	dir    string
+	closer func() error
+	// closeArmed is when × last refused to close a working session; a second press
+	// inside the window closes it (see shell.closeTab).
+	closeArmed time.Time
+	v          *guiView
 
 	cfg        *agent.Config
 	loop       *agent.Loop
@@ -168,6 +189,8 @@ func newSession(sh *shell, o GUIOptions) *GUI {
 		configName: o.ConfigName,
 		jobs:       o.Jobs,
 		tabLabel:   o.TabLabel,
+		dir:        o.Dir,
+		closer:     o.Closer,
 		runDone:    make(chan struct{}),
 	}
 	if o.Model != nil {
@@ -221,7 +244,14 @@ func (g *GUI) InstallHooks() error {
 func (g *GUI) label() string {
 	text := g.tabLabel
 	if text == "" {
-		text = g.modelName
+		// The repository is what tells two top-level tabs apart; the model is
+		// already in the transcript header and the footer, and a strip that
+		// repeats it tells nobody which window is which checkout.
+		if base := filepath.Base(g.dir); base != "" && base != "." && base != string(filepath.Separator) {
+			text = base
+		} else {
+			text = g.modelName
+		}
 	}
 	if text == "" {
 		text = "session"
