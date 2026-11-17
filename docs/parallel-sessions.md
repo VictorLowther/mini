@@ -1393,8 +1393,12 @@ push).
       here too: status and attention markers in the label, `⌥→`/`⌥←`, and the
       per-tab quit guard through `CloseIntercept` - which per decision 15 owns the
       removal and the cascade itself.
-   6. Split the slash commands into tab-level and window-level, and re-issue
-      §5.13's batched cancel across N sessions instead of one `runCtx`.
+   6. **Built (§8.6).** Split the slash commands into tab-level and window-level,
+      and re-issue §5.13's batched cancel across N sessions instead of one `runCtx`.
+      The cancel became a loop over per-session contexts with step 7.2; what landed
+      here is the scoping said out loud in help, and a leaving that arms while any
+      session has work running. The roster's pause and per-job end are still owed,
+      and §8.6 says why neither belongs in this step.
 
    Still owed to the roster, and tabs must not lose it: per-session **pause and
    kill** (§5.7's starvation mitigation is what made that ruling affordable), and
@@ -2082,6 +2086,41 @@ per-session **pause** (`CancelTurn` exists on the session; nothing exposes it as
 pause) and a view of a session's **outstanding jobs** endable independently of the
 session that started them, which is what makes §5.10's deliberate "no auto-kill"
 residue visible.
+### 8.6 Step 7.6: what each command acts on, and a leaving that says so
+
+Half of this increment was already true by construction once a session owned its
+own state (`/y /c /u`, `/compact`, `/m` and steering all reach one `GUI`; `/t` and
+`/quit` reach the `shell`), and the batched cancel of §5.13 became a loop over every
+session's `cancelRun` in `shell.quit` the same day the run context moved per session.
+What was left is the part a reader can actually get wrong, so it is now said out loud
+in both places a command list is shown.
+
+**Tab-level:** `/y`, `/c`, `/u` (this session's mode), `/compact` (this session's
+context), `/m`, `/h`, and prose steering. **Window-level:** `/t` (one sticky thinking
+preference, rebuilt across every tab in one pass), `⌥→`/`⌥←`, `⌘W` for the visible
+tab, and quitting - `⌘Q`, `/quit`, the close button. The GUI appends `guiScopeNote`
+after the shared `helpText` in `/h` and in `Help ▸ Commands`; print mode's help is
+untouched, because a printed transcript has no windows to explain and its help must
+not start talking about tabs it does not have.
+
+**Leaving with work in flight is armed, like `×`.** One `⌘Q` now ends several
+conversations, so the first press notes in *each* working session's transcript that
+it is one of N with work running, and a second press inside ten seconds goes through
+and cancels every run in the batch. The veto is only possible because of which
+callback does what: glfw's `processClosed` runs `onCloseIntercepted` **instead of**
+closing the window, while `Close()` fires `onClosed` and then closes regardless
+(`internal/driver/glfw/window.go`). `SetOnClosed` alone could never have refused a
+close, so the shell sets both - the intercept to guard, `onClosed` for the paths that
+close it programmatically.
+
+**Still owed, deliberately not in this step.** The roster's two debts are their own
+work, not leftovers: a per-session **pause** has nothing to call - `CancelTurn` ends
+a turn and `Quit` ends the session, while "stay open, take no next turn" is a `host`
+concept that does not exist yet - and a human-endable view of a session's
+**outstanding jobs** needs a per-run end on `job.Manager` (it has `KillAll` and the
+model-facing `job_kill` path, no human-facing single kill). Shipping a "pause" that
+is really a cancel, or a job list whose buttons lie, is the kind of thing this
+document exists to record as *not finished*.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

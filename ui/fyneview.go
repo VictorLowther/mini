@@ -1569,6 +1569,16 @@ func (v *guiView) handleInput(text string) {
 // here, it is a keystroke.
 const guiMultilineHint = "multi-line input is not a mode here: shift+enter adds a newline, enter sends"
 
+// guiScopeNote is what the window adds to the shared help block: with a tab per
+// session, the question a command raises is no longer only what it does but what it
+// acts on, and print mode's help - same package, one transcript, no tabs - must not
+// start talking about windows it does not have.
+const guiScopeNote = `
+with tabs: /y /c /u, /compact and steering act on this session only; /t, ⌥→/⌥← and
+quitting act on the whole window; ⌘W or × closes this session - and both × and
+quitting take a second press while work is running, because closing a session takes
+its background jobs and its subagents with it.`
+
 // slash applies the /y /c /u /h commands, printing their feedback into the
 // transcript. /compact is intercepted here too: at a pending prompt the
 // shared slash handling would otherwise feed it to the answer path (a
@@ -1578,9 +1588,16 @@ func (v *guiView) slash(text string) (string, bool) {
 		v.requestCompaction()
 		return "", true
 	}
-	return slash(v.gui.cfg, text, viewWriter{v}, func() string {
+	resolved, reprompt := slash(v.gui.cfg, text, viewWriter{v}, func() string {
 		return text
 	})
+	if text == "/h" {
+		// A printed transcript has one session, so the shared help block cannot
+		// say what a command acts on. In a window it matters: /t and /quit reach
+		// every tab, the rest answer for the one being typed in.
+		v.noteLocal(strings.TrimPrefix(guiScopeNote, "\n"))
+	}
+	return resolved, reprompt
 }
 
 type viewWriter struct{ v *guiView }

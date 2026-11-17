@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -52,6 +53,9 @@ type shell struct {
 	// capability, taken from whichever GUIOptions first carried one, so every tab's
 	// "+" opens a session the same way and a spawned child needs none of it.
 	opener func(dir string) (GUIOptions, error)
+	// quitArmed is when quit() last refused to tear down a window with work in
+	// flight; a second press inside closeArmWindow is allowed to.
+	quitArmed time.Time
 	// picker is the "+" tab awaiting a directory, or nil. It is not a session, so
 	// it lives outside sh.sessions and is the only thing removeItem may take out of
 	// the strip on its own.
@@ -123,6 +127,10 @@ func newShell(o GUIOptions) *shell {
 	// The saved size is the user's, applied before Show so the window opens at the
 	// size it closed at instead of cascading one resize in front of them.
 	sh.window.Resize(loadWindowSize(o.Settings))
+	// The window's own close is intercepted rather than merely observed: glfw runs
+	// the intercept *instead of* closing (window.go processClosed), which is the
+	// only way quit()'s guard can veto ending several sessions with one keystroke.
+	sh.window.SetCloseIntercept(sh.quit)
 	sh.window.SetOnClosed(sh.quit)
 	return sh
 }
@@ -246,6 +254,18 @@ func (sh *shell) tickAll(stop <-chan struct{}) {
 	}
 }
 
+// busySessions is the batched cancel's input: which sessions have a turn running or
+// work handed off to the registry.
+func (sh *shell) busySessions() []*GUI {
+	var busy []*GUI
+	for _, g := range sh.sessions {
+		if g.loopRunning() || g.liveJobs() > 0 {
+			busy = append(busy, g)
+		}
+	}
+	return busy
+}
+
 // idle reports a session with no turn in flight and nothing running: the footer
 // cannot change, so the tick has nothing to do for it.
 func (g *GUI) idle() bool { return !g.loopRunning() && g.liveJobs() == 0 }
@@ -255,6 +275,20 @@ func (g *GUI) idle() bool { return !g.loopRunning() && g.liveJobs() == 0 }
 // session, and the sticky state is written while the window still has a size to
 // read.
 func (sh *shell) quit() {
+	// Leaving is deliberate - /quit, ⌘Q, the window's close button - but with a tab
+	// per session one keystroke can now end several conversations, and the batched
+	// cancel must not be silent about it: the first press reports how much work is
+	// in flight in every session that has some, and the second within the window
+	// goes through (§5.13, armed exactly like a tab's ×).
+	if busy := sh.busySessions(); len(busy) > 0 && time.Since(sh.quitArmed) > closeArmWindow {
+		sh.quitArmed = time.Now()
+		for _, g := range busy {
+			g.v.noteLocal(fmt.Sprintf(
+				"this session is still working: quit again within %d seconds to stop it and leave (%d of %d sessions working)",
+				int(closeArmWindow/time.Second), len(busy), len(sh.sessions)))
+		}
+		return
+	}
 	sh.mu.Lock()
 	if sh.quitting {
 		sh.mu.Unlock()
@@ -527,7 +561,7 @@ func (sh *shell) menus() *fyne.MainMenu {
 		if g == nil {
 			return
 		}
-		g.v.noteLocal("Current mode: " + g.cfg.Mode + "\n" + helpText)
+		g.v.noteLocal("Current mode: " + g.cfg.Mode + "\n" + helpText + guiScopeNote)
 	})
 	// Session is the strip's own commands. The chords exist because the labels
 	// scroll out of sight on a narrow window, and closing needs a keyboard path

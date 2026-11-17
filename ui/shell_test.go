@@ -505,3 +505,32 @@ func findEntry(t *testing.T, o fyne.CanvasObject) *widget.Entry {
 	}
 	return nil
 }
+
+// TestGUIQuitGuardsWorkInFlight: with a tab per session, one ⌘Q can end several
+// conversations, so the batched cancel is armed like a tab's × - the first press
+// reports what is in flight, in the transcript of every session that has work, and
+// the second within the window goes through.
+func TestGUIQuitGuardsWorkInFlight(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	b := openWithOptions(t, a, GUIOptions{TabLabel: "busy", Jobs: busyJobs{live: 2}})
+
+	a.sh.quit()
+	if a.sh.quitting {
+		t.Fatal("the window quit on the first press with a session working")
+	}
+	if len(a.sh.sessions) != 2 {
+		t.Fatalf("%d sessions after the refusal, want both left alone", len(a.sh.sessions))
+	}
+	if got := transcriptText(b.v.root()); !strings.Contains(got, "still working") ||
+		!strings.Contains(got, "1 of 2 sessions working") {
+		t.Errorf("the working session was not told what is waiting on it:\n%s", got)
+	}
+	if got := transcriptText(a.v.root()); strings.Contains(got, "still working") {
+		t.Errorf("an idle session was warned about work it has none of:\n%s", got)
+	}
+
+	a.sh.quit()
+	if !a.sh.quitting {
+		t.Error("the second press did not leave")
+	}
+}
