@@ -2123,15 +2123,31 @@ actually changed. A subagent running a twenty-minute training job and a subagent
 has gone quiet must not read identically, and the strip is the only place a session
 that is not on screen can say anything at all.
 
-**Still owed, deliberately not in this step.** The roster's remaining debts are their
-own work, not leftovers: a per-session **pause** has nothing to call - `CancelTurn`
-ends a turn and `Quit` ends the session, while "stay open, take no next turn" is a
-`host` concept that does not exist yet - and *ending* a session's outstanding jobs
-from the window needs a per-run end on `job.Manager` (it has `KillAll` and the
-model-facing `job_kill` path, no human-facing single kill), so the cards can now show
-the residue but cannot yet act on it. Shipping a "pause" that is really a cancel, or
-a job list whose buttons lie, is the kind of thing this document exists to record as
-*not finished*.
+**Still owed, deliberately not in this step.** Two debts, and the honest state of
+each:
+
+- *Ending an outstanding job from the window.* The capability is **already
+  exported** - `Manager.Get(id)` (`job/job.go:363`) and `(*Run).Kill()`
+  (`job/job.go:308`) are exactly what `job_kill` reaches through - so what is
+  missing is not a `host` or `job` API but the surface, plus a decision about where
+  it belongs: a button on each running card (which turns the card from one text
+  widget into a container, against the single-widget promise the ten-line cap in §8
+  depends on), or one window-level jobs view listing every session's runs. The
+  labels and cards report the residue; they cannot yet act on it.
+- *Per-session pause.* §5.7 accepted starvation and named "per-session pause and
+  kill" as the remedy that made that affordable; the **kill half now exists**
+  (`Run ▸ Cancel turn`, `×`, which cascades). The pause half has no referent under
+  the current loop model: `CancelTurn` ends the turn in flight, `Quit` ends the
+  session, and a session between turns is already idle - there is no
+  suspended-but-live state to enter. A subagent cannot be paused from its own window
+  at all, because it is driven by its parent's job wrapper, and what §5.7 was really
+  worried about - a background session holding gate slots - is answered by killing
+  it or by the gate's own bound, not by a hold button. Recommendation: retire pause
+  as satisfied by kill, or re-scope it explicitly to gate priority.
+
+Shipping a "pause" that is really a cancel, or a job list whose buttons lie, is the
+kind of thing this document exists to record as *not finished*.
+
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that
