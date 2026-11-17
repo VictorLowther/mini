@@ -2,8 +2,10 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -249,5 +251,39 @@ func TestSushiDefaultsToTheSharedGate(t *testing.T) {
 	}
 	if DefaultGate.Limit() != DefaultMaxConcurrentRequests {
 		t.Errorf("DefaultGate limit = %d, want %d", DefaultGate.Limit(), DefaultMaxConcurrentRequests)
+	}
+}
+
+// TestRequestBodyCarriesTheAdvertisedTools closes the last link of §5.6: the set
+// host chooses per kind has to be the set that actually goes over the wire. The
+// prompt listing and the parser's acceptance are asserted elsewhere against the
+// same ToolSet; if this one drifted, a session would be told about a tool it
+// cannot call, or handed a tool its instructions never mentioned.
+func TestRequestBodyCarriesTheAdvertisedTools(t *testing.T) {
+	body := func(set ToolSet) string {
+		s := &Sushi{Model: "m", Tools: set}
+		b, err := json.Marshal(s.requestBody([]Message{{"role": "user", "content": "go"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	top := body(TopLevelTools())
+	for _, want := range []string{`"bash"`, `"jobs"`, `"job_kill"`, `"agent"`, `"job_send"`} {
+		if !strings.Contains(top, want) {
+			t.Errorf("a top-level request body is missing tool %s", want)
+		}
+	}
+	sub := body(SubagentTools())
+	if strings.Contains(sub, `"name":"agent"`) {
+		t.Error("a subagent's request body advertises the spawn tool")
+	}
+	if !strings.Contains(sub, `"bash"`) {
+		t.Error("a subagent's request body lost bash")
+	}
+	// The zero value must not send an empty array, which would leave a
+	// hand-built client with no tools at all.
+	if !strings.Contains(body(nil), `"bash"`) {
+		t.Error("the zero ToolSet sent no tools")
 	}
 }
