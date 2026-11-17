@@ -1156,7 +1156,7 @@ func TestGUITranscriptIsAShellSessionNotJSON(t *testing.T) {
 func TestGUIToolCardScrollsPastTenLines(t *testing.T) {
 	lineH := float32(0)
 	{
-		one := transcriptGrid([]string{"a"}).(*container.Scroll).Content.(*widget.Label)
+		one := transcriptGrid([]string{"a"}).(*container.Scroll).Content.(*widget.RichText)
 		lineH = one.MinSize().Height
 	}
 	short := transcriptGrid([]string{"1", "2", "3"}).(*container.Scroll)
@@ -1168,17 +1168,17 @@ func TestGUIToolCardScrollsPastTenLines(t *testing.T) {
 	if got, capH := long.MinSize().Height, 10*lineH; got > capH+1 {
 		t.Errorf("40-line card min height = %v, want the 10-line cap %v", got, capH)
 	}
-	if content := long.Content.(*widget.Label).MinSize().Height; content <= long.MinSize().Height {
+	if content := long.Content.(*widget.RichText).MinSize().Height; content <= long.MinSize().Height {
 		t.Errorf("40-line content height %v is not above its %v viewport: nothing would scroll",
 			content, long.MinSize().Height)
 	}
 	// The single-widget promise behind the cap: the body is one text widget, so
-	// capping is one MinSize, not a walk over materialized rows. It is a Label
-	// and not a RichText because only Label and Entry can select, and the card
-	// body has to be copyable - see TestGUICardTextSelectsAndCopies, which is the
-	// test that checks the promise that matters rather than this type assertion.
-	if _, ok := long.Content.(*widget.Label); !ok {
-		t.Errorf("card content = %T, want a single selectable Label", long.Content)
+	// capping is one MinSize, not a walk over materialized rows - and it is the
+	// selectable RichText the cards need, so the cap never costs the reader a
+	// copy. See TestGUICardTextSelectsAndCopies, which checks the promise that
+	// matters rather than this type assertion.
+	if _, ok := long.Content.(*widget.RichText); !ok {
+		t.Errorf("card content = %T, want a single selectable RichText", long.Content)
 	}
 }
 
@@ -1496,15 +1496,59 @@ func TestGUIRunningCardYieldsToAPrompt(t *testing.T) {
 	<-asked
 }
 
+// selector is the part of Fyne's internal selection a test has to drive by hand:
+// widget.selectable is unexported, so the only way in from outside package widget
+// is the child object every selectable text widget puts in its own renderer.
+type selector interface {
+	MouseDown(*desktop.MouseEvent)
+	Dragged(*fyne.DragEvent)
+	DragEnd()
+	TypedShortcut(fyne.Shortcut)
+	SelectedText() string
+}
+
+// selectionOf finds a selectable text widget's selection child.
+func selectionOf(t *testing.T, w fyne.CanvasObject) selector {
+	t.Helper()
+	for _, o := range test.WidgetRenderer(w.(fyne.Widget)).Objects() {
+		if s, ok := o.(selector); ok {
+			return s
+		}
+	}
+	t.Fatalf("%T has no selectable child: Selectable was not set, or Fyne moved the selection widget", w)
+	return nil
+}
+
+// dragSelect selects text across an already-laid-out text widget with the mouse
+// and returns what the widget says is selected.
+//
+// Two traps this sidesteps, both of which reported the feature broken when it was
+// fine: the widget must be sized and refreshed first, because a RichText with
+// stale row bounds collapses every position onto one character; and Dragged must
+// carry the pointer's *position*, not just the delta, because the selection tracks
+// the pointer and an anchor-to-anchor drag selects nothing.
+func dragSelect(t *testing.T, w fyne.CanvasObject, width, fromX, toX float32) string {
+	t.Helper()
+	w.Resize(fyne.NewSize(width, 60))
+	w.Refresh()
+	s := selectionOf(t, w)
+	s.MouseDown(&desktop.MouseEvent{Button: desktop.MouseButtonPrimary,
+		PointEvent: fyne.PointEvent{Position: fyne.NewPos(fromX, 4)}})
+	s.Dragged(&fyne.DragEvent{PointEvent: fyne.PointEvent{Position: fyne.NewPos(toX, 4)},
+		Dragged: fyne.Delta{DX: toX - fromX, DY: 0}})
+	s.DragEnd()
+	return s.SelectedText()
+}
+
 // TestGUICardTextSelectsAndCopies drives a real selection through the widget the
 // transcript cards actually build.
 //
 // It exists because the first attempt at this feature was wrong in a way its own
 // test could not see: it swapped monoBlock to a selectable Label, asserted that
 // monoBlock returned a selectable Label, and passed - while the cards kept
-// rendering through transcriptGrid, which builds its own RichText. RichText has
-// no selection at all in Fyne, so nothing the user clicked could be copied and
-// every test stayed green. A test that checks the widget a helper returns is a
+// rendering through transcriptGrid, which built its own RichText. Selection did
+// not exist on RichText then at all, so nothing the user clicked could be copied
+// and every test stayed green. A test that checks the widget a helper returns is a
 // test of the helper; this one goes to the card, selects in it the way a mouse
 // does, and asks the clipboard what arrived.
 func TestGUICardTextSelectsAndCopies(t *testing.T) {
@@ -1521,85 +1565,151 @@ func TestGUICardTextSelectsAndCopies(t *testing.T) {
 		if !ok {
 			t.Fatal("transcriptGrid is not a scroller")
 		}
-		lb, ok := sc.Content.(*widget.Label)
+		rt, ok := sc.Content.(*widget.RichText)
 		if !ok {
-			t.Fatalf("card body is %T, want *widget.Label: RichText cannot select, which is the whole bug", sc.Content)
+			t.Fatalf("card body is %T, want a selectable *widget.RichText", sc.Content)
 		}
-		if !lb.Selectable {
-			t.Fatal("card body label is not Selectable")
+		if !rt.Selectable {
+			t.Fatal("card body RichText is not Selectable")
 		}
-		if !lb.TextStyle.Monospace {
+		if !rt.Segments[0].(*widget.TextSegment).Style.TextStyle.Monospace {
 			t.Error("card body lost monospace")
 		}
 
-		// Sized before selecting, or the drag resolves to nothing: an unsized
-		// label reports a zero-size box, and a selection dragged across a
-		// zero-size box collapses to a single character - which is how this test
-		// first failed, and it looked exactly like the feature being broken.
-		lb.Resize(fyne.NewSize(320, 60))
-		lb.Refresh()
-
-		type selector interface {
-			MouseDown(*desktop.MouseEvent)
-			Dragged(*fyne.DragEvent)
-			DragEnd()
-			TypedShortcut(fyne.Shortcut)
-		}
-		var sel selector
-		for _, o := range test.WidgetRenderer(lb).Objects() {
-			if cand, ok := o.(selector); ok {
-				sel = cand
-				break
-			}
-		}
-		if sel == nil {
-			t.Fatal("no selectable child in the card body's renderer: only Label and Entry embed widget.selectable")
-		}
-		sel.MouseDown(&desktop.MouseEvent{Button: desktop.MouseButtonPrimary,
-			PointEvent: fyne.PointEvent{Position: fyne.NewPos(2, 4)}})
-		// The moved position, not just the delta: Fyne's selection tracks the
-		// pointer, so a Dragged event that repeats the anchor position selects
-		// from the anchor to the anchor - an empty string, and the reason this
-		// assertion failed the first three times.
-		sel.Dragged(&fyne.DragEvent{PointEvent: fyne.PointEvent{Position: fyne.NewPos(72, 4)},
-			Dragged: fyne.Delta{DX: 70, DY: 0}})
-		sel.DragEnd()
-
-		got := lb.SelectedText()
+		got := dragSelect(t, rt, 320, 2, 72)
 		if len([]rune(got)) < 5 {
 			t.Fatalf("selection was %q: a one-character span means the gesture is not reaching the text", got)
 		}
 		if !strings.Contains(got, want) {
 			t.Fatalf("mouse selection gave %q, want it to contain %q", got, want)
 		}
-		// And copy moves it: the same handler fyne dispatches ⌘C to once
-		// mouse-down has taken focus onto the selection.
-		sel.TypedShortcut(&fyne.ShortcutCopy{})
+		// And copy moves it: the same handler ⌘C reaches once mouse-down has taken
+		// focus onto the selection.
+		selectionOf(t, rt).TypedShortcut(&fyne.ShortcutCopy{})
 		if cb := p.app.Clipboard().Content(); !strings.Contains(cb, want) {
 			t.Errorf("clipboard holds %q, want %q", cb, want)
 		}
 	})
 }
 
-// bodyTextProps reads the two properties the RichText-only assertions used to
-// reach for, from whichever body kind the block got: a styled block is a
-// RichText whose alignment lives on its segments, an unstyled one is a
-// selectable Label with a single alignment field. Written as one helper because
-// every card body can now be either, and a test that assumes one of the two is
-// how the last copy-paste regression stayed invisible.
-func bodyTextProps(o fyne.CanvasObject) (fyne.TextWrap, fyne.TextAlign) {
-	switch b := o.(type) {
-	case *widget.RichText:
-		for _, seg := range b.Segments {
-			if ts, ok := seg.(*widget.TextSegment); ok {
-				return b.Wrapping, ts.Style.Alignment
+// TestGUIMarkdownCardSelectsRenderedText is the point of the selectable RichText:
+// a styled paragraph used to be either its formatting or the clipboard, and the
+// mouse now gives up the text as rendered - emphasis included, markers excluded.
+func TestGUIMarkdownCardSelectsRenderedText(t *testing.T) {
+	c := newConfig("yolo")
+	p := newGUIForTest(t, c, &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}})
+	text := "the build passed cleanly and `make test` ran every suite in the repo today"
+
+	p.do(func() {
+		cards := blockCards(block{kind: "assistant", text: text}, false)
+		a, ok := cards[0].(*area)
+		if !ok {
+			t.Fatalf("assistant card is %T, want an area", cards[0])
+		}
+		rt, ok := a.body.(*widget.RichText)
+		if !ok {
+			t.Fatalf("body is %T, want the markdown RichText", a.body)
+		}
+		if !rt.Selectable {
+			t.Fatal("the markdown body is not Selectable")
+		}
+		got := dragSelect(t, rt, 320, 2, 300)
+		if !strings.Contains(got, "build passed cleanly") {
+			t.Fatalf("selection gave %q, want the paragraph's prose", got)
+		}
+		for _, marker := range []string{"`", "*", "_"} {
+			if strings.Contains(got, marker) {
+				t.Errorf("selection carried the markdown marker %q instead of the rendered text: %q", marker, got)
 			}
 		}
-		return b.Wrapping, fyne.TextAlignLeading
-	case *widget.Label:
-		return b.Wrapping, b.Alignment
+	})
+}
+
+// TestGUICopyMenuCopiesAndReturnsFocus covers Edit ▸ Copy on a live card, which is
+// the only copy path that works once a card's selection has taken the focus: glfw
+// hands a shortcut to the focused widget and stops, so neither the input nor a
+// canvas-level handler would ever see ⌘C here.
+func TestGUICopyMenuCopiesAndReturnsFocus(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = false
+	l := &agent.Loop{Cfg: c,
+		Model: outputs(t, submit("the **build** passed cleanly after the flaky test was rewritten today")),
+		Env:   &env.Local{Timeout: 10 * time.Second}}
+	p := newGUIForTest(t, c, l)
+	p.setTask("T")
+	if _, err := l.Run(context.Background(), "T"); err != nil {
+		t.Fatal(err)
 	}
-	return 0, 0
+
+	if !strings.Contains(p.transcript(), "build passed cleanly") {
+		t.Fatalf("the assistant card never reached the transcript:\n%s", p.transcript())
+	}
+
+	var copyItem *fyne.MenuItem
+	for _, m := range p.v.win.MainMenu().Items {
+		for _, it := range m.Items {
+			if it.Label == "Copy" {
+				copyItem = it
+			}
+		}
+	}
+	if copyItem == nil {
+		t.Fatal("no Edit > Copy menu item: ⌘C cannot reach a card holding the focus")
+	}
+	if copyItem.Shortcut == nil || copyItem.Shortcut.ShortcutName() != "Copy" {
+		t.Errorf("Copy's chord is %v, want the platform copy shortcut", copyItem.Shortcut)
+	}
+
+	// firstArea posts, so it must run outside the do() below: the pane's mutex is
+	// not reentrant, and calling it while holding the lock self-deadlocks.
+	a := p.firstArea("LLM output")
+	if a == nil {
+		t.Fatal("no LLM output area to select in")
+	}
+	p.do(func() {
+		rt, ok := a.body.(*widget.RichText)
+		if !ok {
+			t.Fatalf("live card body is %T, want the markdown RichText", a.body)
+		}
+		p.v.win.Canvas().Focus(p.v.editor) // typing works before the drag
+		if got := dragSelect(t, rt, 300, 2, 220); !strings.Contains(got, "build passed cleanly") {
+			t.Fatalf("live card selection gave %q", got)
+		}
+		copyItem.Action()
+
+		if cb := p.app.Clipboard().Content(); !strings.Contains(cb, "build passed cleanly") {
+			t.Errorf("Copy put %q on the clipboard", cb)
+		} else if strings.Contains(cb, "**") {
+			t.Errorf("Copy took the markers, not the rendering: %q", cb)
+		}
+		// The keyboard has to come back: a card holding focus swallows every
+		// keystroke, and the input being typeable is not optional.
+		if p.v.win.Canvas().Focused() != fyne.Focusable(p.v.editor) {
+			t.Errorf("focus stayed on %v after Copy; typing would be swallowed", p.v.win.Canvas().Focused())
+		}
+		// The promise behind handing the focus back: the next keystroke is a
+		// message, not a swallowed one.
+		p.v.editor.TypedRune('x')
+		if !strings.HasSuffix(p.v.editor.Text, "x") {
+			t.Errorf("the input did not take the next keystroke after Copy: %q", p.v.editor.Text)
+		}
+	})
+}
+
+// bodyTextProps reads the two properties every card body must carry: word
+// wrapping, and the alignment that keeps a user's own message right-justified.
+// Every body is a RichText now, so alignment lives on its text segments.
+func bodyTextProps(o fyne.CanvasObject) (fyne.TextWrap, fyne.TextAlign) {
+	rt, ok := o.(*widget.RichText)
+	if !ok {
+		return 0, 0
+	}
+	for _, seg := range rt.Segments {
+		if ts, ok := seg.(*widget.TextSegment); ok {
+			return rt.Wrapping, ts.Style.Alignment
+		}
+	}
+	return rt.Wrapping, fyne.TextAlignLeading
 }
 
 // TestGUICardBodiesAreSelectable is the assertion the user asked for, and the
@@ -1634,40 +1744,18 @@ func TestGUICardBodiesAreSelectable(t *testing.T) {
 		case fyne.CanvasObject:
 			body = o
 		}
-		// Cards whose body is a scroll or an accordion hold a Label inside;
+		// Cards whose body is a scroll or an accordion hold the text inside;
 		// dig one level so the check is about the text, not the container.
 		if sc, ok := body.(*container.Scroll); ok {
 			body = sc.Content
 		}
-		lb, ok := body.(*widget.Label)
+		rt, ok := body.(*widget.RichText)
 		if !ok {
-			t.Errorf("%s: body is %T, want a *widget.Label so it can select", k.what, body)
+			t.Errorf("%s: body is %T, want a *widget.RichText", k.what, body)
 			continue
 		}
-		if !lb.Selectable {
-			t.Errorf("%s: body label is not Selectable", k.what)
-		}
-	}
-}
-
-// TestGUIStyledMarkdownStaysRichText records the boundary the conservative rule
-// draws: a block whose markdown would change the rendering keeps the formatting
-// and gives up selection, and that is a decision rather than an oversight.
-func TestGUIStyledMarkdownStaysRichText(t *testing.T) {
-	for _, raw := range []string{"a **bold** claim", "a `code span`", "- one item", "# heading"} {
-		if _, ok := mdOrLabel(raw).(*widget.RichText); !ok {
-			t.Errorf("mdOrLabel(%q) = %T, want RichText: this block renders differently as markdown",
-				raw, mdOrLabel(raw))
-		}
-	}
-	for _, raw := range []string{"the build passed, 12 tests ok", "no markers here at all"} {
-		lb, ok := mdOrLabel(raw).(*widget.Label)
-		if !ok {
-			t.Errorf("mdOrLabel(%q) = %T, want a selectable Label", raw, mdOrLabel(raw))
-			continue
-		}
-		if !lb.Selectable {
-			t.Errorf("mdOrLabel(%q): Label is not Selectable", raw)
+		if !rt.Selectable {
+			t.Errorf("%s: body is not Selectable, so its text cannot be copied out", k.what)
 		}
 	}
 }

@@ -797,51 +797,77 @@ func (v *guiView) toggleThinking() {
 	v.noteLocal(map[bool]string{true: "thinking shown", false: "thinking hidden"}[on])
 }
 
+// copySelection is Edit ▸ Copy, and the only copy path that works everywhere in
+// this window: a selectable body copies itself while it holds focus, but taking
+// that focus is exactly what a card selection does, so ⌘C has to be answered above
+// the focus - see GUI.menus.
+//
+// After copying out of a card the caret goes back to the input, because a card
+// holding focus swallows every keystroke (widget.focusSelectable's TypedKey and
+// TypedRune are no-ops) and the input being typeable is not optional. The
+// highlight goes with the focus - Fyne draws a selection only on the focused
+// widget - so ⌘C doubles as the "copied" feedback; both halves cannot be had.
+func (v *guiView) copySelection() {
+	focus := v.win.Canvas().Focused()
+	sel, ok := focus.(interface{ SelectedText() string })
+	if !ok {
+		return
+	}
+	text := sel.SelectedText()
+	if text == "" {
+		return
+	}
+	v.gui.app.Clipboard().SetContent(text)
+	if focus == fyne.Focusable(v.editor) {
+		return // the input keeps its selection and its caret
+	}
+	// Not ClearSelection: the focused object is widget.focusSelectable, and only
+	// the RichText above it carries that method, so it is unreachable from outside
+	// package widget. Losing the focus hides the rectangles anyway.
+	v.win.Canvas().Focus(v.editor)
+}
+
 // ------------------------------------------------------------------ the view --
 
 func dimStyle() widget.RichTextStyle {
 	return widget.RichTextStyle{ColorName: theme.ColorNameDisabled}
 }
 
+// plainRT, dimRT and signalRT are the three colours transcript text comes in.
 func plainRT(text string) *widget.RichText {
-	rt := widget.NewRichText(&widget.TextSegment{Text: text})
-	rt.Wrapping = fyne.TextWrapWord
-	return rt
+	return selectableRT(widget.NewRichText(&widget.TextSegment{Text: text}))
 }
 
 func dimRT(text string) *widget.RichText {
-	rt := widget.NewRichText(&widget.TextSegment{Text: text, Style: dimStyle()})
-	rt.Wrapping = fyne.TextWrapWord
-	return rt
+	return selectableRT(widget.NewRichText(&widget.TextSegment{Text: text, Style: dimStyle()}))
 }
 
-// selectableLabel is card text that the mouse can select and ⌘C can copy. It is
-// the body for every block that carries no inline formatting, which turns out to
-// be most of what a session says: prose paragraphs, the human's own messages,
-// notes, tool-call-only turns.
+// signalRT is HighImportance made explicit: the colour errorRT used to paint
+// with, now that the widget it came from is gone.
+func signalRT(text string) *widget.RichText {
+	return selectableRT(widget.NewRichText(&widget.TextSegment{Text: text,
+		Style: widget.RichTextStyle{ColorName: theme.ColorNamePrimary}}))
+}
+
+// selectableRT is the invariant on every transcript body: wrapped, and selectable
+// by mouse so ⌘C has something to copy. Fyne put selection into RichText in 2.9
+// (RichText.Selectable), which is why every card body can now be the widget that
+// renders its markdown; before that, selection lived only in Label and Entry, and
+// its geometry calls into the RichText provider are unexported, so a styled block
+// had to choose between its formatting and the clipboard.
 //
-// The reason this exists rather than one selectable RichText: Fyne builds
-// selection in widget.selectable over a *RichText* provider, so the formatting
-// widget is the one the selection machinery reads - but the methods it calls are
-// unexported (row, rows, rowLength, rowAlignOffset, charMinSize), so nothing
-// outside package widget can attach it to a RichText of its own. What a caller
-// can do is hand the text to the widget that already embeds the selection, and
-// keep the markdown path only where the markup actually changes the picture.
-func selectableLabel(text string, imp widget.Importance) *widget.Label {
-	l := widget.NewLabel(text)
-	l.Selectable = true
-	l.Wrapping = fyne.TextWrapWord
-	l.Importance = imp
-	return l
+// Mono bodies set Wrapping themselves - see monoRT.
+func selectableRT(rt *widget.RichText) *widget.RichText {
+	rt.Wrapping = fyne.TextWrapWord
+	rt.Selectable = true
+	return rt
 }
 
-// markdownRT renders a block as markdown. Not selectable: see selectableLabel
-// for why a RichText cannot carry selection from outside the widget package, and
-// mdOrLabel for the rule that keeps this path to blocks whose formatting shows.
+// markdownRT renders a block with fyne's own markdown parser, and it selects: the
+// text that reaches the clipboard is the rendered text, so the ** and ` markers
+// stay on the screen where they belong.
 func markdownRT(text string) *widget.RichText {
-	rt := widget.NewRichTextFromMarkdown(text)
-	rt.Wrapping = fyne.TextWrapWord
-	return rt
+	return selectableRT(widget.NewRichTextFromMarkdown(text))
 }
 
 // messageKindLabel names a message block's area and picks its side: text the
@@ -1050,9 +1076,6 @@ func areaCard(label string, m metrics, body fyne.CanvasObject, align fyne.TextAl
 		Style: widget.RichTextStyle{ColorName: areaColor(label), Alignment: align},
 	})
 	header.Wrapping = fyne.TextWrapWord
-	if lb, ok := body.(*widget.Label); ok {
-		lb.Alignment = align
-	}
 	if rt, ok := body.(*widget.RichText); ok {
 		alignRT(rt, align)
 	} else if align != fyne.TextAlignLeading {
@@ -1113,11 +1136,11 @@ func alignRT(rt *widget.RichText, align fyne.TextAlign) {
 // widest real line; the horizontal scroller owns the overflow, so long
 // output never pushes the transcript (or the window) wider than it is.
 func monoBlock(lines []string) fyne.CanvasObject {
-	// Wraps the shared selectable label in a horizontal scroller: the columns of
-	// `$ cmd` / `in <cwd>` / `exit N` are the point, so the text must not reflow,
-	// and the scroller owns the overflow. MinSize reports the widest real line,
-	// which is what keeps a long result from pushing the transcript - or the
-	// window - wider than it is.
+	// Wraps the shared selectable monospace text in a horizontal scroller: the
+	// columns of `$ cmd` / `in <cwd>` / `exit N` are the point, so the text must
+	// not reflow, and the scroller owns the overflow. MinSize reports the widest
+	// real line, which is what keeps a long result from pushing the transcript -
+	// or the window - wider than it is.
 	//
 	// TextGrid remains the wrong tool for the reason this file already records:
 	// a canvas.Text and a rectangle per *cell*, walked every frame.
@@ -1145,22 +1168,16 @@ func transcriptGrid(lines []string) fyne.CanvasObject {
 }
 
 // monoRT is the one monospace text widget behind both the capped transcript card
-// and the scrolling monoBlock: a selectable Label, shaped as a single run rather
-// than a cell grid.
-//
-// It used to be a RichText, which is why card text could not be copied: Fyne
-// implements selection in widget.selectable and embeds it in Label and Entry
-// only, so no amount of clicking or ⌘C on a RichText does anything at all. The
-// name is kept because a dozen call sites read better for saying what the text
-// *is* rather than which widget class carries it, and because the one thing that
-// must not happen again is a reader assuming mono means RichText.
-func monoRT(lines []string) *widget.Label {
-	l := widget.NewLabel(strings.Join(lines, "\n"))
-	l.TextStyle = fyne.TextStyle{Monospace: true}
-	l.Wrapping = fyne.TextWrapOff
-	l.Alignment = fyne.TextAlignLeading
-	l.Selectable = true
-	return l
+// and the scrolling monoBlock: a single selectable run rather than a cell grid.
+// Wrapping stays off so the columns line up and the horizontal scroller owns the
+// overflow; selection is the RichText's own, so a drag across output keeps the
+// line breaks the reader sees.
+func monoRT(lines []string) *widget.RichText {
+	rt := widget.NewRichText(&widget.TextSegment{Text: strings.Join(lines, "\n"),
+		Style: widget.RichTextStyle{TextStyle: fyne.TextStyle{Monospace: true}}})
+	rt.Wrapping = fyne.TextWrapOff
+	rt.Selectable = true
+	return rt
 }
 
 func exitRT(b block) *widget.RichText {
@@ -1168,6 +1185,7 @@ func exitRT(b block) *widget.RichText {
 		&widget.TextSegment{Text: "✓ " + b.title + "\n", Style: widget.RichTextStyle{ColorName: theme.ColorNameSuccess}},
 		&widget.TextSegment{Text: b.text, Style: dimStyle()})
 	rt.Wrapping = fyne.TextWrapWord
+	rt.Selectable = true // both colours of the line copy as one selection
 	return rt
 }
 
@@ -1210,13 +1228,12 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		// one continuous scroll across the boundary.
 		return []fyne.CanvasObject{areaCard(b.title, metrics{}, mdBody(b.text), fyne.TextAlignLeading)}
 	case "error":
-		// A Label, so a traceback can be lifted straight out of the transcript
-		// - the text most likely to be pasted somewhere, and the one that used
-		// to need retyping. HighImportance is the same signal colour errorRT
-		// painted with.
-		return []fyne.CanvasObject{selectableLabel(b.text, widget.HighImportance)}
+		// The text most likely to be pasted somewhere else, and the one that used
+		// to need retyping: it is selectable like every other body now, in the
+		// same signal colour errorRT painted with.
+		return []fyne.CanvasObject{signalRT(b.text)}
 	default: // notes: UI feedback, the session header, command results
-		return []fyne.CanvasObject{selectableLabel(b.text, widget.LowImportance)}
+		return []fyne.CanvasObject{dimRT(b.text)}
 	}
 }
 

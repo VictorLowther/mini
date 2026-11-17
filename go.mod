@@ -3,7 +3,7 @@ module github.com/VictorLowther/mini
 go 1.27.3
 
 require (
-	fyne.io/fyne/v2 v2.8.2
+	fyne.io/fyne/v2 v2.8.3-0.20261115175655-cfb984d35559
 	github.com/ncruces/go-sqlite3 v0.37.0
 	gopkg.in/yaml.v3 v3.0.1
 	mvdan.cc/sh/v3 v3.14.1

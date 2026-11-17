@@ -1470,6 +1470,67 @@ selection, and reserve the markdown path for the blocks that need it.
 Still not selectable, both on purpose: the `exit` row, which paints two colours
 in one line and is a status marker rather than output, and inline-styled prose.
 
+### 8.2 Fyne 2.9's `RichText.Selectable` deletes the whole trade-off (dev pin)
+
+Both halves of 8.1's compromise are gone: every card body is a `RichText` again,
+*and* every card body is selectable. Fyne put selection into `RichText` itself -
+`Selectable`, `SelectedText()`, `ClearSelection()`, "Since: 2.9" (upstream
+issue [#5946](https://github.com/fyne-io/fyne/issues/5946), closed as completed
+2026-10-09; landed by commit `2e33fd8a` "Add selection API for RichText"). The
+last *release* is v2.8.2 and does not have it, so `go.mod` now pins the develop
+pseudo-version `v2.8.3-0.20261115175655-cfb984d35559`. **When 2.9.0 ships, replace
+the pin with the release**; until then, treat any Fyne-side regression as ours to
+bisect, because the pin moves under us only when we bump it deliberately.
+
+What that bought, measured rather than assumed: a drag across a markdown
+`RichText` yields the *rendered* text - `the **build** passed` copies as
+`the build passed`, backtick and asterisk markers left behind - and a drag across
+blocks reconstructs structure (`first paragraph line\n• item one\n• item two`).
+So `mdOrLabel`, `mdShowsFormatting` and `selectableLabel` are deleted, the
+formatting-vs-clipboard predicate is gone, and card bodies are one widget kind
+again. `exitRT` selects across its two colours, which the Label route could not
+draw at all.
+
+The survey behind the decision (15 text-oriented apps from apps.fyne.io, read from
+source): **zero** use `Label.Selectable`; every app that renders styled text either
+adds a whole-text Copy button and keeps a raw string beside the widget (Janice,
+EcNotes, Fyclip - which is also the maintainers' own advice) or hand-rolls
+selection over custom painting (Gaze ~2k LOC of caret/anchor/row-rect code;
+fyne-io/terminal inverts per-cell `TextGrid` styles; TetherSSH needs a transparent
+`TextGrid` plus a pixel-snapped background layer and still documents gaps; DasherG
+abandoned its selection highlight as unworkable). `TextGrid` has no selection in
+2.8.2 *or* 2.9, so the one-widget-per-block mono body stays a `RichText`.
+
+**The focus trap is not a Fyne bug we can pin away - it is the model.** Mouse-down
+in any selectable text widget (`Label`, `RichText`, `Entry`) moves canvas focus to
+the internal `*widget.focusSelectable`, whose `TypedKey`/`TypedRune` are no-ops, and
+the highlight rectangles are drawn *only while that widget holds focus* (measured:
+one visible rectangle while selected, zero after refocusing the input). So
+"the selection stays visible" and "the input is focused" cannot both hold, and
+`chatInput`'s reclaim cannot fire because `Focused()` is not nil. Left alone, that
+means select a card and then every keystroke is swallowed.
+
+The answer is a menu item, not a handler: glfw dispatches a shortcut to the focused
+widget and **returns**, so `Canvas.AddShortcut` is unreachable while any text widget
+holds focus; only main-menu shortcuts fire *before* the focused widget
+(`internal/driver/glfw/window.go`, `triggerMainMenuShortcut`). Hence `Edit ▸ Copy`
+carrying `&fyne.ShortcutCopy{}`, whose action asks the *focused object* - which is
+`widget.focusSelectable`, not the RichText above it - for `SelectedText()`, puts it on
+the app clipboard, and returns the caret to the input: select, ⌘C, type is one
+continuous gesture. Two consequences of that focus model are accepted rather than
+fought:
+
+- the highlight disappears when ⌘C hands the focus back, so ⌘C *is* the "copied"
+  feedback. Fyne draws selection rectangles only on the focused widget, so "still
+  visible" and "still typeable" cannot both be had;
+- the copy must go through `app.Clipboard()`, the same handle `widget.selectable`
+  uses. `window.Clipboard()` is a different object - per-window on Unix, and a
+  single-use stub in the test driver, where writing it is silently invisible.
+
+`ClearSelection()` is deliberately not called: it lives on the RichText, while the
+focused object is its internal selection, and nothing about that object is
+reachable from outside package `widget`. Right-click Copy on a card is Fyne's own.
+
 - **`TestGUITrajectoryMatchesPrintMode` intermittently deadlocks, and the first
   write-up of this got the attribution wrong.** It was recorded above as
   link/CGO contention, because it appeared in full-suite runs while the same

@@ -149,14 +149,14 @@ func mdBlocks(src string) []fyne.CanvasObject {
 		if isFence {
 			out = append(out, codeCard(info, lines))
 		} else {
-			out = append(out, mdOrLabel(raw))
+			out = append(out, markdownRT(raw))
 		}
 	})
 	if inFence {
 		// A committed turn that ends inside an unclosed fence: render the
 		// rest as markdown rather than swallowing the block.
 		if raw := strings.TrimSpace(scan[openAt:]); raw != "" {
-			out = append(out, mdOrLabel(raw))
+			out = append(out, markdownRT(raw))
 		}
 	}
 	return out
@@ -198,54 +198,4 @@ func alignTree(o fyne.CanvasObject, align fyne.TextAlign) {
 			alignTree(c, align)
 		}
 	}
-}
-
-// mdOrLabel picks the body for a prose block: a selectable Label unless the
-// block contains markdown that would visibly change the rendering.
-//
-// The test is deliberately conservative - an underscore or an asterisk anywhere
-// sends the block to the markdown path, even though plenty of such blocks would
-// have rendered identically - because the two ways to get this wrong are not
-// equal. Guess "plain" and a heading or an emphasis silently loses its
-// formatting, which reads as the renderer being broken; guess "markdown" and the
-// cost is that one styled paragraph cannot be drag-selected, while the card's
-// whole text is still reachable from the code path and the rest of the turn.
-// Getting text *out* matters more than one paragraph of italics.
-func mdOrLabel(raw string) fyne.CanvasObject {
-	if mdShowsFormatting(raw) {
-		return markdownRT(raw)
-	}
-	// Importance(0) is the normal weight: prose at the default colour.
-	return selectableLabel(raw, 0)
-}
-
-// mdShowsFormatting reports whether a block carries markdown a Label could not
-// reproduce. Line prefixes are checked per line because a "# " mid-sentence is
-// text, and only a marker at the start of a line is a heading.
-func mdShowsFormatting(raw string) bool {
-	for _, m := range []string{"*", "_", "`", "~~", "](", "<http", "<https"} {
-		if strings.Contains(raw, m) {
-			return true
-		}
-	}
-	for _, line := range strings.Split(raw, "\n") {
-		t := strings.TrimLeft(line, " \t")
-		switch {
-		case strings.HasPrefix(t, "#"), strings.HasPrefix(t, ">"),
-			strings.HasPrefix(t, "- "), strings.HasPrefix(t, "+ "),
-			strings.HasPrefix(t, "* "):
-			return true
-		}
-		if len(t) > 1 && t[0] >= '0' && t[0] <= '9' {
-			// "1." / "2)" ordered list markers.
-			i := 1
-			for i < len(t) && t[i] >= '0' && t[i] <= '9' {
-				i++
-			}
-			if i < len(t) && (t[i] == '.' || t[i] == ')') {
-				return true
-			}
-		}
-	}
-	return false
 }

@@ -695,5 +695,13 @@ func (g *GUI) menus() *fyne.MainMenu {
 	commands := fyne.NewMenuItem("Commands", func() {
 		g.v.noteLocal("Current mode: " + g.cfg.Mode + "\n" + helpText)
 	})
-	return fyne.NewMainMenu(run, fyne.NewMenu("View", thinking), fyne.NewMenu("Help", commands))
+	// Edit exists for one reason: glfw hands a shortcut to the focused widget and
+	// stops there, so a canvas-level ⌘C never runs while a card's text selection
+	// holds the focus. Main-menu shortcuts fire *before* the focused widget
+	// (internal/driver/glfw/window.go triggerMainMenuShortcut), which is what makes
+	// Copy mean the same thing in the input and in any card body.
+	copyItem := fyne.NewMenuItem("Copy", g.v.copySelection)
+	copyItem.Shortcut = &fyne.ShortcutCopy{}
+	edit := fyne.NewMenu("Edit", copyItem)
+	return fyne.NewMainMenu(run, edit, fyne.NewMenu("View", thinking), fyne.NewMenu("Help", commands))
 }
