@@ -574,3 +574,53 @@ func TestGUITabLabelCarriesWorkInFlight(t *testing.T) {
 		t.Errorf("label = %q after the answer, want the marker gone and the count kept", got)
 	}
 }
+
+// TestGUIPauseHoldsItsOwnSession is the pause surface, and the per-session half of
+// it: holding one conversation must not silently park the tab next to it, which is
+// the same class of bug as one shared streamState. That the hold *works* - the loop
+// stopping at its boundary and carrying on when released - is agent's
+// TestPauseHoldsAtTheStepBoundary.
+func TestGUIPauseHoldsItsOwnSession(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	b := openWithOptions(t, a, GUIOptions{TabLabel: "worker"})
+
+	a.setPause(true)
+	if !a.loop.Paused() {
+		t.Fatal("alpha is not held")
+	}
+	if b.loop.Paused() {
+		t.Error("holding alpha parked the session in the next tab")
+	}
+	if got := a.item.Text; got != "⏸ alpha" {
+		t.Errorf("tab = %q, want the hold visible", got)
+	}
+	a.v.refreshStatus()
+	if !strings.Contains(a.v.status.Text, "paused") {
+		t.Errorf("footer = %q, want it to say so too", a.v.status.Text)
+	}
+
+	// esc cannot interrupt a step that is not running; saying it cancelled one
+	// would be a lie, and the hold would vanish with the lie.
+	a.v.esc()
+	if !a.loop.Paused() {
+		t.Error("esc quietly released the hold")
+	}
+	if got := transcriptText(a.v.root()); !strings.Contains(got, "held at its step boundary") {
+		t.Errorf("esc said nothing about the hold:\n%s", got)
+	}
+
+	if !a.v.commandOrSteer("/resume") {
+		t.Error("/resume was not handled as a command")
+	}
+	if a.loop.Paused() {
+		t.Error("/resume did not release the session")
+	}
+	if got := a.item.Text; got != "alpha" {
+		t.Errorf("tab = %q after resuming, want the marker gone", got)
+	}
+	if !a.v.commandOrSteer("/pause") || !a.loop.Paused() {
+		t.Error("/pause did not hold the session")
+	}
+	a.setPause(false)
+	drainPosts()
+}

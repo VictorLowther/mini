@@ -272,6 +272,9 @@ func (g *GUI) label() string {
 // screen to say so is indistinguishable from one that has gone quiet.
 func (g *GUI) statusLabel(liveJobs int) string {
 	text := g.label()
+	if g.paused() {
+		text = "⏸ " + text
+	}
 	if liveJobs > 0 {
 		text += fmt.Sprintf(" \u00b7 %d %s", liveJobs, map[bool]string{true: "job", false: "jobs"}[liveJobs == 1])
 	}
@@ -603,6 +606,36 @@ func (g *GUI) ToggleReasoning() bool { return g.sh.toggleThinking() }
 // are being built.
 func (g *GUI) showReasoning() bool { return g.sh.showReasoning() }
 
+// setPause holds this session at its next step boundary, or releases it. The turn
+// in flight is left to finish - abandoning a command half-written is what esc and
+// `Run ▸ Cancel turn` are for, and pause means the opposite: keep everything, take
+// no next step. §5.7's remedy beside kill.
+func (g *GUI) setPause(on bool) {
+	if g.loop == nil {
+		return
+	}
+	if on {
+		g.loop.Pause()
+		g.v.noteLocal("paused: this session stops at its next step boundary. /resume, or Session ▸ Pause/resume this session, carries on.")
+	} else {
+		g.loop.Unpause()
+		g.v.noteLocal("resumed: this session continues at the step it stopped at.")
+	}
+	g.refreshLabel(g.liveJobs())
+}
+
+// togglePause is the menu's one control for both directions; it reports the state
+// the tab now shows.
+func (g *GUI) togglePause() bool {
+	g.setPause(!g.paused())
+	return g.paused()
+}
+
+// paused reports a session being held, including the window between asking and
+// actually stopping at the boundary - the ⏸ says "will stop", which is what the
+// human needs to know either way.
+func (g *GUI) paused() bool { return g.loop != nil && g.loop.Paused() }
+
 // loopRunning reports whether the agent is inside Loop.Run.
 func (g *GUI) loopRunning() bool { return g.loop != nil && g.loop.Running() }
 
@@ -629,6 +662,11 @@ func (g *GUI) AssistantHeader() string {
 // through history and the cards themselves are not being repainted.
 func (g *GUI) RunStats() string {
 	text := runStatsText(g.snapshot(), g.cfg.Mode, g.showReasoning(), g.cfg.ContextWindow)
+	if g.paused() {
+		// The pause belongs next to the mode: both describe what this session will
+		// do on its own, and neither is visible in the token counts around them.
+		text += " \u00b7 paused"
+	}
 	if n := g.liveJobs(); n > 0 {
 		text += fmt.Sprintf(" \u00b7 %d %s", n, map[bool]string{true: "job", false: "jobs"}[n == 1])
 	}

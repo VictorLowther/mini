@@ -2135,19 +2135,49 @@ each:
   depends on), or one window-level jobs view listing every session's runs. The
   labels and cards report the residue; they cannot yet act on it.
 - *Per-session pause.* §5.7 accepted starvation and named "per-session pause and
-  kill" as the remedy that made that affordable; the **kill half now exists**
-  (`Run ▸ Cancel turn`, `×`, which cascades). The pause half has no referent under
-  the current loop model: `CancelTurn` ends the turn in flight, `Quit` ends the
-  session, and a session between turns is already idle - there is no
-  suspended-but-live state to enter. A subagent cannot be paused from its own window
-  at all, because it is driven by its parent's job wrapper, and what §5.7 was really
-  worried about - a background session holding gate slots - is answered by killing
-  it or by the gate's own bound, not by a hold button. Recommendation: retire pause
-  as satisfied by kill, or re-scope it explicitly to gate priority.
+  kill" as the remedy that made that affordable. The draft of this section argued
+  pause had no referent and recommended retiring it; **the maintainer ruled it in
+  with a definition**: a paused session "simply does not continue once it hits the
+  next step boundary, and resuming just carries on". That is §8.7, and the reading
+  that made it cheap is that the boundary already exists - it is the one place the
+  loop appends job wakes before a model call - so pause is a wait there and nothing
+  else has to change.
 
 Shipping a "pause" that is really a cancel, or a job list whose buttons lie, is the
 kind of thing this document exists to record as *not finished*.
 
+### 8.7 Pause: a session that stops at its next step boundary
+
+Ruled by the maintainer over this document's recommendation to retire the idea, and
+the ruling's wording is the specification: **hold at the step boundary, release and
+carry on**. So `agent.Loop` gained exactly that much - `Pause`, `Unpause`,
+`Paused`, and a `waitUnpaused` select at the top of the loop's boundary, before the
+wakes are claimed and before the model is called - and nothing else. The turn in
+flight finishes normally, because abandoning a command half-written is what
+`CancelTurn` is for and pause claims to mean the opposite.
+
+Three consequences worth naming, all of them tested:
+
+- **A held session is still running.** `Running()` stays true, so `×`, the job-count
+  label and the quit guard all treat it as work in flight. That is correct - it owns
+  a transcript, jobs and gate slots - but it also means a hold has to be *visible*
+  or it is indistinguishable from a hang, which is the exact confusion `Issuer`
+  exists to remove. Hence `⏸` on the tab and `paused` in the footer.
+- **The wait is a select, not a receive.** Quitting or cancelling a held run ends it
+  (`ctx.Err()` back out through the normal path); a plain `<-release` would make
+  pause a way to build a run nobody can stop. Cancelling does *not* clear the hold:
+  the next run of that session is still meant to stop at its boundary until the
+  human says otherwise.
+- **`esc` on a parked session says so and does nothing else.** There is no turn to
+  interrupt; the old branch would have noted "cancelling this turn" over a session
+  that had none, and then the hold would have looked like the thing that lied.
+
+Surfaces: `/pause` and `/resume` (tab-level, like `/compact`), `Session ▸
+Pause/resume this session` on ⌘. / Ctrl+. , the `⏸` tab marker, and `paused` in the
+footer beside the mode. `print` mode has no control yet - the loop capability is
+there, the front end is not - and `helpText` stayed silent about it for that reason:
+the shared help block must not advertise a command one of the two front ends will
+feed to the model as prose. The window's own scope note covers it.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

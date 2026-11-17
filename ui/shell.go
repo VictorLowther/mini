@@ -582,6 +582,12 @@ func (sh *shell) menus() *fyne.MainMenu {
 	next.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyRight, Modifier: fyne.KeyModifierAlt}
 	prev := fyne.NewMenuItem("Previous session", func() { sh.selectOffset(-1) })
 	prev.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyLeft, Modifier: fyne.KeyModifierAlt}
+	pause := fyne.NewMenuItem("Pause/resume this session", func() {
+		if g := sh.selected(); g != nil {
+			g.togglePause()
+		}
+	})
+	pause.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyPeriod, Modifier: fyne.KeyModifierShortcutDefault}
 	closeItem := fyne.NewMenuItem("Close session", func() {
 		if g := sh.selected(); g != nil {
 			sh.closeTab(g.item)
@@ -590,7 +596,7 @@ func (sh *shell) menus() *fyne.MainMenu {
 	closeItem.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyW, Modifier: fyne.KeyModifierShortcutDefault}
 
 	return fyne.NewMainMenu(run, fyne.NewMenu("Edit", copyItem),
-		fyne.NewMenu("Session", next, prev, fyne.NewMenuItemSeparator(), closeItem),
+		fyne.NewMenu("Session", next, prev, pause, fyne.NewMenuItemSeparator(), closeItem),
 		fyne.NewMenu("View", thinking), fyne.NewMenu("Help", commands))
 }
 

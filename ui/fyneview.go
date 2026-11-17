@@ -1017,9 +1017,20 @@ type area struct {
 	widget.BaseWidget
 	label  string
 	header *widget.RichText
-	body   fyne.CanvasObject
-	bubble *bubble
-	stack  *fyne.Container
+	// actions rides the right edge of the header line: it is the card's control
+	// for the text underneath it, and a row of its own would read as content.
+	actions *fyne.Container
+	body    fyne.CanvasObject
+	bubble  *bubble
+	stack   *fyne.Container
+}
+
+// setActions gives a card its controls. Call it while the card is being built:
+// blockCards is a pure function of the block, and only the view knows what a
+// button may legitimately do - so the wiring happens in newRow, before the row
+// reaches the canvas, and nothing has to be refreshed afterwards.
+func (a *area) setActions(objs ...fyne.CanvasObject) {
+	a.actions.Objects = objs
 }
 
 func (a *area) CreateRenderer() fyne.WidgetRenderer {
@@ -1051,14 +1062,18 @@ func areaCard(label string, m metrics, body fyne.CanvasObject, align fyne.TextAl
 	}
 	b := newBubble(label, mine)
 	pad := theme.Size(theme.SizeNamePadding)
+	// The actions row is empty for most cards, and an empty row layout has a zero
+	// MinSize, so a card without a control costs the header line nothing.
+	actions := container.NewHBox()
 	content := container.New(layout.NewCustomPaddedLayout(pad, bubbleTailDrop(b)+pad, pad, pad),
-		container.NewVBox(header, body))
+		container.NewVBox(container.NewBorder(nil, nil, nil, actions, header), body))
 	a := &area{
-		label:  label,
-		header: header,
-		body:   body,
-		bubble: b,
-		stack:  container.NewStack(b, content),
+		label:   label,
+		header:  header,
+		actions: actions,
+		body:    body,
+		bubble:  b,
+		stack:   container.NewStack(b, content),
 	}
 	a.ExtendBaseWidget(a)
 	return a
@@ -1488,6 +1503,13 @@ func (v *guiView) showRunDone() {
 // native quit hotkey, or closing the window. It used also to dismiss the limits
 // prompt, which went with the limits themselves (§5.14).
 func (v *guiView) esc() {
+	if v.gui.paused() {
+		// Nothing is in flight to interrupt, and saying "cancelling this turn"
+		// while a session is parked at its boundary would be a lie with a note
+		// attached. The way out of a hold is the way into it.
+		v.noteLocal("nothing is running: this session is held at its step boundary. /resume carries on.")
+		return
+	}
 	if v.gui.loopRunning() {
 		v.gui.CancelCurrentTurn()
 		v.noteLocal("cancelling this turn…")
@@ -1572,12 +1594,13 @@ const guiMultilineHint = "multi-line input is not a mode here: shift+enter adds 
 // guiScopeNote is what the window adds to the shared help block: with a tab per
 // session, the question a command raises is no longer only what it does but what it
 // acts on, and print mode's help - same package, one transcript, no tabs - must not
-// start talking about windows it does not have.
+// start talking about windows it does not have. Keep it to three lines: `/h` prints
+// into the transcript, and the transcript materializes a window, so a long note
+// here is the top of the help block scrolling out of sight.
 const guiScopeNote = `
-with tabs: /y /c /u, /compact and steering act on this session only; /t, ⌥→/⌥← and
-quitting act on the whole window; ⌘W or × closes this session - and both × and
-quitting take a second press while work is running, because closing a session takes
-its background jobs and its subagents with it.`
+with tabs: /y /c /u /compact /pause /resume act on this session, /t and quitting on the
+whole window. ⌥→ / ⌥← switch sessions, ⌘. holds this one at its next step boundary,
+⌘W or × closes it - and × and quitting both take a second press while work is running.`
 
 // slash applies the /y /c /u /h commands, printing their feedback into the
 // transcript. /compact is intercepted here too: at a pending prompt the
@@ -1611,6 +1634,12 @@ func (w viewWriter) Write(p []byte) (int, error) {
 // prompt is pending: /y /c /u /h /t /compact and /m.
 func (v *guiView) commandOrSteer(text string) bool {
 	switch text {
+	case "/pause":
+		v.gui.setPause(true)
+		return true
+	case "/resume":
+		v.gui.setPause(false)
+		return true
 	case "/t":
 		v.toggleThinking()
 		return true

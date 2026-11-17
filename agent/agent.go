@@ -212,11 +212,17 @@ type Loop struct {
 	extraVars               map[string]any
 	mu                      sync.Mutex
 	cancelTurn              context.CancelFunc
-	running                 bool
-	snap                    Snapshot
-	pending                 Snapshot
-	runCtx                  context.Context
-	queued                  []model.Message
+	// paused is non-nil while the session is held at a step boundary; closing it
+	// releases the wait. pauseMu guards the pointer only - a waiter holds its own
+	// copy, so a Pause racing an Unpause cannot strand a second waiter on a
+	// channel nobody will close.
+	pauseMu sync.Mutex
+	paused  chan struct{}
+	running bool
+	snap    Snapshot
+	pending Snapshot
+	runCtx  context.Context
+	queued  []model.Message
 	// scratchDir holds the temp result files of a run without a Recorder;
 	// empty otherwise. It must live until Run returns, not merely until its
 	// turn is rendered, because the trajectory written after every step
@@ -872,6 +878,59 @@ func (l *Loop) CancelTurn() {
 	}
 }
 
+// Pause holds this session at its next step boundary. Nothing already in flight
+// is disturbed: the turn finishes, its observations land, and the loop waits
+// before the next model call. This is §5.7's other remedy beside kill - a
+// background session that should stop taking gate slots without losing its
+// transcript, its jobs or its place in the conversation.
+func (l *Loop) Pause() {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	if l.paused == nil {
+		l.paused = make(chan struct{})
+		l.logger().Info("session paused; it stops at its next step boundary")
+	}
+}
+
+// Unpause releases a held session, which carries on at the step it had reached. A
+// session that was never paused is untouched, so the control is idempotent and a
+// release that raced a pause cannot close somebody else's channel.
+func (l *Loop) Unpause() {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	if l.paused != nil {
+		close(l.paused)
+		l.paused = nil
+		l.logger().Info("session resumed")
+	}
+}
+
+// Paused reports whether the session is being held, including the window between
+// asking and actually stopping at the boundary.
+func (l *Loop) Paused() bool {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	return l.paused != nil
+}
+
+// waitUnpaused parks at a step boundary until the session is released or the run
+// ends. Cancellation wins: a held session must be escapable by the same esc that
+// ends any other turn, or pause becomes a way to make a run unkillable.
+func (l *Loop) waitUnpaused(ctx context.Context) error {
+	l.pauseMu.Lock()
+	release := l.paused
+	l.pauseMu.Unlock()
+	if release == nil {
+		return nil
+	}
+	select {
+	case <-release:
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (l *Loop) setCancelTurn(cancel context.CancelFunc) {
 	l.mu.Lock()
 	l.cancelTurn = cancel
@@ -1087,7 +1146,14 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	}
 
 	for {
-		// A step boundary. Anything a background job reported since the last one
+		// A step boundary. A held session stops here, with the turn it was in
+		// allowed to finish: abandoning a command mid-write is what CancelTurn is
+		// for, and pause means the opposite - keep everything, take no next step.
+		if err := l.waitUnpaused(ctx); err != nil {
+			l.save()
+			return nil, err
+		}
+		// Anything a background job reported since the last one
 		// is appended here, as one message, before the next model call - the
 		// only place this design writes to history besides an observation, and
 		// deliberately not in the middle of a turn: a wake is an appended
