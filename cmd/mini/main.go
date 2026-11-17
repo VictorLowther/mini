@@ -473,13 +473,27 @@ type miniRun struct {
 // it needs to become a session must live below this function.
 func buildRun(o *options, stdin *os.File, stdout io.Writer, logTarget *ui.LogTarget) (r *miniRun, err error) {
 	loadGlobalEnv()
-	if err := maybeRunFirstTimeSetup(stdin, stdout, o); err != nil {
-		return nil, err
-	}
 
 	merged, configName, err := buildConfig(o)
 	if err != nil {
 		return nil, err
+	}
+
+	// First-run setup is gated on the configuration mini is about to run with, so
+	// it has to come after the merge and not before it. It used to be a test on two
+	// environment variables and the -m flag evaluated before any config was read,
+	// which meant a saved config that specifies model.model_name and model.base_url
+	// satisfied nothing, and the wizard asked for a model and provider on every
+	// start - the very config it was supposed to use.
+	if needsFirstTimeSetup(merged) {
+		if err := runFirstTimeSetup(stdin, stdout); err != nil {
+			return nil, err
+		}
+		// The wizard exports what it wrote into this process, so re-merge: the
+		// answer typed a moment ago has to reach this run, not only the next one.
+		if merged, configName, err = buildConfig(o); err != nil {
+			return nil, err
+		}
 	}
 	modelCfg := config.Sub(merged, "model")
 	envCfg := config.Sub(merged, "environment")
@@ -861,12 +875,29 @@ func (h *splitHandler) WithGroup(g string) slog.Handler {
 	return &splitHandler{h.stderr.WithGroup(g), h.file.WithGroup(g)}
 }
 
-// maybeRunFirstTimeSetup is configure_if_first_time(): the wizard runs once, and
-// only when there is a terminal to talk to.
-func maybeRunFirstTimeSetup(stdin *os.File, stdout io.Writer, o *options) error {
-	if os.Getenv("MINI_CONFIGURED") != "" || os.Getenv("MINI_MODEL_NAME") != "" || o.modelName != "" {
-		return nil
+// needsFirstTimeSetup is the whole gate: mini asks for a model and a server only
+// when the configuration it is about to run cannot answer that question itself.
+// It asks it the way the model client will - the merged section first,
+// $MINI_MODEL_NAME as the fallback - so a saved config, an environment variable and
+// -m each count as configured, and none of them can drift from what actually gets
+// used, because this is the same constructor that produces the client.
+//
+// MINI_CONFIGURED stays as an answer of its own: the wizard lets every field be left
+// blank on purpose, so somebody who went through it and typed nothing has still said
+// "stop asking", which a missing model name must not overwrite.
+func needsFirstTimeSetup(merged map[string]any) bool {
+	if os.Getenv("MINI_CONFIGURED") != "" {
+		return false
 	}
+	return model.NewSushi(config.Sub(merged, "model")).Model == ""
+}
+
+// runFirstTimeSetup asks the first-run questions, and only where a human can answer
+// them: with no terminal, mini names the command that configures it instead of
+// blocking on a prompt nobody will ever see. Whether anything needs asking is
+// needsFirstTimeSetup's question - and that one can only be asked once the config
+// has been merged.
+func runFirstTimeSetup(stdin *os.File, stdout io.Writer) error {
 	fi, err := stdin.Stat()
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		fmt.Fprintln(os.Stderr, "mini: no model configured. Run `mini config setup`, or pass -m/--model.")

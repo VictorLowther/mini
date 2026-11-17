@@ -569,3 +569,38 @@ func TestApplyConcurrencyChain(t *testing.T) {
 		t.Errorf("a stored zero produced limit %d; the gate must never be closed", got)
 	}
 }
+
+// The first-run wizard used to be gated on two environment variables read before
+// the config was merged, so a saved config that names a model and a server asked
+// for them again on every start - the very config it was about to use.
+// needsFirstTimeSetup now asks the question the way the model client resolves it.
+func TestNeedsFirstTimeSetup(t *testing.T) {
+	t.Setenv("MINI_CONFIGURED", "")
+	t.Setenv("MINI_MODEL_NAME", "")
+
+	named := map[string]any{"model": map[string]any{
+		"model_name": "sushi/mimo",
+		"base_url":   "http://127.0.0.1:1234",
+	}}
+	unnamed := map[string]any{"model": map[string]any{"base_url": "http://127.0.0.1:1234"}}
+
+	if needsFirstTimeSetup(named) {
+		t.Error("ran setup despite a saved config that names the model")
+	}
+	if !needsFirstTimeSetup(unnamed) {
+		t.Error("nothing names a model and setup was skipped")
+	}
+
+	t.Setenv("MINI_MODEL_NAME", "sushi/mimo")
+	if needsFirstTimeSetup(unnamed) {
+		t.Error("the environment names the model and setup still ran")
+	}
+
+	// The wizard lets every field be left blank on purpose, so completing it is
+	// itself an answer: "stop asking", even with no model resolved.
+	t.Setenv("MINI_MODEL_NAME", "")
+	t.Setenv("MINI_CONFIGURED", "true")
+	if needsFirstTimeSetup(unnamed) {
+		t.Error("a completed wizard was ignored")
+	}
+}
