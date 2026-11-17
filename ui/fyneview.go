@@ -313,8 +313,71 @@ func estimateBlockHeight(b block) float32 {
 // its cards and the inter-block spacer, wrapped so the window has one object
 // per block.
 func (v *guiView) newRow(i int) *fyne.Container {
-	cards := blockCards(v.committed[i], v.gui.showReasoning())
+	b := v.committed[i]
+	cards := blockCards(b, v.gui.showReasoning())
+	v.attachCardActions(b, cards)
 	return container.NewVBox(append(cards, blockSpacer())...)
+}
+
+// attachCardActions gives a job card its one control. Only a card still tracking a
+// running job gets one, and only when the window was handed a way to end it: a
+// button that cannot reach the registry is the lying affordance §8.6 says not to
+// ship. It is attached here rather than built in blockCards because that function
+// is a pure mapping from a block to its widgets, and the registry is neither.
+func (v *guiView) attachCardActions(b block, cards []fyne.CanvasObject) {
+	if b.job == "" || v.gui.jobEnd == nil || v.gui.jobs == nil {
+		return
+	}
+	card, found := v.gui.jobs.JobCard(b.job)
+	if !found || !card.Running {
+		return
+	}
+	for _, c := range cards {
+		if a, ok := c.(*area); ok {
+			a.setActions(v.endButton(b.job))
+			return
+		}
+	}
+}
+
+// endArmWindow is how long the first press stays remembered - the same courtesy a
+// tab's × extends, for the same reason.
+const endArmWindow = 10 * time.Second
+
+// endButton is a job card's way out: Manager.Get(id) then (*Run).Kill(), the pair
+// job_kill already reaches through, offered to the human who is watching the card
+// and did not ask for the run. The first press arms - ending a job that has been
+// training for twenty minutes must not cost a brush past a button - and Kill waits
+// through the unwind, so it runs off-thread and the card's state comes back from
+// the registry on the next refresh.
+func (v *guiView) endButton(jobID string) *widget.Button {
+	b := widget.NewButton("End", nil)
+	b.Importance = widget.DangerImportance
+	var armed time.Time
+	b.OnTapped = func() {
+		if time.Since(armed) > endArmWindow {
+			armed = time.Now()
+			b.SetText("End it?")
+			return
+		}
+		armed = time.Time{}
+		b.Disable()
+		b.SetText("ending…")
+		go func() {
+			err := v.gui.jobEnd(jobID)
+			v.gui.post(func() {
+				if err != nil {
+					b.Enable()
+					b.SetText("End")
+					v.noteLocal("could not end job " + jobID + ": " + err.Error())
+					return
+				}
+				v.noteLocal("ended job " + jobID)
+				v.refreshJobCards()
+			})
+		}()
+	}
+	return b
 }
 
 // recomputeWindow rescans the cumulative heights against the viewport
@@ -519,11 +582,13 @@ func (v *guiView) focusEditor() {
 
 // ------------------------------------------------------------ the transcript --
 
+// noteLocal appends UI feedback as ONE card, lines and all. The old per-line split
+// was harmless while a note was a bare row; now that every card carries chrome,
+// printing the help block line by line would draw eight bubbles for one message and
+// blow the transcript's row budget with it.
 func (v *guiView) noteLocal(text string) {
-	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		if line != "" {
-			v.appendBlock(block{kind: "note", text: line})
-		}
+	if text = strings.TrimRight(text, "\n"); text != "" {
+		v.appendBlock(block{kind: "note", text: text})
 	}
 }
 
@@ -1205,7 +1270,9 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		}
 		return cards
 	case "exit":
-		return []fyne.CanvasObject{exitRT(b)}
+		// A card like every other: the ✓ marker and the exit text stay two
+		// colours in one body, and the header says what the row is.
+		return []fyne.CanvasObject{areaCard("exit", metrics{}, exitRT(b), fyne.TextAlignLeading)}
 	case "compaction":
 		// Its own card, in the transcript's flow: the session's story keeps
 		// one continuous scroll across the boundary.
@@ -1214,9 +1281,9 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 		// The text most likely to be pasted somewhere else, and the one that used
 		// to need retyping: it is selectable like every other body now, in the
 		// same signal colour errorRT painted with.
-		return []fyne.CanvasObject{signalRT(b.text)}
+		return []fyne.CanvasObject{areaCard("error", metrics{}, signalRT(b.text), fyne.TextAlignLeading)}
 	default: // notes: UI feedback, the session header, command results
-		return []fyne.CanvasObject{dimRT(b.text)}
+		return []fyne.CanvasObject{areaCard("note", metrics{}, dimRT(b.text), fyne.TextAlignLeading)}
 	}
 }
 

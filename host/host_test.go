@@ -33,6 +33,12 @@ func newProcess(t *testing.T) (*Process, string) {
 	t.Cleanup(func() { st.Close() })
 	p := New(st, context.Background())
 	p.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Reap the process, not just the store. A test that spawned anything leaves a
+	// child run in flight, and its goroutine keeps writing trajectory and result
+	// files under t.TempDir() - which then fails cleanup with "directory not
+	// empty" whenever the child wins the race against the test's last assertion.
+	// Children close before parents, once, with a shared deadline (§9.2).
+	t.Cleanup(func() { _ = p.Close() })
 	return p, base
 }
 

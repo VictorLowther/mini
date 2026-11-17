@@ -384,9 +384,26 @@ func sessionGUI(hs *host.Session, configName string) ui.GUIOptions {
 	return ui.GUIOptions{
 		Cfg: hs.Cfg, Loop: hs.Loop, Model: m, ConfigName: configName,
 		Jobs:     jobReader(hs.Jobs),
+		JobEnd:   jobEnder(hs.Jobs),
 		Dir:      hs.Workdir,
 		Closer:   hs.Quit,
 		TabLabel: hs.Name,
+	}
+}
+
+// jobEnder is the human's half of job_kill: look the run up and stop it through
+// the same (*job.Run).Kill the model's tool already uses. Ending waits for the
+// unwind, so the window calls it from a goroutine.
+func jobEnder(m *job.Manager) func(string) error {
+	if m == nil {
+		return nil
+	}
+	return func(id string) error {
+		run, err := m.Get(id)
+		if err != nil {
+			return err
+		}
+		return run.Kill()
 	}
 }
 

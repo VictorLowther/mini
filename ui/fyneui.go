@@ -41,6 +41,11 @@ type GUIOptions struct {
 	// the window has no way to stop what it is showing, and closing the tab then
 	// only takes the tab away.
 	Closer func() error
+	// JobEnd stops one run the registry still tracks - a handed-off command or a
+	// subagent - and waits for the unwind, so its caller keeps it off the canvas
+	// thread. nil means the window has no way to end a job, and running job cards
+	// then carry no control at all rather than one that lies.
+	JobEnd func(id string) error
 	// Opener assembles a session for another working directory. It belongs to the
 	// window rather than to the session that carried it first: opening a session
 	// writes to the session store and asks the server for its context window, so
@@ -87,10 +92,11 @@ type GUI struct {
 	// label says with a leading marker because a tab is the only surface a
 	// background session has.
 	needsAttention bool
-	// dir and closer come from GUIOptions: where this session runs, and how to
-	// stop it.
+	// dir, closer and jobEnd come from GUIOptions: where this session runs, how to
+	// stop it, and how to stop one of its runs without stopping the session.
 	dir    string
 	closer func() error
+	jobEnd func(id string) error
 	// closeArmed is when × last refused to close a working session; a second press
 	// inside the window closes it (see shell.closeTab).
 	closeArmed time.Time
@@ -191,6 +197,7 @@ func newSession(sh *shell, o GUIOptions) *GUI {
 		tabLabel:   o.TabLabel,
 		dir:        o.Dir,
 		closer:     o.Closer,
+		jobEnd:     o.JobEnd,
 		runDone:    make(chan struct{}),
 	}
 	if o.Model != nil {
@@ -454,14 +461,14 @@ func (g *GUI) Resume(msgs []model.Message, note string) { g.resume, g.resumeNote
 // to. Call before Run.
 func (g *GUI) SetSessionID(id string) { g.sessionID = id }
 
-// note appends UI-generated lines (help text, mode changes, errors).
+// note appends UI-generated text - help, mode changes, retry notices - as one card
+// per message, on the canvas thread. Splitting it per line would give a card, and
+// its header and bubble, to every line of one message.
 func (g *GUI) note(text string) {
-	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		if line != "" {
-			l := line
-			g.post(func() { g.v.appendBlock(block{kind: "note", text: l}) })
-		}
+	if text = strings.TrimRight(text, "\n"); text == "" {
+		return
 	}
+	g.post(func() { g.v.appendBlock(block{kind: "note", text: text}) })
 }
 
 // queueSteering appends a user message to the loop's steering queue.

@@ -624,3 +624,116 @@ func TestGUIPauseHoldsItsOwnSession(t *testing.T) {
 	a.setPause(false)
 	drainPosts()
 }
+
+// jobLister is a registry holding one handed-off run, still burning until a card's
+// End control stops it.
+type jobLister struct {
+	id    string
+	alive bool
+}
+
+func (j *jobLister) JobCard(id string) (JobCard, bool) {
+	if id != j.id {
+		return JobCard{}, false
+	}
+	state := "killed"
+	if j.alive {
+		state = "running"
+	}
+	return JobCard{ID: id, Running: j.alive, State: state, Label: "train"}, true
+}
+
+func (j *jobLister) LiveJobs() (int, error) {
+	if j.alive {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// committedForTest gives a session's view one block to render, exactly as
+// appendBlock would have left it.
+func (g *GUI) committedForTest(b block) {
+	g.v.committed = []block{b}
+	g.v.blockH = []float32{estimateBlockHeight(b)}
+}
+
+// newRowForTest materializes row i the way the virtualizer does.
+func (g *GUI) newRowForTest(i int) fyne.CanvasObject { return g.v.newRow(i) }
+
+// findArea digs the first card out of a materialized row, the way the strip
+// reaches one.
+func findArea(o fyne.CanvasObject) *area {
+	if a, ok := o.(*area); ok {
+		return a
+	}
+	if c, ok := o.(*fyne.Container); ok {
+		for _, ch := range c.Objects {
+			if a := findArea(ch); a != nil {
+				return a
+			}
+		}
+	}
+	return nil
+}
+
+// jobCardBlock is the committed shape a handed-off call leaves behind: a tool card
+// whose body is the live job's lines, tagged with the registry id it tracks.
+func jobCardBlock(id string) block {
+	return block{kind: "tool", title: "train", job: id,
+		transcript: []string{"$ python train.py", "job " + id + " is still running (10s)  out=train.log"}}
+}
+
+// TestGUIJobCardEndsItsOwnJob is the human's way out of §5.10's deliberate residue:
+// a job that outlived its turn is visible on a card, and now it is also endable
+// without ending the session or arguing the model into calling job_kill.
+func TestGUIJobCardEndsItsOwnJob(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	reg := &jobLister{id: "j1", alive: true}
+	ended := make(chan string, 4)
+	b := openWithOptions(t, a, GUIOptions{
+		TabLabel: "worker", Jobs: reg,
+		JobEnd: func(id string) error { ended <- id; reg.alive = false; return nil },
+	})
+	b.committedForTest(jobCardBlock("j1"))
+
+	row := b.newRowForTest(0)
+	ar := findArea(row)
+	if ar == nil {
+		t.Fatal("the job card materialized as no card at all")
+	}
+	if len(ar.actions.Objects) != 1 {
+		t.Fatalf("a running job's card carries %d controls, want its End button", len(ar.actions.Objects))
+	}
+	btn := ar.actions.Objects[0].(*widget.Button)
+	if btn.Text != "End" {
+		t.Fatalf("button reads %q", btn.Text)
+	}
+
+	// First press arms and touches nothing: the run is not ours to end by accident.
+	btn.OnTapped()
+	if btn.Text != "End it?" {
+		t.Errorf("after the first press the button reads %q, want the confirmation", btn.Text)
+	}
+	select {
+	case id := <-ended:
+		t.Fatalf("the job was ended on the first press (%q)", id)
+	default:
+	}
+
+	btn.OnTapped()
+	select {
+	case id := <-ended:
+		if id != "j1" {
+			t.Errorf("ended job %q, want the id this card tracks", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the second press never reached the registry")
+	}
+	drainPosts()
+
+	// A job that is no longer running gets no control, so the card cannot offer an
+	// action that would do nothing.
+	if got := findArea(b.newRowForTest(0)); len(got.actions.Objects) != 0 {
+		t.Errorf("a finished job's card still carries %d controls", len(got.actions.Objects))
+	}
+}

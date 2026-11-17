@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,33 +33,31 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func TestPauseHoldsAtTheStepBoundary(t *testing.T) {
+// TestPauseHoldsBeforeTheNextStep is the hold and its release, parked at the very
+// first boundary so the test cannot race the loop: pause before the run starts, and
+// no model call may happen until the session is released.
+func TestPauseHoldsBeforeTheNextStep(t *testing.T) {
 	l := newLoop(t, &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
 		turn("looking", "echo one"),
 		done("the line is there"),
 	}}, &env.Local{Timeout: 10 * time.Second})
 
+	l.Pause()
 	finished := make(chan runResult, 1)
 	go func() {
 		info, err := l.Run(context.Background(), "count the lines")
 		finished <- runResult{info, err}
 	}()
 
-	// Let one whole step land - the model call and its command - then hold.
-	eventually(t, "the first step to land", func() bool { return l.Snapshot().Calls >= 1 })
-	l.Pause()
-	if !l.Paused() {
-		t.Fatal("Paused() reports false immediately after Pause()")
-	}
-
-	// Held means: still running, and no further model call. A session that
-	// "paused" by ending its run would be indistinguishable from one that died.
-	time.Sleep(200 * time.Millisecond)
-	if got := l.Snapshot().Calls; got != 1 {
-		t.Errorf("%d model calls while held, want the boundary to be the last one", got)
+	time.Sleep(300 * time.Millisecond)
+	if got := l.Snapshot().Calls; got != 0 {
+		t.Errorf("%d model calls while held, want none", got)
 	}
 	if !l.Running() {
 		t.Error("the loop ended rather than waiting at the boundary")
+	}
+	if !l.Paused() {
+		t.Error("Paused() reports false while the session is held")
 	}
 	select {
 	case r := <-finished:
@@ -77,11 +77,62 @@ func TestPauseHoldsAtTheStepBoundary(t *testing.T) {
 		if got, _ := r.info["exit_status"].(string); got != "Submitted" {
 			t.Errorf("exit_status = %q, want the submission the second turn carries", got)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("the resumed run never finished")
 	}
+	// Carrying on means the whole conversation, not a fresh start: both turns ran.
 	if got := l.Snapshot().Calls; got != 2 {
 		t.Errorf("%d model calls after resuming, want both turns", got)
+	}
+}
+
+// TestPauseLeavesTheTurnInFlightToFinish is the difference between pause and esc.
+// The hold is asked for while a command is running, and that command's result must
+// still land in the history - abandoning a write half-done is what CancelTurn is
+// for, and pause promises the opposite.
+func TestPauseLeavesTheTurnInFlightToFinish(t *testing.T) {
+	l := newLoop(t, &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+		turn("looking", "sleep 1 && echo SLEPTOK"),
+		done("the line is there"),
+	}}, &env.Local{Timeout: 10 * time.Second})
+
+	finished := make(chan runResult, 1)
+	go func() {
+		info, err := l.Run(context.Background(), "count the lines")
+		finished <- runResult{info, err}
+	}()
+
+	eventually(t, "the model call that issues the command", func() bool { return l.Snapshot().Calls >= 1 })
+	time.Sleep(200 * time.Millisecond) // mid-command, for certain
+	l.Pause()
+
+	// The step completes: the command's result reaches the history (observations
+	// land as user messages, as everywhere in mini's prompt contract), and the run
+	// is still going because the boundary holds rather than because work remains.
+	eventually(t, "the command's result to land while held", func() bool {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for _, m := range l.Messages {
+			if strings.Contains(fmt.Sprint(m["content"]), "SLEPTOK") {
+				return true
+			}
+		}
+		return false
+	})
+	calls := l.Snapshot().Calls
+	time.Sleep(300 * time.Millisecond)
+	if got := l.Snapshot().Calls; got != calls {
+		t.Errorf("%d model calls while held, want the boundary to be the last one", got)
+	}
+
+	l.Unpause()
+	select {
+	case r := <-finished:
+		if r.err != nil {
+			t.Fatalf("resumed run failed: %v", r.err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the resumed run never finished")
 	}
 }
 

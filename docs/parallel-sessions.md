@@ -1397,17 +1397,18 @@ push).
       and re-issue §5.13's batched cancel across N sessions instead of one `runCtx`.
       The cancel became a loop over per-session contexts with step 7.2; what landed
       here is the scoping said out loud in help, and a leaving that arms while any
-      session has work running. The roster's pause and per-job end are still owed,
-      and §8.6 says why neither belongs in this step.
+      session has work running. Everything the roster was owed was still open at
+      that point; §8.7 and §8.8 say how each half was closed once the maintainer
+      ruled on them.
 
-   Still owed to the roster, and tabs must not lose it: per-session **pause and
-   kill** (§5.7's starvation mitigation is what made that ruling affordable) - the
-   kill half is × and `Run ▸ Cancel turn` (§8.5), the pause half still owed - and a
-   view of a session's **outstanding jobs** endable independently of the session that
-   started them: the labels now report the count (§8.6), the cards cannot yet end
-   them. Without the second, §5.10's deliberate "no
-   auto-kill" residue is invisible, and an invisible residue is not a judgement -
-   it is a leak.
+   The roster's two debts are now closed: per-session **pause and kill** (§5.7's
+   starvation mitigation is what made that ruling affordable) are `Loop.Pause`
+   (§8.7) and `×` / `Run ▸ Cancel turn` (§8.5), and a session's **outstanding jobs**
+   are both visible - on the tab's label (§8.6) and on the card - and endable from
+   the card, without ending the session that started them (§8.8). What the roster had
+   and tabs still do not is one screen listing every session at a glance, which
+   decision 15 traded for the labels deliberately; §5.10's "no auto-kill" residue is
+   no longer invisible, which was the whole worry.
 
 ## 8. What is built
 
@@ -2123,28 +2124,11 @@ actually changed. A subagent running a twenty-minute training job and a subagent
 has gone quiet must not read identically, and the strip is the only place a session
 that is not on screen can say anything at all.
 
-**Still owed, deliberately not in this step.** Two debts, and the honest state of
-each:
-
-- *Ending an outstanding job from the window.* The capability is **already
-  exported** - `Manager.Get(id)` (`job/job.go:363`) and `(*Run).Kill()`
-  (`job/job.go:308`) are exactly what `job_kill` reaches through - so what is
-  missing is not a `host` or `job` API but the surface, plus a decision about where
-  it belongs: a button on each running card (which turns the card from one text
-  widget into a container, against the single-widget promise the ten-line cap in §8
-  depends on), or one window-level jobs view listing every session's runs. The
-  labels and cards report the residue; they cannot yet act on it.
-- *Per-session pause.* §5.7 accepted starvation and named "per-session pause and
-  kill" as the remedy that made that affordable. The draft of this section argued
-  pause had no referent and recommended retiring it; **the maintainer ruled it in
-  with a definition**: a paused session "simply does not continue once it hits the
-  next step boundary, and resuming just carries on". That is §8.7, and the reading
-  that made it cheap is that the boundary already exists - it is the one place the
-  loop appends job wakes before a model call - so pause is a wait there and nothing
-  else has to change.
-
-Shipping a "pause" that is really a cancel, or a job list whose buttons lie, is the
-kind of thing this document exists to record as *not finished*.
+**Both debts were then closed, by ruling rather than by argument.** The maintainer
+asked for pause with a definition - *"a paused session should simply not continue
+once it hits the next step boundary, and resuming just carries on"* - which is §8.7,
+and asked that the cards be real containers rather than rich text with background
+colors, which is where the jobs' End control lives (§8.8).
 
 ### 8.7 Pause: a session that stops at its next step boundary
 
@@ -2178,6 +2162,56 @@ footer beside the mode. `print` mode has no control yet - the loop capability is
 there, the front end is not - and `helpText` stayed silent about it for that reason:
 the shared help block must not advertise a command one of the two front ends will
 feed to the model as prose. The window's own scope note covers it.
+### 8.8 Cards became containers, and the job cards got an End control
+
+Ruled by the maintainer: *all of the cards should be real containers instead of
+being just rich text widgets with background colors.* So `blockCards` no longer
+returns bare `RichText` for the exit marker, an error, or a note - every transcript
+row is now an `area`: bubble, header naming the kind, body. That also retires the
+line in §8.1 that kept those three as plain rows, and it is what makes a card able
+to carry a control at all.
+
+`area.actions` is an empty horizontal box in the trailing slot of the header line -
+zero MinSize, so the majority of cards pay nothing for the possibility - and
+`setActions` is called from `newRow` while the row is being built, never after it
+reaches the canvas. That ordering is the whole reason there is no refresh path to
+get wrong here, and it keeps `blockCards` what it always was: a pure mapping from a
+block to its widgets. The registry is not a block, so the view supplies the wiring.
+
+**A running job's card gets End.** It calls `Manager.Get(id)` then `(*Run).Kill()` -
+the same pair `job_kill` already reaches through, so nothing new is invented about
+what ending a run means - and it exists because §5.10 deliberately leaves a job
+running past the turn that started it: a human watching a card that says *still
+running (14m)* had no way out except convincing the model to ask, or closing the
+whole session. Three rules make the button trustworthy:
+
+- **Armed like `×`.** The first press reads `End it?` and touches nothing; the
+  second within ten seconds ends the run. `Kill` waits through the unwind, so it
+  runs off-thread and the card's own state comes back from the registry on the next
+  refresh rather than from anything the button assumes.
+- **Absent when there is nothing to end.** The control is built only for a card
+  whose job the registry still reports as running, and only when the front end was
+  handed a `JobEnd` at all. A disabled button or a button wired to nothing is the
+  lying affordance §8.6 refused to ship.
+- **Per session.** `JobEnd` rides `GUIOptions`, so a window with tabs ends each
+  session's own runs; the ender a subagent's tab carries is that child's registry.
+
+**The regression that taught something about rows.** Wrapping notes in cards made
+the per-line split in `noteLocal` and `GUI.note` visible in the worst way: `/h`
+printed eight separate bubbles for one help block, and because the transcript
+materializes a *window of rows*, the help text that the test checked had been pushed
+out of it entirely. Both functions now append one card per message. The lesson is
+not that a test was brittle - the window's row budget is the real constraint, the
+same one the ten-line card cap is written against, and any change that turns one
+message into N rows spends it.
+
+One measured cost of a taller header: `estimateBlockHeight` counts a card's lines
+and a fixed chrome allowance, and it cannot know that this card's header row now
+carries a button. That is a one-frame drift, not a permanent lie - the visibility
+pass writes the row's actual height back into `blockH` (`fyneview.go:217`) - but a
+control that changes a card's height must be expected to shift the scrollbar by a
+few pixels the first time the row is seen.
+
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that
