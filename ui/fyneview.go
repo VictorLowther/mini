@@ -78,9 +78,7 @@ type guiView struct {
 	status      *widget.Label
 	editor      *chatInput
 
-	cancelItem *fyne.MenuItem
 	wasRunning bool
-	lastTitle  string
 
 	// streaming coalescing: sushi emits a chunk every few milliseconds;
 	// re-wrapping every live surface per chunk is a repaint storm that pegs
@@ -797,36 +795,6 @@ func (v *guiView) toggleThinking() {
 	v.noteLocal(map[bool]string{true: "thinking shown", false: "thinking hidden"}[on])
 }
 
-// copySelection is Edit ▸ Copy, and the only copy path that works everywhere in
-// this window: a selectable body copies itself while it holds focus, but taking
-// that focus is exactly what a card selection does, so ⌘C has to be answered above
-// the focus - see GUI.menus.
-//
-// After copying out of a card the caret goes back to the input, because a card
-// holding focus swallows every keystroke (widget.focusSelectable's TypedKey and
-// TypedRune are no-ops) and the input being typeable is not optional. The
-// highlight goes with the focus - Fyne draws a selection only on the focused
-// widget - so ⌘C doubles as the "copied" feedback; both halves cannot be had.
-func (v *guiView) copySelection() {
-	focus := v.win.Canvas().Focused()
-	sel, ok := focus.(interface{ SelectedText() string })
-	if !ok {
-		return
-	}
-	text := sel.SelectedText()
-	if text == "" {
-		return
-	}
-	v.gui.app.Clipboard().SetContent(text)
-	if focus == fyne.Focusable(v.editor) {
-		return // the input keeps its selection and its caret
-	}
-	// Not ClearSelection: the focused object is widget.focusSelectable, and only
-	// the RichText above it carries that method, so it is unreachable from outside
-	// package widget. Losing the focus hides the rectangles anyway.
-	v.win.Canvas().Focus(v.editor)
-}
-
 // ------------------------------------------------------------------ the view --
 
 func dimStyle() widget.RichTextStyle {
@@ -1388,8 +1356,14 @@ func (v *guiView) refreshStatus() {
 	if text := g.RunStats(); text != v.status.Text {
 		v.status.SetText(text)
 	}
-	if title := "mini · " + g.cfg.Mode; title != v.lastTitle {
-		v.lastTitle = title
+	// The title is the window's, and only the visible session speaks for it: a
+	// background tab's tick retitling the window would make the mode in the title
+	// bar belong to a session nobody is looking at. What was last applied is
+	// therefore remembered on the shell, not on this view - a tab that set the
+	// string while hidden would count it as applied and never show it when the
+	// human finally selects it.
+	if title := "mini · " + g.cfg.Mode; g.sh.isCurrent(g) && title != g.sh.lastTitle {
+		g.sh.lastTitle = title
 		v.win.SetTitle(title)
 	}
 	if running := g.loopRunning(); running != v.wasRunning {
@@ -1403,9 +1377,12 @@ func (v *guiView) refreshStatus() {
 		}
 		v.wasRunning = running
 		// The menu bar draws its dropdowns when opened, so the field alone
-		// carries the state; there is nothing to invalidate.
-		if v.cancelItem != nil {
-			v.cancelItem.Disabled = !running
+		// carries the state; there is nothing to invalidate. It is the window's
+		// item and this session's run, so only the visible tab drives it -
+		// otherwise the one enabled action in the menu stops a turn in whichever
+		// background session ticked last.
+		if item := g.sh.cancelItem; item != nil && g.sh.isCurrent(g) {
+			item.Disabled = !running
 		}
 	}
 }
@@ -1496,7 +1473,12 @@ func (v *guiView) showRunDone() {
 			status = "stopped"
 		}
 		v.appendBlock(block{kind: "note", text: "run finished: " + status})
-		v.gui.app.Quit()
+		// Only the last session leaves the window with nothing to show.
+		// A subagent's tab ending must not close the tab its human is reading,
+		// which is the one place its report was just written.
+		if v.gui.sh.liveSessions() <= 1 {
+			v.gui.sh.app.Quit()
+		}
 	}
 	v.refreshStatus()
 }
@@ -1525,7 +1507,7 @@ func (v *guiView) handleInput(text string) {
 		// the mode the next prompt will use) and prose is queued as steering,
 		// which lands in the history before the model's next call.
 		if text == quitCommand {
-			g.quit()
+			g.sh.quit()
 			return
 		}
 		if text == "" {
@@ -1704,15 +1686,27 @@ func (c *chatInput) KeyUp(key *fyne.KeyEvent) {
 // FocusLost reclaims the caret: tapping a non-focusable object (a bubble, the
 // scroll bar, blank space) makes Fyne clear canvas focus, and an entry that
 // never gets focus back is the "input box stopped accepting input" bug.
-// Nothing else in this window is focusable, so the input always wins. The
-// reclaim is deferred: FocusLost fires *before* the focus manager records the
+// The reclaim is deferred: FocusLost fires *before* the focus manager records the
 // loss, so an inline Focus(c) would early-return against the still-registered
 // focus.
+//
+// It is also limited to the visible session. With a tab per session the window
+// holds several inputs, and a background tab reclaiming a focus it no longer owns
+// would type into a transcript the human cannot see - the same bug with the sign
+// changed. (A card's text selection also holds focus legitimately; that is what
+// Edit > Copy hands back.)
 func (c *chatInput) FocusLost() {
 	c.Entry.FocusLost()
 	time.AfterFunc(0, func() {
 		c.v.gui.post(func() {
-			if c.v.win.Canvas().Focused() == nil {
+			// Both guards, and why: Fyne's FocusManager silently declines to focus
+			// content whose ancestor is hidden (internal/app/focus_manager.go), which
+			// is most of the protection a background tab needs - but a tab that has
+			// been deselected is not hidden *instantly*, and during DocTabs'
+			// transition the outgoing view is still visible, so without the
+			// isCurrent test the hidden session can win the caret in that window and
+			// the visible one stops accepting typing.
+			if c.v.win.Canvas().Focused() == nil && c.v.gui.sh.isCurrent(c.v.gui) {
 				c.v.win.Canvas().Focus(c)
 			}
 		})

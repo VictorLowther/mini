@@ -159,7 +159,7 @@ func TestGUIRestoresThinkingAndSize(t *testing.T) {
 	if !g.showReasoning() {
 		t.Error("the stored thinking preference was ignored")
 	}
-	if got := g.window.Canvas().Size(); got.Width != 1280 || got.Height != 800 {
+	if got := g.sh.window.Canvas().Size(); got.Width != 1280 || got.Height != 800 {
 		t.Errorf("window opened at %v, want the stored 1280x800", got)
 	}
 
@@ -173,7 +173,7 @@ func TestGUIRestoresThinkingAndSize(t *testing.T) {
 	}
 	// And quitting saves the size the window ended at.
 	s.rows = map[string]string{}
-	g.quit()
+	g.sh.quit()
 	if s.rows[settingWindowWidth] != "1280.00" || s.rows[settingWindowHeight] != "800.00" {
 		t.Errorf("quit stored %+v, want the window's 1280x800", s.rows)
 	}
@@ -186,7 +186,7 @@ func TestGUINoStore(t *testing.T) {
 	if g.showReasoning() {
 		t.Error("a window with no store opens collapsed")
 	}
-	if got := g.window.Canvas().Size(); got != defaultWindowSize {
+	if got := g.sh.window.Canvas().Size(); got != defaultWindowSize {
 		t.Errorf("window = %v, want the default %v", got, defaultWindowSize)
 	}
 	g.ToggleReasoning() // must not panic on a nil store
@@ -202,7 +202,7 @@ func TestSettingsWriteFailureIsOnlyALog(t *testing.T) {
 	if on := g.ToggleReasoning(); !on {
 		t.Error("a failed write must not lie about the in-memory state")
 	}
-	g.quit()
+	g.sh.quit()
 	if len(s.rows) != 0 {
 		t.Errorf("the failed write invented rows: %v", s.rows)
 	}

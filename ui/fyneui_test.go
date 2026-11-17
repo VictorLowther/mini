@@ -1586,7 +1586,7 @@ func TestGUICardTextSelectsAndCopies(t *testing.T) {
 		// And copy moves it: the same handler ⌘C reaches once mouse-down has taken
 		// focus onto the selection.
 		selectionOf(t, rt).TypedShortcut(&fyne.ShortcutCopy{})
-		if cb := p.app.Clipboard().Content(); !strings.Contains(cb, want) {
+		if cb := p.sh.app.Clipboard().Content(); !strings.Contains(cb, want) {
 			t.Errorf("clipboard holds %q, want %q", cb, want)
 		}
 	})
@@ -1677,7 +1677,7 @@ func TestGUICopyMenuCopiesAndReturnsFocus(t *testing.T) {
 		}
 		copyItem.Action()
 
-		if cb := p.app.Clipboard().Content(); !strings.Contains(cb, "build passed cleanly") {
+		if cb := p.sh.app.Clipboard().Content(); !strings.Contains(cb, "build passed cleanly") {
 			t.Errorf("Copy put %q on the clipboard", cb)
 		} else if strings.Contains(cb, "**") {
 			t.Errorf("Copy took the markers, not the rendering: %q", cb)

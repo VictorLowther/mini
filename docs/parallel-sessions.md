@@ -1373,11 +1373,14 @@ push).
    each shippable:
 
    1. `DocTabs` around the existing view, one tab, no new behaviour. **Done.**
-   2. Extract the per-session state `GUI` currently holds singularly - above all
+   2. **Built (§8.3).** Extract the per-session state `GUI` currently holds
+      singularly - above all
       `stream streamState`, which decides which transcript streamed text lands
       in, plus `pending`, `lastQ`, `contextNote` - into a `tab`, and move the ask
       queue with it. The risky step: leave `streamState` shared and a background
-      session writes into the transcript the human is reading.
+      session writes into the transcript the human is reading. It landed as
+      `shell` (the window) plus a `GUI` that *is* one tab, because `ui.UI` was
+      already the per-session contract; same seam, one fifth of the renaming.
    3. `CreateTab` to open a top-level session, with a working-directory picker,
       because a tab whose repository you cannot choose is a tab you cannot use.
    4. A child-created callback on `Process`, so a spawn opens its tab. Polling
@@ -1900,6 +1903,69 @@ failed" (`job/job.go:57-62`) - rather than a bug in it, so the fix belongs in th
 test: await quiescence instead of trusting the reap's deadline. Noted here so the
 next person who meets it does not spend an afternoon suspecting their own
 concurrency work.
+
+### 8.3 Step 7.2: the window became a `shell`, and a `GUI` became one session
+
+The plan said "extract the per-session state `GUI` currently holds singularly into
+a `tab`". It landed the other way round, for one reason: `ui.UI`
+(`Reasoning`/`Content`/`Message`/`Ask`/`Interactive`) plus the optional `Issuer`
+*already is* the per-session contract, and `GUI` already held exactly the
+per-session state behind it - so making `GUI` mean "one tab" and moving the
+window's own belongings into a new `shell` type cuts the same seam with a fraction
+of the renaming, and every existing `g.<field>` call site stayed valid. What the
+plan asked for is true either way: no per-session field is reachable from two
+sessions, and the ask queue moved with the session.
+
+`ui/shell.go` is the window: `app`, `window`, the `DocTabs` strip, the menu bar,
+the sticky thinking preference and window size, the one `app.Run()` and the one
+per-second tick. `ui/fyneui.go`'s `GUI` is one session: `cfg`, `loop`, `stream`,
+`pending`, `lastQ`, `asks`, `inflight`, `runDone`, `cancelRun`, `task`, `resume`,
+`sessionID`, its own mutex, and its own `guiView`. `NewGUI(o)` still returns a
+`*GUI` with a window around it, which is why `cmd/mini` and all 1673 lines of GUI
+tests needed no restructuring.
+
+Three collisions the step existed to kill, each now covered by a test in
+`ui/shell_test.go` that two sessions in one window run:
+
+- **streaming.** One shared `streamState` interleaved two turns and painted the
+  result into whichever tab repainted first. Each `GUI` owns its buffers, and its
+  `Loop.Handler` points at *its* `Content`/`Reasoning`.
+- **questions.** One `pending` slot and one `askQueue` meant a keystroke at one
+  session could answer another's `AskConfirm` - §5.5's safety property, one shared
+  field away from being void - and an unrelated repository's confirmation queued
+  behind a prompt nobody was looking at. Per-session queue (decision 15's
+  "one-at-a-time becomes per-tab"), per-session panel, per-session `Origin`-free
+  attribution: the tab *is* the attribution now.
+- **window chrome.** A background session's tick retitled the window with its mode
+  and its input could reclaim the caret. The title and the enabled state of
+  `Run ▸ Cancel turn` are applied by the visible session only, and what was last
+  applied is remembered on the shell (`lastTitle`), not on the view - a tab that
+  set the string while hidden would count it as applied and never show it when the
+  human finally selected it.
+
+Two findings about Fyne itself, both verified against source:
+
+- **`DocTabs.OnSelected` is what moves the keyboard.** Selecting a tab by click
+  selects the *content* and nothing else, so the newly visible transcript has no
+  focus owner (and the outgoing one's deferred `FocusLost` reclaim is exactly the
+  wrong thing to let fire). `shell` wires `OnSelected` to
+  focus-the-now-visible-input + refresh-its-status. `Select` on the already-current
+  item is a no-op that does *not* fire the callback, so `selectTab` repeats the
+  work rather than relying on it.
+- **`FocusManager.Focus` (internal/app/focus_manager.go) walks the complete object
+  tree and returns success *without switching focus* when an ancestor is hidden.**
+  So the toolkit already refuses to focus a hidden tab's input, which the focus
+  tests in `shell_test.go` cannot see - the assertion there is a net, not a proof.
+  The `isCurrent` clause in `chatInput.FocusLost` stays for the gap the toolkit
+  does not cover: a deselected tab is not hidden *instantly*, and through DocTabs'
+  transition the outgoing view is still visible and still focusable.
+
+Not in this step, still owned by later increments: `CreateTab` and the
+working-directory picker (7.3), the child-created callback (7.4), the attention
+marker and `⌥→`/`⌥←` and the real `CloseIntercept` teardown (7.5), and splitting
+the slash commands into tab-level and window-level with the batched cancel across
+N sessions (7.6). `/quit` is still window-level: it cancels every session's run in
+flight, which is what it always did with one.
 
 ## 9. Open questions
 

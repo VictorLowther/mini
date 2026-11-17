@@ -8,9 +8,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/driver/desktop"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/model"
@@ -45,16 +43,28 @@ type GUIOptions struct {
 	Post func(fn func())
 }
 
-// GUI is the Fyne desktop front end, the interactive face of mini. It is both
-// the UI the agent talks to and the owner of the event loop: the agent runs in
-// a goroutine and every callback reaches the screen through fyne.Do (the post
-// field), so all widget access happens on the toolkit goroutine. State shared
-// with the agent goroutine is guarded by one mutex.
+// GUI is ONE session's Fyne front end: the interactive face of mini for one
+// agent.Loop, and the owner of that session's transcript, input, question and
+// streaming state. The window it is drawn in belongs to a shell, which holds the
+// canvas, the tab strip, the menu bar and the single event loop, and may host any
+// number of these - one per top-level session and one per subagent (decision 15).
 //
-// The transcript model is ui/blocks.go: same blocks, same questions, same
-// answer semantics, same notes. Only the key names in the "how to leave" notes
-// speak desktop (esc for ctrl-c).
+// It is both the UI the agent talks to and the state behind it: the agent runs in
+// a goroutine and every callback reaches the screen through shell.post, so all
+// widget access happens on the toolkit goroutine. State shared with the agent
+// goroutine is guarded by one mutex - this session's.
+//
+// The transcript model is ui/blocks.go: same blocks, same questions, same answer
+// semantics, same notes. Only the key names in the "how to leave" notes speak
+// desktop (esc for ctrl-c).
 type GUI struct {
+	// sh is the window this session is drawn in.
+	sh *shell
+	// item is this session's tab in sh.tabs; the strip has no way to reorder, so
+	// the shell keeps sessions and items in the same order (consequence 3).
+	item *container.TabItem
+	v    *guiView
+
 	cfg        *agent.Config
 	loop       *agent.Loop
 	modelName  string
@@ -64,32 +74,13 @@ type GUI struct {
 	// model client (see model.Sushi.DiscoverContextWindow).
 	contextNote string
 
-	app       fyne.App
-	window    fyne.Window
-	logWriter *LogTarget
-	// tabs is the session strip. It holds exactly one item until the per-session
-	// state moves out of GUI (docs/parallel-sessions.md §5.15). The container is
-	// DocTabs and not AppTabs because, verified against Fyne 2.8.2, AppTabs has
-	// no close affordance, no create button and no scroller, and a tab per
-	// session needs all three; its mutation API is otherwise identical to
-	// DocTabs', which is why this was a cheap bet to make at the seam.
-	tabs *container.DocTabs
-	tab  *container.TabItem
-	v    *guiView // one session's view; N of these is what tabs is for
 	// jobs backs the live cards for calls that handed off. See GUIOptions.Jobs.
 	jobs JobReader
-	// asks serializes prompts so exactly one question is on screen at a time.
-	// See askQueue and docs/parallel-sessions.md §9.4.
+	// asks serializes prompts so exactly one question is on screen at a time *in
+	// this session*. Per-session is the point: one queue for the window would
+	// make an unrelated repository's confirmation wait behind the session the
+	// human is not even looking at (decision 15). See askQueue and §9.4.
 	asks askQueue
-
-	// post delivers a closure to the thread that owns the canvas, and it is the
-	// only way anything here may reach the view: the deferred passes are
-	// scheduled from time.AfterFunc callbacks, which run on the Go timer
-	// goroutine, and from the run and status goroutines. Production is fyne.Do.
-	// Tests inject a queue drained by the test goroutine, because the software
-	// driver runs Do inline on the calling goroutine and would otherwise let a
-	// timer mutate view state beside the canvas pass that is measuring it.
-	post func(fn func())
 
 	// inflight are the commands the current step has started but not finished,
 	// and inflightSince when they began. See Issuer.
@@ -102,11 +93,8 @@ type GUI struct {
 	runInfo  map[string]any
 	runError error
 	runDone  chan struct{}
-	// cancelRun stops the run (quit).
+	// cancelRun stops this session's run (quit, esc).
 	cancelRun context.CancelFunc
-	// reasoningVisible is toggled with ctrl+t / /t, and is sticky across
-	// launches (see ui/prefs.go); hidden until someone asks otherwise.
-	reasoningVisible bool
 	// task is the run's task text, shown on one line in place of the rendered
 	// instance template.
 	task string
@@ -115,42 +103,40 @@ type GUI struct {
 	resume     []model.Message
 	resumeNote string
 	sessionID  string
-
-	// settings is the sticky-state store handed in through GUIOptions; nil
-	// means this GUI has nowhere to remember anything. It is written from the
-	// toolkit goroutine only, and never read after construction.
-	settings Settings
 }
 
-// NewGUI builds the window and installs the GUI as the loop's streaming
-// handler. Cfg and Model fields may be zero on the startup-error path; the
-// GUI must still be able to show a message.
+// post delivers a closure to the thread that owns the canvas, and it is the only
+// way anything here may reach the view: the deferred passes are scheduled from
+// time.AfterFunc callbacks, which run on the Go timer goroutine, and from the run
+// goroutine. Production is fyne.Do; tests inject a queue drained by the test
+// goroutine, because the software driver runs Do inline on the calling goroutine
+// and would otherwise let a timer mutate view state beside the canvas pass that is
+// measuring it. A method rather than a field so that every existing call site
+// stays valid while the function itself belongs to the window.
+func (g *GUI) post(fn func()) { g.sh.post(fn) }
+
+// NewGUI builds a session's front end and, when the options carry no window yet,
+// the window around it. Cfg and Model fields may be zero on the startup-error
+// path; the GUI must still be able to show a message.
 func NewGUI(o GUIOptions) *GUI {
+	sh := newShell(o)
+	return sh.open(o)
+}
+
+// open adds one more session to the window: the whole of what a second
+// repository or a spawned subagent needs is a GUIOptions and a tab.
+func (sh *shell) open(o GUIOptions) *GUI {
 	cfg := o.Cfg
 	if cfg == nil {
 		cfg = &agent.Config{}
 	}
-	a := o.App
-	if a == nil {
-		a = app.New()
-	}
-	post := o.Post
-	if post == nil {
-		post = fyne.Do
-	}
 	g := &GUI{
+		sh:         sh,
 		cfg:        cfg,
-		post:       post,
 		loop:       o.Loop,
 		configName: o.ConfigName,
-		logWriter:  o.LogWriter,
-		app:        a,
-		runDone:    make(chan struct{}),
-		settings:   o.Settings,
 		jobs:       o.Jobs,
-		// The thinking toggle comes back from the store; with nothing stored
-		// the window opens collapsed, as it always did.
-		reasoningVisible: loadThinkingShown(o.Settings),
+		runDone:    make(chan struct{}),
 	}
 	if o.Model != nil {
 		g.modelName = o.Model.Model
@@ -163,86 +149,48 @@ func NewGUI(o GUIOptions) *GUI {
 			g.contextNote = o.Model.ContextWindowNote()
 		}
 	}
-	w := a.NewWindow("mini")
-	g.window = w
-	g.v = newGUIView(g, w)
-	// The tab strip wraps the existing view unchanged, which is what makes this
-	// increment behaviour-neutral: nothing else in the file reaches for the
-	// window's content object, so every current path - banner, transcript,
-	// question panel, live cards - runs inside the one tab exactly as before.
-	g.tabs = container.NewDocTabs(container.NewTabItem(g.tabLabel(), g.v.root()))
-	g.tab = g.tabs.Items[0]
-	g.tabs.SetTabLocation(container.TabLocationTop)
-	// CloseIntercept is set, and it refuses. This is the §5.15 gotcha that turns
-	// a half-wired close into a lost session: DocTabs' renderer puts an × on
-	// every tab, and close() calls the intercept *instead of* removing the item
-	// and firing OnClosed. With no intercept at all, a stray hover click would
-	// delete the only tab and leave an empty window holding a live session -
-	// worse than any way mini currently has of losing work. The per-tab quit
-	// guard that makes × mean "stop this session, or cancel" is a later step, so
-	// until it exists the × says so rather than acting.
-	g.tabs.CloseIntercept = func(*container.TabItem) {
-		g.v.noteLocal("a tab closes its session once the per-tab quit guard lands; leave with /quit for now")
-	}
-	w.SetContent(g.tabs)
-	w.SetMainMenu(g.menus())
-	// The saved size is the user's, and it is applied before Show so the
-	// window opens at the size it closed at instead of cascading one resize
-	// in front of them.
-	w.Resize(loadWindowSize(o.Settings))
-	// Closing the window is the deliberate way out: same path as /quit,
-	// cancelling the run if one is in flight.
-	w.SetOnClosed(g.quit)
+	g.v = newGUIView(g, sh.window)
+	sh.addTab(g)
 	if o.Loop != nil {
 		o.Loop.Handler = &model.Handler{Content: g.Content, Reasoning: g.Reasoning}
 	}
 	return g
 }
 
-// tabLabel is the tab's title. It names the model because that is the only
-// per-session identity GUI holds today: agent.Loop carries no session pointer,
-// and the name and working directory that would actually tell three tabs apart
-// live on host.Session, arriving with the steps that let a human open a second
-// one (§5.15). Until then a second tab would read the same, which is honest
-// about what is wired rather than a placeholder someone forgets to replace.
-func (g *GUI) tabLabel() string {
+// label is the tab's title: what actually tells two tabs apart. A top-level
+// session names its model until the host hands over a working directory and a
+// name (§5.15, and increment 3 is what makes a second top-level tab possible);
+// a subagent is named by the spawner, and that name is the only thing the human
+// has to go on.
+func (g *GUI) label() string {
 	if g.modelName != "" {
 		return g.modelName
 	}
 	return "session"
 }
 
-// Interactive: the GUI always has a human on the other end.
+// Interactive reports whether a human is on the other end. A GUI exists because a
+// human opened a window, so the answer is always yes - and it is per session: the
+// limits a session may cross are the ones its own tab can be asked about.
 func (g *GUI) Interactive() bool { return true }
 
-// Run builds the transcript, shows the window, drives the loop and blocks in
-// the toolkit event loop until the user quits. It must be called on the main
-// goroutine: Fyne's driver owns it from app.Run on (see cmd/mini/gui.go).
+// Run shows the window, drives this session's loop and blocks in the toolkit event
+// loop until the user quits. It must be called on the main goroutine: Fyne's driver
+// owns it from app.Run on. The window's event loop is the shell's; this is the
+// entry point for the session the CLI handed the task to.
 func (g *GUI) Run(ctx context.Context, task string) (map[string]any, error) {
-	undo := g.logWriter.Mute()
-	defer undo()
+	return g.sh.run(g, ctx, task)
+}
 
-	runCtx, cancelRun := context.WithCancel(ctx)
+// cancelRunTurn stops this session's run in flight, leaving every other session in
+// the window alone. Quit calls it for each of them.
+func (g *GUI) cancelRunTurn() {
 	g.mu.Lock()
-	g.cancelRun = cancelRun
+	cancel := g.cancelRun
 	g.mu.Unlock()
-	g.prepareTranscript()
-	g.v.start()
-
-	stopTicker := make(chan struct{})
-	defer close(stopTicker)
-	go g.drive(runCtx, task)
-	go g.tickStatus(stopTicker)
-
-	g.app.Run()
-	// Give the loop a moment to finish saving its trajectory.
-	select {
-	case <-g.runDone:
-	case <-time.After(2 * time.Second):
+	if g.loopRunning() && cancel != nil {
+		cancel()
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.runInfo, g.runError
 }
 
 // ShowError presents a setup failure inside the window - the only surface the
@@ -253,7 +201,7 @@ func (g *GUI) ShowError(err error) int {
 	g.v.appendBlock(block{kind: "error", text: "mini: " + err.Error()})
 	g.v.appendBlock(block{kind: "note", text: "close the window or type /quit to leave"})
 	g.v.start()
-	g.app.Run()
+	g.sh.app.Run()
 	return 1
 }
 
@@ -276,42 +224,6 @@ func (g *GUI) prepareTranscript() {
 		g.v.noteLocal(g.resumeNote)
 	}
 	g.v.refreshStatus()
-}
-
-// tickStatus refreshes the footer once a second while a command runs, and keeps
-// going after the turn ends for as long as the registry has anything running.
-//
-// The extension is the point: a call that handed off is not finished, and the
-// card that tracks it has to keep following the job through the idle window
-// between turns - which is where a training run spends nearly all of its life.
-// The lifetime stays the run's own (this goroutine is stopped by the same defer
-// that closes stopTicker), so the view never gains a timer outliving its window.
-func (g *GUI) tickStatus(stop <-chan struct{}) {
-	t := time.NewTicker(time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-		}
-		g.post(func() {
-			g.v.refreshStatus()
-			if g.jobs != nil {
-				g.v.refreshJobCards()
-			}
-		})
-		select {
-		case <-g.runDone:
-			// The turn is over. Stop only once nothing is running: quitting the
-			// watch here would freeze every handed-off card at "still running"
-			// and never show the outcome the wait is for.
-			if g.liveJobs() == 0 {
-				return
-			}
-		default:
-		}
-	}
 }
 
 // drive asks for a task when needed, then runs the loop.
@@ -337,38 +249,6 @@ func (g *GUI) finish(info map[string]any, err error) {
 	g.runInfo, g.runError = info, err
 	g.mu.Unlock()
 	g.post(func() { g.v.showRunDone() })
-}
-
-// quit ends the app: the window closes and Run returns. A running loop is
-// cancelled first, so leaving never orphans a command mid-execution, and the
-// sticky state is written before the driver takes the window away - this is
-// the one moment the size is guaranteed to still be readable and the last
-// moment anybody cares.
-func (g *GUI) quit() {
-	g.mu.Lock()
-	cancel := g.cancelRun
-	g.mu.Unlock()
-	if g.loopRunning() && cancel != nil {
-		cancel()
-	}
-	g.saveStickyState()
-	g.app.Quit()
-}
-
-// saveStickyState writes what the next launch restores: the thinking toggle
-// and the window's content size (the same unit Resize takes, which is why
-// reading the canvas rather than the content tree is the honest measurement).
-// Safe from the toolkit goroutine, the only place it is called.
-func (g *GUI) saveStickyState() {
-	if g.settings == nil {
-		return
-	}
-	saveThinkingShown(g.settings, g.showReasoning())
-	if g.window != nil {
-		if size := g.window.Canvas().Size(); size.Width > 0 && size.Height > 0 {
-			saveWindowSize(g.settings, size)
-		}
-	}
 }
 
 var _ UI = (*GUI)(nil)
@@ -583,26 +463,14 @@ func (g *GUI) PendingQuestion() Question {
 	return g.lastQ
 }
 
-// ToggleReasoning flips the collapsed state of thinking blocks, and remembers
-// the flip: quitting and coming back leaves it exactly where the user left it.
-func (g *GUI) ToggleReasoning() bool {
-	g.mu.Lock()
-	g.reasoningVisible = !g.reasoningVisible
-	on := g.reasoningVisible
-	g.mu.Unlock()
-	// Written outside the lock, because the write is a database call: one
-	// upsert on a local WAL file is microseconds, and the settings layer caps
-	// itself at two seconds, so the worst a locked database can cost is a slow
-	// keystroke rather than a hung window.
-	g.saveStickyState()
-	return on
-}
+// ToggleReasoning and showReasoning reach the window's thinking state: one
+// preference applied to every session's transcript, because the toggle rebuilds
+// all of them in a single pass anyway (ui/prefs.go keeps it across launches).
+func (g *GUI) ToggleReasoning() bool { return g.sh.toggleThinking() }
 
-func (g *GUI) showReasoning() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.reasoningVisible
-}
+// showReasoning is the window's thinking state, read while this session's cards
+// are being built.
+func (g *GUI) showReasoning() bool { return g.sh.showReasoning() }
 
 // loopRunning reports whether the agent is inside Loop.Run.
 func (g *GUI) loopRunning() bool { return g.loop != nil && g.loop.Running() }
@@ -662,46 +530,4 @@ func (g *GUI) snapshot() agent.Snapshot {
 		return agent.Snapshot{}
 	}
 	return g.loop.Snapshot()
-}
-
-// ------------------------------------------------------------------- menus --
-
-func (g *GUI) menus() *fyne.MainMenu {
-	run := fyne.NewMenu("Run")
-	cancel := fyne.NewMenuItem("Cancel turn", func() {
-		if !g.loopRunning() {
-			return
-		}
-		g.CancelCurrentTurn()
-		g.v.noteLocal("cancelling this turn…")
-	})
-	g.v.cancelItem = cancel
-	run.Items = append(run.Items, cancel)
-	run.Items = append(run.Items, fyne.NewMenuItem("Compact now", func() {
-		if !g.loopRunning() {
-			return
-		}
-		g.loop.RequestCompaction()
-		g.v.noteLocal("compaction armed: runs before the model's next turn")
-	}))
-	run.Items = append(run.Items, fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", g.quit))
-	quit := run.Items[len(run.Items)-1]
-	// Platform conventions: ⌘ on macOS, Ctrl elsewhere (KeyModifierShortcut
-	// Default is the platform's primary modifier).
-	quit.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyQ, Modifier: fyne.KeyModifierShortcutDefault}
-	thinking := fyne.NewMenuItem("Show thinking", func() { g.v.toggleThinking() })
-	thinking.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyT, Modifier: thinkingMods()}
-	commands := fyne.NewMenuItem("Commands", func() {
-		g.v.noteLocal("Current mode: " + g.cfg.Mode + "\n" + helpText)
-	})
-	// Edit exists for one reason: glfw hands a shortcut to the focused widget and
-	// stops there, so a canvas-level ⌘C never runs while a card's text selection
-	// holds the focus. Main-menu shortcuts fire *before* the focused widget
-	// (internal/driver/glfw/window.go triggerMainMenuShortcut), which is what makes
-	// Copy mean the same thing in the input and in any card body.
-	copyItem := fyne.NewMenuItem("Copy", g.v.copySelection)
-	copyItem.Shortcut = &fyne.ShortcutCopy{}
-	edit := fyne.NewMenu("Edit", copyItem)
-	return fyne.NewMainMenu(run, edit, fyne.NewMenu("View", thinking), fyne.NewMenu("Help", commands))
 }
