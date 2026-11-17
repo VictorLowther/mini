@@ -413,8 +413,15 @@ func (l *Loop) spawnObservation(ctx context.Context, action model.Action, sink i
 		return refusedObservation(err)
 	}
 	fmt.Fprintf(sink, "started subagent %q as job %s, output at %s\n", reply.Name, reply.JobID, reply.OutputPath)
+	fmt.Fprintf(sink, "it runs in its own session; its report arrives as a background result when it finishes.\n")
+	fmt.Fprintf(sink, "to steer it or ask it for more, use job_send with this id.\n")
+	// Pending, not returncode 0 - the same lesson the handoff path already
+	// records (see the comment on `detached` above). A freshly spawned subagent
+	// has done nothing yet, and a 0 here is read by every front end as "this
+	// call finished successfully", which would close the card on a conversation
+	// that has not produced a line.
 	return env.Result{
-		ReturnCode: 0,
+		Pending: true,
 		Extra: map[string]any{
 			"job_id": reply.JobID, "job_output_path": reply.OutputPath,
 			"subagent": reply.Name,

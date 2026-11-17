@@ -132,7 +132,19 @@ func (a Action) Display() string {
 // gate's SHELL_TOOLS set, and both are right for a registry that can *launch*
 // from a tool. Neither argument reaches ending a run that exists.
 func (a Action) NeedsConfirmation() bool {
-	return a.ToolName() == ToolBash
+	// Delegating counts alongside starting a command, because a subagent is the
+	// same act with a wider reach: it runs a whole session in the parent's
+	// directory with the parent's tools, and nothing after the spawn is visible
+	// to the human until the report lands. omp's posture - "the parent task
+	// approval is the authorization boundary" (docs/parallel-sessions.md §3.7) -
+	// is only true if the boundary is a prompt rather than a suggestion, and this
+	// is the one place it can be one.
+	//
+	// `job_send` deliberately stays ungated, on the same reasoning as `job_kill`:
+	// it can begin nothing. It redirects work the parent was already allowed to
+	// start, and a prompt per steering message would make the mitigation slower
+	// than the problem it is there for.
+	return a.ToolName() == ToolBash || a.ToolName() == ToolAgent
 }
 
 // ToolCall is an issued call plus the open file its complete merged output is

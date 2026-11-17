@@ -1127,6 +1127,36 @@ cost that actually matters on one GPU. A runaway is visible in `jobs` with a nam
 an elapsed time and an output path - a thing a human can act on, where a silent
 budget cut is a thing that merely stops.
 
+**Two wiring gaps found by asking "is it actually wired in?" rather than by
+reading the implementation notes.** Both were in the spawn path, and both were
+the kind that a green test suite would never show because nothing had been
+written to look at them:
+
+- **Delegation was not gated.** `NeedsConfirmation` had grown to cover bash and
+  the three job tools and had simply never been told about the fourth thing that
+  starts work. So a `confirm`-mode human would have approved the parent's
+  commands while an agent quietly spawned whole sessions beside them. That
+  matters more than an ordinary missed gate: §3.7's omp posture rests on "the
+  parent `task` approval is the authorization boundary", and a boundary nobody is
+  prompted at is not a boundary. `job_send` stays ungated on the existing
+  job_kill reasoning - it can begin nothing.
+- **A running subagent looked like a finished call.** The spawn observation
+  returned `ReturnCode: 0`, and `ui/blocks.go:88` keys its live card on
+  `obs.Pending` - so the card closed immediately, reporting a delegation that had
+  produced no output as a successful one, and the running child became
+  invisible in the one place the human looks. The handoff path already carries a
+  comment explaining why `Pending` rather than `0` - "a 0 here is what made a
+  handed-off call look like a succeeded one in every front end that reads it" -
+  and the spawn path had not been given the same treatment it warned about.
+
+`TestNeedsConfirmationCoversDelegation` pins the gate across all five tools,
+including the bare unlabelled action that defaults to bash.
+`TestKillStopsALiveSubagent` is the one that the budget removal makes
+load-bearing: with no ceiling left, `job_kill` and `Quit` are the only brakes, so
+stopping a mid-turn child has to work, settle its row as `killed`, leave its loop
+not running, and hand the parent a summary with how far it got rather than a
+blank.
+
 What stays in every reading is the **accounting**: `Cost`, `NCalls`, the tree
 total, the card headers, the trajectory. Those answer "what did this cost", which
 is a different question from "when should we stop you", and §5.8's rollup depends

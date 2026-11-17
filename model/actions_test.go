@@ -282,3 +282,35 @@ func TestToolSetRenderingsAgree(t *testing.T) {
 		t.Error("a subagent lost the job tools it needs for its own background work")
 	}
 }
+
+// TestNeedsConfirmationCoversDelegation pins the gate's shape now that there are
+// five tools. Spawning belongs with bash because a subagent is the same act -
+// starting work - with a wider reach and nothing visible until the report lands.
+// The three job tools stay ungated on the reasoning that already covers
+// job_kill: they can begin nothing, so prompting for them makes the mitigation
+// slower than the problem.
+func TestNeedsConfirmationCoversDelegation(t *testing.T) {
+	cases := []struct {
+		tool string
+		want bool
+		why  string
+	}{
+		{ToolBash, true, "runs a command"},
+		{ToolAgent, true, "starts a whole session"},
+		{ToolJobs, false, "reads a table"},
+		{ToolJobKill, false, "ends only work already authorised"},
+		{ToolJobSend, false, "redirects work already authorised"},
+	}
+	for _, c := range cases {
+		got := Action{Tool: c.tool, Command: "x"}.NeedsConfirmation()
+		if got != c.want {
+			t.Errorf("%s NeedsConfirmation = %v, want %v (%s)", c.tool, got, c.want, c.why)
+		}
+	}
+	// A bare action predates the tool set and is bash by ToolName's default, so
+	// it must still be gated.
+	bare := Action{Command: "rm -rf /"}
+	if !bare.NeedsConfirmation() {
+		t.Error("an unlabelled action escaped the gate")
+	}
+}

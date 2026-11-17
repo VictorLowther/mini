@@ -1072,3 +1072,62 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return b
 }
+
+// TestKillStopsALiveSubagent is the control that replaced the budgets. With no
+// step, cost or wall-clock ceiling left (§5.14), job_kill and Quit are the only
+// brakes on a runaway - so the one thing that must unquestionably work is ending
+// a child that is mid-turn, with its row settling honestly and the parent being
+// told rather than left guessing.
+func TestKillStopsALiveSubagent(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ChildModel = func(string) model.Model {
+		// Never submits: the only way to be still running when the parent
+		// decides to stop it.
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+			turn("sleep 30; echo never"),
+		}}
+	}
+	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "stuck", Prompt: "take forever"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForHost(t, "the child to be running", func() bool {
+		row, err := parent.Sess.GetJob(reply.JobID)
+		return err == nil && row.State == session.JobRunning
+	})
+
+	run, err := parent.Jobs.Get(reply.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	row := waitJobDone(t, parent, reply.JobID)
+	if row.State != session.JobKilled {
+		t.Errorf("state = %s, want killed", row.State)
+	}
+	// The parent is told, and told something it can act on: the report of a
+	// killed child names how far it got rather than going blank.
+	kid, ok := p.childOfJob(parent.ID.String(), reply.JobID)
+	if !ok {
+		t.Fatal("child not mapped")
+	}
+	if kid.Running() {
+		t.Error("the child's loop is still running after the kill")
+	}
+	body := string(mustRead(t, row.OutputPath))
+	if strings.Contains(body, "ended without a report") {
+		t.Errorf("a killed child produced the blank summary: %q", body)
+	}
+	// And the row is not counted as live work any more, which is what frees the
+	// parent's registry view.
+	if n := parent.LiveJobs(); n != 0 {
+		t.Errorf("parent live jobs = %d after the kill, want 0", n)
+	}
+}
