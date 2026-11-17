@@ -1096,23 +1096,15 @@ func alignRT(rt *widget.RichText, align fyne.TextAlign) {
 // widest real line; the horizontal scroller owns the overflow, so long
 // output never pushes the transcript (or the window) wider than it is.
 func monoBlock(lines []string) fyne.CanvasObject {
-	// A selectable Label, not a RichText. Fyne 2.8 puts selection in
-	// widget.selectable and embeds it in Label and Entry only - RichText has no
-	// selection at all - and card text is the one thing in this UI a person
-	// routinely wants to lift out and paste somewhere. The Label keeps the whole
-	// rendering contract monoBlock had: monospace, no reflow, leading-aligned,
-	// MinSize reporting the widest real line so the horizontal scroller owns the
-	// overflow. What it gives back is drag-select, double-click word select,
-	// right-click Copy and the system copy shortcut, all of them standard.
+	// Wraps the shared selectable label in a horizontal scroller: the columns of
+	// `$ cmd` / `in <cwd>` / `exit N` are the point, so the text must not reflow,
+	// and the scroller owns the overflow. MinSize reports the widest real line,
+	// which is what keeps a long result from pushing the transcript - or the
+	// window - wider than it is.
 	//
 	// TextGrid remains the wrong tool for the reason this file already records:
 	// a canvas.Text and a rectangle per *cell*, walked every frame.
-	l := widget.NewLabel(strings.Join(lines, "\n"))
-	l.TextStyle = fyne.TextStyle{Monospace: true}
-	l.Wrapping = fyne.TextWrapOff
-	l.Alignment = fyne.TextAlignLeading
-	l.Selectable = true
-	return container.NewHScroll(l)
+	return container.NewHScroll(monoRT(lines))
 }
 
 // transcriptGrid renders a tool block's lines as fixed-width text inside a
@@ -1124,29 +1116,34 @@ func monoBlock(lines []string) fyne.CanvasObject {
 // grow vertical scrollbars, which is what Scroll.SetMinSize expresses - a
 // floor the layout may not squeeze below, and no taller.
 func transcriptGrid(lines []string) fyne.CanvasObject {
-	rt := monoRT(lines)
-	sc := container.NewScroll(rt)
+	txt := monoRT(lines)
+	sc := container.NewScroll(txt)
 	line := fyne.MeasureText("M", theme.TextSize(), fyne.TextStyle{Monospace: true}).Height
 	capH := 10 * line
-	if h := rt.MinSize().Height; h < capH {
+	if h := txt.MinSize().Height; h < capH {
 		capH = h
 	}
 	sc.SetMinSize(fyne.NewSize(0, capH))
 	return sc
 }
 
-// monoRT is the single monospace RichText behind monoBlock and the capped
-// transcript grid: one shaped widget, not a cell grid.
-func monoRT(lines []string) *widget.RichText {
-	rt := widget.NewRichText(&widget.TextSegment{
-		Text: strings.Join(lines, "\n"),
-		Style: widget.RichTextStyle{
-			TextStyle: fyne.TextStyle{Monospace: true},
-			Alignment: fyne.TextAlignLeading,
-		},
-	})
-	rt.Wrapping = fyne.TextWrapOff
-	return rt
+// monoRT is the one monospace text widget behind both the capped transcript card
+// and the scrolling monoBlock: a selectable Label, shaped as a single run rather
+// than a cell grid.
+//
+// It used to be a RichText, which is why card text could not be copied: Fyne
+// implements selection in widget.selectable and embeds it in Label and Entry
+// only, so no amount of clicking or ⌘C on a RichText does anything at all. The
+// name is kept because a dozen call sites read better for saying what the text
+// *is* rather than which widget class carries it, and because the one thing that
+// must not happen again is a reader assuming mono means RichText.
+func monoRT(lines []string) *widget.Label {
+	l := widget.NewLabel(strings.Join(lines, "\n"))
+	l.TextStyle = fyne.TextStyle{Monospace: true}
+	l.Wrapping = fyne.TextWrapOff
+	l.Alignment = fyne.TextAlignLeading
+	l.Selectable = true
+	return l
 }
 
 func exitRT(b block) *widget.RichText {

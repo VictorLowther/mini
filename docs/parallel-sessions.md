@@ -1427,6 +1427,31 @@ Two flakes surfaced while landing this, one real and one not:
   sometimes needed a call the script no longer had. Fixed by giving the script
   slack for both orderings, with the reason in the test. The assertion was always
   about the child reporting and the row settling, never about turn count.
+### 8.1 Copying out of the cards, and the test that could not see it
+
+Card text is now selectable, and it took two attempts. The first swapped
+`monoBlock` from `RichText` to a selectable `Label`, and its test asserted that
+`monoBlock` returns a selectable `Label` - and passed, while the user still could
+not copy anything, because the transcript cards do not go through `monoBlock`.
+They go through `transcriptGrid`, which built its own `RichText` via `monoRT`.
+`RichText` has no selection whatsoever in Fyne 2.8: `widget.selectable` is
+embedded by `Label` and `Entry` only. So the fix had to move `monoRT` itself, and
+the test had to move with it to the widget the user actually clicks.
+
+The lesson is not "test the real path", which everyone already knows, but that a
+test which asserts *a helper returns what the helper was changed to return* is
+not a test of the feature. The replacement drives a mouse-down and a drag across
+the card body and then asks the clipboard what arrived, which is the only version
+of this that can fail for the reason it just failed for. Two incidental findings
+came with it: the drag has to carry the *moved* position, because Fyne's
+selection tracks the pointer and ignores the delta, and an unsized text widget
+collapses every position onto one character, so a selection test needs the widget
+laid out or it reports the feature broken for the wrong reason.
+
+Prose bubbles are still `RichText`, because they render markdown and there is no
+selectable markdown widget; making the report text copyable means choosing
+between formatting and the clipboard. That is still open.
+
 - **`TestGUITrajectoryMatchesPrintMode` intermittently deadlocks, and the first
   write-up of this got the attribution wrong.** It was recorded above as
   link/CGO contention, because it appeared in full-suite runs while the same

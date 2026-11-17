@@ -1156,7 +1156,7 @@ func TestGUITranscriptIsAShellSessionNotJSON(t *testing.T) {
 func TestGUIToolCardScrollsPastTenLines(t *testing.T) {
 	lineH := float32(0)
 	{
-		one := transcriptGrid([]string{"a"}).(*container.Scroll).Content.(*widget.RichText)
+		one := transcriptGrid([]string{"a"}).(*container.Scroll).Content.(*widget.Label)
 		lineH = one.MinSize().Height
 	}
 	short := transcriptGrid([]string{"1", "2", "3"}).(*container.Scroll)
@@ -1168,14 +1168,17 @@ func TestGUIToolCardScrollsPastTenLines(t *testing.T) {
 	if got, capH := long.MinSize().Height, 10*lineH; got > capH+1 {
 		t.Errorf("40-line card min height = %v, want the 10-line cap %v", got, capH)
 	}
-	if content := long.Content.(*widget.RichText).MinSize().Height; content <= long.MinSize().Height {
+	if content := long.Content.(*widget.Label).MinSize().Height; content <= long.MinSize().Height {
 		t.Errorf("40-line content height %v is not above its %v viewport: nothing would scroll",
 			content, long.MinSize().Height)
 	}
-	// The single-widget promise behind the cap: the body is one RichText, so
-	// capping is one MinSize, not a walk over materialized rows.
-	if _, ok := long.Content.(*widget.RichText); !ok {
-		t.Errorf("card content = %T, want a single RichText", long.Content)
+	// The single-widget promise behind the cap: the body is one text widget, so
+	// capping is one MinSize, not a walk over materialized rows. It is a Label
+	// and not a RichText because only Label and Entry can select, and the card
+	// body has to be copyable - see TestGUICardTextSelectsAndCopies, which is the
+	// test that checks the promise that matters rather than this type assertion.
+	if _, ok := long.Content.(*widget.Label); !ok {
+		t.Errorf("card content = %T, want a single selectable Label", long.Content)
 	}
 }
 
@@ -1499,31 +1502,87 @@ func TestGUIRunningCardYieldsToAPrompt(t *testing.T) {
 	<-asked
 }
 
-// TestGUICardTextIsSelectable guards the widget choice behind copy: Fyne puts
-// selection in widget.selectable, embedded by Label and Entry only, and card
-// text used to render as RichText, which cannot select. A future "cleanup" that
-// swaps the mono body back to RichText would quietly take clipboard copy away
-// again, and no test would notice except a human trying to paste a path.
-func TestGUICardTextIsSelectable(t *testing.T) {
-	p := newGUIForTest(t, newConfig("yolo"), &agent.Loop{Cfg: newConfig("yolo"),
-		Model: &model.Deterministic{}, Env: &env.Local{}})
+// TestGUICardTextSelectsAndCopies drives a real selection through the widget the
+// transcript cards actually build.
+//
+// It exists because the first attempt at this feature was wrong in a way its own
+// test could not see: it swapped monoBlock to a selectable Label, asserted that
+// monoBlock returned a selectable Label, and passed - while the cards kept
+// rendering through transcriptGrid, which builds its own RichText. RichText has
+// no selection at all in Fyne, so nothing the user clicked could be copied and
+// every test stayed green. A test that checks the widget a helper returns is a
+// test of the helper; this one goes to the card, selects in it the way a mouse
+// does, and asks the clipboard what arrived.
+func TestGUICardTextSelectsAndCopies(t *testing.T) {
+	c := newConfig("yolo")
+	p := newGUIForTest(t, c, &agent.Loop{Cfg: c, Model: &model.Deterministic{}, Env: &env.Local{}})
+	// A span of real length, not the whole line: the point is that a mouse
+	// gesture produces a selection at all and that copy moves it. The exact
+	// column a headless layout resolves x=112 to depends on the scroll's
+	// measured width, and pinning it would make this test about Fyne's metrics.
+	want := "echo"
+
 	p.do(func() {
-		hx, ok := monoBlock([]string{"$ echo hi", "hi"}).(*container.Scroll)
+		sc, ok := transcriptGrid([]string{"$ echo path/to/the/thing", "path/to/the/thing"}).(*container.Scroll)
 		if !ok {
-			t.Fatal("monoBlock no longer returns a horizontal scroller")
+			t.Fatal("transcriptGrid is not a scroller")
 		}
-		lb, ok := hx.Content.(*widget.Label)
+		lb, ok := sc.Content.(*widget.Label)
 		if !ok {
-			t.Fatalf("card body is %T, want a *widget.Label: only Label and Entry can select", hx.Content)
+			t.Fatalf("card body is %T, want *widget.Label: RichText cannot select, which is the whole bug", sc.Content)
 		}
 		if !lb.Selectable {
-			t.Error("card body label is not Selectable: copy would be mouse-only with no shortcut")
+			t.Fatal("card body label is not Selectable")
 		}
 		if !lb.TextStyle.Monospace {
-			t.Error("card body lost monospace: column-aligned output would reflow")
+			t.Error("card body lost monospace")
 		}
-		if lb.Wrapping != fyne.TextWrapOff {
-			t.Errorf("Wrapping = %v, want TextWrapOff so the scroller owns overflow", lb.Wrapping)
+
+		// Sized before selecting, or the drag resolves to nothing: an unsized
+		// label reports a zero-size box, and a selection dragged across a
+		// zero-size box collapses to a single character - which is how this test
+		// first failed, and it looked exactly like the feature being broken.
+		lb.Resize(fyne.NewSize(320, 60))
+		lb.Refresh()
+
+		type selector interface {
+			MouseDown(*desktop.MouseEvent)
+			Dragged(*fyne.DragEvent)
+			DragEnd()
+			TypedShortcut(fyne.Shortcut)
+		}
+		var sel selector
+		for _, o := range test.WidgetRenderer(lb).Objects() {
+			if cand, ok := o.(selector); ok {
+				sel = cand
+				break
+			}
+		}
+		if sel == nil {
+			t.Fatal("no selectable child in the card body's renderer: only Label and Entry embed widget.selectable")
+		}
+		sel.MouseDown(&desktop.MouseEvent{Button: desktop.MouseButtonPrimary,
+			PointEvent: fyne.PointEvent{Position: fyne.NewPos(2, 4)}})
+		// The moved position, not just the delta: Fyne's selection tracks the
+		// pointer, so a Dragged event that repeats the anchor position selects
+		// from the anchor to the anchor - an empty string, and the reason this
+		// assertion failed the first three times.
+		sel.Dragged(&fyne.DragEvent{PointEvent: fyne.PointEvent{Position: fyne.NewPos(72, 4)},
+			Dragged: fyne.Delta{DX: 70, DY: 0}})
+		sel.DragEnd()
+
+		got := lb.SelectedText()
+		if len([]rune(got)) < 5 {
+			t.Fatalf("selection was %q: a one-character span means the gesture is not reaching the text", got)
+		}
+		if !strings.Contains(got, want) {
+			t.Fatalf("mouse selection gave %q, want it to contain %q", got, want)
+		}
+		// And copy moves it: the same handler fyne dispatches ⌘C to once
+		// mouse-down has taken focus onto the selection.
+		sel.TypedShortcut(&fyne.ShortcutCopy{})
+		if cb := p.app.Clipboard().Content(); !strings.Contains(cb, want) {
+			t.Errorf("clipboard holds %q, want %q", cb, want)
 		}
 	})
 }
