@@ -549,6 +549,20 @@ func TestSpawnRunsAChildAndReportsToItsParent(t *testing.T) {
 			spawnTurn("explore repo", "Look at the working directory and report what you wrote."),
 			done("waiting on the child"),
 			done("parent finished"),
+			// Slack, and it is load-bearing rather than tidy. Whether the
+			// child's report is owed *before* the parent's own submission is
+			// the race this test's own comment admits two lines below, and the
+			// answer changes how many turns the first run spends: if the wake
+			// lands inside it, `deliverOwed` takes the parent one turn further
+			// and the later runChildTurn needs a call the script no longer has.
+			// A three-output script is therefore a coin flip - it failed as
+			// "deterministic model ran out of outputs after 3 calls" at
+			// roughly one run in two under full-suite load, at commit 59e37ca
+			// and with no UI change involved. The assertion is about the child
+			// reporting and the row settling, not about how many times the
+			// parent is asked, so the script has to cover both orderings.
+			done("parent finished, extra wake"),
+			done("parent finished, second extra wake"),
 		},
 	}})
 	if err != nil {
