@@ -1401,9 +1401,11 @@ push).
       and §8.6 says why neither belongs in this step.
 
    Still owed to the roster, and tabs must not lose it: per-session **pause and
-   kill** (§5.7's starvation mitigation is what made that ruling affordable), and
-   a view of a session's **outstanding jobs** endable independently of the
-   session that started them. Without the second, §5.10's deliberate "no
+   kill** (§5.7's starvation mitigation is what made that ruling affordable) - the
+   kill half is × and `Run ▸ Cancel turn` (§8.5), the pause half still owed - and a
+   view of a session's **outstanding jobs** endable independently of the session that
+   started them: the labels now report the count (§8.6), the cards cannot yet end
+   them. Without the second, §5.10's deliberate "no
    auto-kill" residue is invisible, and an invisible residue is not a judgement -
    it is a leak.
 
@@ -2113,14 +2115,23 @@ closing the window, while `Close()` fires `onClosed` and then closes regardless
 close, so the shell sets both - the intercept to guard, `onClosed` for the paths that
 close it programmatically.
 
-**Still owed, deliberately not in this step.** The roster's two debts are their own
-work, not leftovers: a per-session **pause** has nothing to call - `CancelTurn` ends
-a turn and `Quit` ends the session, while "stay open, take no next turn" is a `host`
-concept that does not exist yet - and a human-endable view of a session's
-**outstanding jobs** needs a per-run end on `job.Manager` (it has `KillAll` and the
-model-facing `job_kill` path, no human-facing single kill). Shipping a "pause" that
-is really a cancel, or a job list whose buttons lie, is the kind of thing this
-document exists to record as *not finished*.
+**The label carries the work in flight, which is the roster's virtue tabs were told
+to keep.** `GUI.statusLabel` puts the session's live job count on its tab -
+`survey · 2 jobs`, singular-correct, and `⚠ survey · 1 job` when a prompt is waiting
+in it too - refreshed by the window's one tick and repainted only when a label
+actually changed. A subagent running a twenty-minute training job and a subagent that
+has gone quiet must not read identically, and the strip is the only place a session
+that is not on screen can say anything at all.
+
+**Still owed, deliberately not in this step.** The roster's remaining debts are their
+own work, not leftovers: a per-session **pause** has nothing to call - `CancelTurn`
+ends a turn and `Quit` ends the session, while "stay open, take no next turn" is a
+`host` concept that does not exist yet - and *ending* a session's outstanding jobs
+from the window needs a per-run end on `job.Manager` (it has `KillAll` and the
+model-facing `job_kill` path, no human-facing single kill), so the cards can now show
+the residue but cannot yet act on it. Shipping a "pause" that is really a cancel, or
+a job list whose buttons lie, is the kind of thing this document exists to record as
+*not finished*.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

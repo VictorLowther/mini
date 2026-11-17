@@ -242,13 +242,15 @@ func (sh *shell) tickAll(stop <-chan struct{}) {
 		}
 		sh.post(func() {
 			for _, g := range sh.sessions {
-				if g.idle() {
-					continue
+				live := g.liveJobs()
+				if !g.loopRunning() && live == 0 {
+					continue // nothing can have changed: no turn, no work
 				}
 				g.v.refreshStatus()
 				if g.jobs != nil {
 					g.v.refreshJobCards()
 				}
+				g.refreshLabel(live)
 			}
 		})
 	}
@@ -266,9 +268,18 @@ func (sh *shell) busySessions() []*GUI {
 	return busy
 }
 
-// idle reports a session with no turn in flight and nothing running: the footer
-// cannot change, so the tick has nothing to do for it.
-func (g *GUI) idle() bool { return !g.loopRunning() && g.liveJobs() == 0 }
+// refreshLabel puts the session's current state on its tab, and repaints the strip
+// only when a label actually changed - the tick runs once a second for every
+// session, and a DocTabs refresh walks the whole strip.
+func (g *GUI) refreshLabel(liveJobs int) {
+	if g.item == nil {
+		return
+	}
+	if text := g.statusLabel(liveJobs); text != g.item.Text {
+		g.item.Text = text
+		g.sh.tabs.Refresh()
+	}
+}
 
 // quit ends the app: the window closes and run returns. Every running loop is
 // cancelled first, so leaving never orphans a command mid-execution in any

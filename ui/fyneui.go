@@ -265,6 +265,19 @@ func (g *GUI) label() string {
 	return text
 }
 
+// statusLabel is what the tab carries right now: the name, plus how much work this
+// session has handed off and cannot finish without a while. Decision 15 kept the
+// roster's one real virtue - seeing every session's state at once - by moving it
+// into the labels, and a subagent running a twenty-minute job with nothing on
+// screen to say so is indistinguishable from one that has gone quiet.
+func (g *GUI) statusLabel(liveJobs int) string {
+	text := g.label()
+	if liveJobs > 0 {
+		text += fmt.Sprintf(" \u00b7 %d %s", liveJobs, map[bool]string{true: "job", false: "jobs"}[liveJobs == 1])
+	}
+	return text
+}
+
 // setAttention raises or drops the tab's "somebody is waiting here" marker. It
 // runs on the toolkit goroutine, like everything that touches the strip; before a
 // session's tab exists (OpenSession posts the attach) it only records the state,
@@ -277,8 +290,7 @@ func (g *GUI) setAttention(on bool) {
 	if g.v == nil {
 		return // no tab yet: attach renders the label with the marker already on it
 	}
-	g.item.Text = g.label()
-	g.sh.tabs.Refresh()
+	g.refreshLabel(g.liveJobs())
 }
 
 // Interactive reports whether a human is on the other end. A GUI exists because a

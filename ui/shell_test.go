@@ -85,8 +85,8 @@ func openWithOptions(t *testing.T, a *GUI, o GUIOptions) *GUI {
 // "this session is not safe to close" without running a turn for five seconds.
 type busyJobs struct{ live int }
 
-func (b busyJobs) JobCard(string) (JobCard, bool) { return JobCard{}, false }
-func (b busyJobs) LiveJobs() (int, error)         { return b.live, nil }
+func (b *busyJobs) JobCard(string) (JobCard, bool) { return JobCard{}, false }
+func (b *busyJobs) LiveJobs() (int, error)         { return b.live, nil }
 
 // TestGUISessionsStreamIntoTheirOwnTranscripts is the hazard the step was named
 // for: one shared streamState interleaves two turns, and the merged text lands in
@@ -429,7 +429,7 @@ func TestGUITabCloseGuardsAWorkingSession(t *testing.T) {
 	a := newTestWindow(t, "yolo", "alpha")
 	closed := make(chan string, 1)
 	b := openWithOptions(t, a, GUIOptions{
-		TabLabel: "busy", Jobs: busyJobs{live: 1},
+		TabLabel: "busy", Jobs: &busyJobs{live: 1},
 		Closer: func() error { closed <- "busy"; return nil },
 	})
 
@@ -512,7 +512,7 @@ func findEntry(t *testing.T, o fyne.CanvasObject) *widget.Entry {
 // the second within the window goes through.
 func TestGUIQuitGuardsWorkInFlight(t *testing.T) {
 	a := newTestWindow(t, "yolo", "alpha")
-	b := openWithOptions(t, a, GUIOptions{TabLabel: "busy", Jobs: busyJobs{live: 2}})
+	b := openWithOptions(t, a, GUIOptions{TabLabel: "busy", Jobs: &busyJobs{live: 2}})
 
 	a.sh.quit()
 	if a.sh.quitting {
@@ -532,5 +532,45 @@ func TestGUIQuitGuardsWorkInFlight(t *testing.T) {
 	a.sh.quit()
 	if !a.sh.quitting {
 		t.Error("the second press did not leave")
+	}
+}
+
+// TestGUITabLabelCarriesWorkInFlight is the roster's virtue kept: decision 15 moved
+// "see every session at once" into the labels, so a subagent with a twenty-minute
+// handoff running must not read the same as one that has gone quiet.
+func TestGUITabLabelCarriesWorkInFlight(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	jobs := &busyJobs{}
+	b := openWithOptions(t, a, GUIOptions{TabLabel: "worker", Jobs: jobs})
+	if got := b.item.Text; got != "worker" {
+		t.Fatalf("label = %q, want the plain name while nothing runs", got)
+	}
+
+	jobs.live = 2
+	b.refreshLabel(b.liveJobs())
+	if got := b.item.Text; got != "worker · 2 jobs" {
+		t.Errorf("label = %q, want the work in flight", got)
+	}
+	jobs.live = 1
+	b.refreshLabel(b.liveJobs())
+	if got := b.item.Text; got != "worker · 1 job" {
+		t.Errorf("label = %q, want the singular", got)
+	}
+
+	// A prompt waiting still outranks the count: the marker is the thing that has
+	// to be seen, and the jobs are already going.
+	waiting := make(chan Answer, 1)
+	go func() {
+		ans, _ := b.Ask(context.Background(), Question{Kind: AskConfirm, Title: "continue?", Cfg: b.cfg})
+		waiting <- ans
+	}()
+	waitFor(t, "the worker's tab to be marked", func() bool { return strings.HasPrefix(b.item.Text, "⚠") })
+	if got := b.item.Text; got != "⚠ worker · 1 job" {
+		t.Errorf("label = %q, want the marker and the count together", got)
+	}
+	b.resolve(Answer{})
+	<-waiting
+	if got := b.item.Text; got != "worker · 1 job" {
+		t.Errorf("label = %q after the answer, want the marker gone and the count kept", got)
 	}
 }
