@@ -1427,12 +1427,29 @@ Two flakes surfaced while landing this, one real and one not:
   sometimes needed a call the script no longer had. Fixed by giving the script
   slack for both orderings, with the reason in the test. The assertion was always
   about the child reporting and the row settling, never about turn count.
-- **`ui` once hit the suite's 400s package deadline.** It passed in 2.7-2.8s in
-  four other full-suite runs, in a deliberately loaded five-package run, and
-  isolated, and the shape matches the pre-existing link/CGO contention recorded
-  above rather than anything DocTabs does - a tab container whose renderer is a
-  scroller and a row of buttons is not 150x of anything. Left as an observation,
-  not a fix, because the mechanism never reproduced.
+- **`TestGUITrajectoryMatchesPrintMode` intermittently deadlocks, and the first
+  write-up of this got the attribution wrong.** It was recorded above as
+  link/CGO contention, because it appeared in full-suite runs while the same
+  package finished in 2.7s alone. It is not contention. It reproduces about once
+  in three at `go test ./ui/ ./agent/ ./host/ -count=1`, it hangs in that same
+  test for the whole package deadline, and it **reproduces at `59e37ca`** in a
+  fresh worktree - before the tab strip and before the running card, so neither
+  caused it and neither can be blamed for it.
+
+  What is known: `waitFor` gives up after 5s and `t.Fatalf`es, so the minutes of
+  silence are not polling. The stall is the test parked on `<-done` with the run
+  goroutine still inside `GUI.Ask` - a question that will never be answered
+  because the only thing that answers it is the test, and the test has stopped
+  pumping to wait. `TestGUITrajectoryMatchesPrintMode` is the one GUI test that
+  ends by typing `/quit` *while a question is still pending*, and its own comment
+  calls the preceding `p.enter()` "no-op on every frontend", so the resolution
+  depends on which path the submit takes.
+
+  Not fixed here, deliberately: it is pre-existing, it is in the quit-answer
+  path rather than in anything this increment touched, and a blind change to how
+  a slash command interacts with a pending prompt is exactly the sort of edit
+  that turns a one-in-three hang into a one-in-one. It is the first thing to
+  take up, and the reproduction command above is the whole cost of entry.
 
 §7 steps 1 and 2 - the prerequisite's schema and loop-safety half - are in the
 tree, with the survey and the rulings behind them.
