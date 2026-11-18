@@ -70,6 +70,12 @@ type shell struct {
 	// title as applied, or it would never publish it when the human selects it.
 	lastTitle string
 
+	// baseCtx is the context every session's run descends from, captured by run
+	// before the event loop starts. It is written once there and read only by
+	// callbacks the canvas thread starts afterwards, so the post queue orders the
+	// two - like sessions and tabs, it needs no lock.
+	baseCtx context.Context
+
 	mu       sync.Mutex
 	thinking bool
 	quitting bool
@@ -199,6 +205,7 @@ func (sh *shell) isCurrent(g *GUI) bool { return sh.selected() == g }
 func (sh *shell) run(g *GUI, ctx context.Context, task string) (map[string]any, error) {
 	undo := sh.logWrite.Mute()
 	defer undo()
+	sh.baseCtx = ctx
 
 	g.prepareTranscript()
 	sh.window.Show()
@@ -440,6 +447,7 @@ func (sh *shell) openSessionAt(dir string) {
 		g, err = sh.openSession(o)
 		if err == nil {
 			sh.post(func() { sh.selectTab(g) })
+			sh.startSession(g)
 			return
 		}
 	}
@@ -450,6 +458,42 @@ func (sh *shell) openSessionAt(dir string) {
 			g.v.noteLocal(msg)
 		}
 	})
+}
+
+// startSession gives a session the run its tab exists to show: the transcript
+// header, and its loop driven with no task, so the tab asks "What do you want to
+// do?" exactly as the first session does when the CLI was given no -t.
+//
+// Only the "+" needs it. A spawned child arrives with a loop its parent is already
+// running, and driving that a second time would run the conversation twice, so
+// openSession - the entry point both share - correctly starts nothing.
+//
+// Without this the tab has no run at all, and handleInput's idle branch, which is
+// right for a session that has finished, reads a session that never started as one
+// that ended: the task the human just typed is dropped and replaced with "the run
+// has ended". A tab the human asked for is never that.
+func (sh *shell) startSession(g *GUI) {
+	if g.loop == nil {
+		return
+	}
+	base := sh.baseCtx
+	if base == nil {
+		// ShowError's window, and any test that opens a tab without running one.
+		base = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(base)
+	// cancelRun is what quit and Session > Cancel turn reach for; run stores it for
+	// the first session, and nothing else stored it for the rest.
+	g.mu.Lock()
+	g.cancelRun = cancel
+	g.mu.Unlock()
+	sh.post(func() {
+		g.prepareTranscript()
+		g.v.pinned = true
+		g.v.follow()
+		g.v.refreshStatus()
+	})
+	go g.drive(runCtx, "")
 }
 
 // closeTab is a tab's ×, and it owns the teardown: the guard, the removal, and the
@@ -503,6 +547,9 @@ func (sh *shell) removeTab(g *GUI) {
 	sh.sessions = slices.Delete(sh.sessions, i, i+1)
 	sh.removeItem(g.item)
 	g.item = nil
+	// The run belongs to the tab. Parked at a prompt or between turns, it has no
+	// surface left to be answered on once the tab is gone.
+	g.abandonRun()
 	if len(sh.sessions) == 0 {
 		sh.quit()
 		return

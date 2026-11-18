@@ -329,6 +329,20 @@ func (g *GUI) cancelRunTurn() {
 	}
 }
 
+// abandonRun releases a session's run context because its tab is gone. It is not
+// cancelRunTurn: that is the human's "stop this turn" and refuses when nothing is
+// stepping, which is precisely when a closed tab is still parked - waiting for a
+// task, or for an answer nobody will type now. Left parked it holds the session's
+// ask-queue slot and its goroutine until the process ends.
+func (g *GUI) abandonRun() {
+	g.mu.Lock()
+	cancel := g.cancelRun
+	g.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // ShowError presents a setup failure inside the window - the only surface the
 // user gets after startup - and runs until the window is closed. It returns
 // the exit code.
@@ -342,8 +356,9 @@ func (g *GUI) ShowError(err error) int {
 }
 
 // prepareTranscript fills the header, the resume replay and the resume note.
-// Call on the main goroutine before app.Run: widget access is safe there and
-// fyne.Do would only queue onto a loop nothing runs yet.
+// Call on the toolkit goroutine: run does it before app.Run, where widget access
+// is already safe and a post would only queue onto a loop nothing runs yet, and
+// startSession posts it for a session opened while the loop does.
 func (g *GUI) prepareTranscript() {
 	g.v.noteLocal(sessionHeaderLine(g.modelName, g.baseURL, g.configName, g.sessionID, g.contextNote))
 	for _, msg := range g.resume {
