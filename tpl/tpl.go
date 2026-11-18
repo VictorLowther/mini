@@ -39,7 +39,31 @@ var FuncMap = template.FuncMap{
 // keep_trailing_newline=False, so `Template("x\n")` renders "x" and the
 // prompts the Python agent sends never end in a newline.
 func Render(name, source string, ctx map[string]any) (string, error) {
-	t, err := template.New(name).Option("missingkey=zero").Funcs(FuncMap).Parse(strings.TrimSuffix(source, "\n"))
+	return render(name, source, ctx, "missingkey=zero")
+}
+
+// RenderStrict is Render with `missingkey=error`: a reference to a key the
+// context does not carry is an error instead of an empty string.
+//
+// It exists for the two templates whose context is fixed and whose silence is
+// expensive - the system prompt and the instance prompt. Upstream renders every
+// prompt with Jinja's StrictUndefined (`agents/default.py`), so a misspelled or
+// renamed variable raises there and is invisible here: `{{ .tool_lst }}` ships a
+// system prompt with no tool listing, the model quietly stops knowing what it can
+// call, and every trajectory afterwards reads like a model-quality problem
+// (A-7). Config is user-authored, so "every context here is built by this
+// program" is not a promise the config layer can keep.
+//
+// The observation and format-error templates deliberately keep Render. Their
+// context is per-result - a job observation has no `.returncode`, a plain one has
+// no `.job_id` - so a missing key there is normal rather than a typo, and making
+// it fatal would kill runs over template shape.
+func RenderStrict(name, source string, ctx map[string]any) (string, error) {
+	return render(name, source, ctx, "missingkey=error")
+}
+
+func render(name, source string, ctx map[string]any, missingKey string) (string, error) {
+	t, err := template.New(name).Option(missingKey).Funcs(FuncMap).Parse(strings.TrimSuffix(source, "\n"))
 	if err != nil {
 		return "", fmt.Errorf("parsing template %s: %w", name, err)
 	}

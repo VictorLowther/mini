@@ -98,12 +98,19 @@ func (l *Loop) checkWindowParams() {
 
 // RequestCompaction asks the loop to compact before the next model call no
 // matter what the estimate says. Safe from any goroutine; the GUI wires it
-// to /compact. A second request while one is pending is a no-op, and a
-// request with no run in flight does nothing until the next Query.
+// to /compact. A second request while one is pending is a no-op.
+//
+// It also raises the work signal, because "before the next model call" is
+// worthless to a session that is parked inside a hook waiting for a human:
+// the next call only happens if somebody types. A front end blocked on a
+// prompt selects on WorkSignal and, seeing this armed, calls CompactHere - so
+// an idle session compacts at the boundary it is already standing in, and a
+// running one takes the request at its next Query exactly as before.
 func (l *Loop) RequestCompaction() {
 	l.mu.Lock()
 	l.manualCompact = true
 	l.mu.Unlock()
+	l.NotifyWork()
 }
 
 // prepareContext returns the projected context for the next model call and
@@ -114,7 +121,7 @@ func (l *Loop) RequestCompaction() {
 // autonomous run must never wait for a user-prompt boundary to notice it has
 // outgrown its window.
 func (l *Loop) prepareContext(ctx context.Context) ([]model.Message, int) {
-	proj := model.ProjectContext(l.Messages)
+	proj := model.ProjectContext(l.messages)
 	est, reported := model.ContextTokens(proj)
 	// Reported usage wins outright (sushi answers every completion with
 	// token counts); the chars/4 estimate is only the stopgap for turns
@@ -129,7 +136,7 @@ func (l *Loop) prepareContext(ctx context.Context) ([]model.Message, int) {
 	threshold := l.Cfg.compactThreshold()
 	if manual || (threshold > 0 && est >= threshold && !l.autoCompactOff) {
 		if l.compact(ctx, proj, est, manual) {
-			proj = model.ProjectContext(l.Messages)
+			proj = model.ProjectContext(l.messages)
 			est, _ = model.ContextTokens(proj)
 		}
 	}
@@ -153,8 +160,17 @@ func (l *Loop) compact(ctx context.Context, proj []model.Message, estBefore int,
 	if keep <= 0 {
 		keep = 40000
 	}
-	cut := pickCut(proj, keep)
+	cut, ok := pickCut(proj, keep)
 	head := model.ProjectContextHead(proj)
+	if !ok {
+		// No boundary means no compaction, and the history must be left
+		// exactly as it is. Returning false here rather than pressing on is
+		// what separates "this session cannot compact" from "this session is
+		// gone": the panic reached proj[cut] with cut == len(proj).
+		l.logger().Warn("compaction: the projected context has no assistant turn to cut at; nothing to compact",
+			"turns", len(proj), "head", head)
+		return false
+	}
 	if cut <= head {
 		// The whole conversation after the prompt plumbing fits in the tail
 		// budget: there is nothing to summarize. pi calls this "session too
@@ -277,7 +293,14 @@ func (l *Loop) rejectCompaction(manual bool, estBefore, estAfter, kept int) {
 // slots are adjacent to it), so keeping everything from an assistant row
 // never splits a call from its result, and the turn ahead is the summary or
 // the plumbing, keeping roles alternating for the server's chat template.
-func pickCut(proj []model.Message, keepTokens int) int {
+// pickCut chooses the first turn that survives a compaction verbatim, and
+// reports whether such a boundary exists at all.
+//
+// It used to return len(proj) as a "no assistant turn anywhere" sentinel, and
+// `compact` only guarded `cut <= head` - so the sentinel sailed straight through
+// to proj[cut] and panicked the process (A-3). A sentinel that every caller must
+// remember to re-check is not a protocol; the bool is.
+func pickCut(proj []model.Message, keepTokens int) (int, bool) {
 	acc, start := 0, 0
 	for j := len(proj) - 1; j >= 0; j-- {
 		acc += model.EstimateMessageTokens(proj[j])
@@ -289,17 +312,25 @@ func pickCut(proj []model.Message, keepTokens int) int {
 	// The budget never tipped: everything already fits the tail.
 	for j := start; j >= 0; j-- {
 		if role, _ := proj[j]["role"].(string); role == "assistant" {
-			return j
+			return j, true
 		}
 	}
 	// Nothing assistant at or before the budget point (a newest group made
 	// only of human-mode rows): advance to the next assistant boundary.
 	for j := start; j < len(proj); j++ {
 		if role, _ := proj[j]["role"].(string); role == "assistant" {
-			return j
+			return j, true
 		}
 	}
-	return len(proj) // no assistant at all: nothing survives verbatim
+	// No assistant turn in the whole projected context, so no boundary exists
+	// and nothing can survive verbatim. This is reachable, not theoretical:
+	// human mode answers with a user row and its observation and returns before
+	// the model is queried (agent.go:NextHumanCommand), so a session can run a
+	// long stretch with no assistant row at all and then be asked to compact -
+	// by /y, by the automatic trigger, or by a server that reported a context
+	// window small enough to trip it on the first query (host.go assigns
+	// DiscoverContextWindow's answer straight into the config).
+	return 0, false
 }
 
 // estimateProjection measures a context the way estimateRebuild measures the

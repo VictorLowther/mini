@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
@@ -68,6 +69,28 @@ type Config struct {
 	CompactThresholdRatio   float64
 	CompactKeepTokens       int
 	CompactSummaryMaxTokens int
+}
+
+// InteractiveModes are the only values agent.mode may hold. "confirm" asks a
+// human before running anything not whitelisted; "yolo" never asks; "human"
+// issues the human's own commands instead of querying the model.
+var InteractiveModes = []string{"human", "confirm", "yolo"}
+
+// ValidateMode rejects a mode the port does not implement.
+//
+// This is the invariant upstream got for free from pydantic's Literal and the Go
+// port silently dropped (A-2). Checking it at the config boundary is the fix;
+// the gate now also fails closed, so a value that reaches it anyway asks rather
+// than approving. Neither alone is enough: without this one, a typo is a silent
+// policy change; without that one, any future caller that skips validation is a
+// silent policy change again.
+func ValidateMode(mode string) error {
+	for _, m := range InteractiveModes {
+		if mode == m {
+			return nil
+		}
+	}
+	return fmt.Errorf("agent.mode %q is not one of %s", mode, strings.Join(InteractiveModes, ", "))
 }
 
 // ConfigFromMap builds the agent section, with the upstream defaults.
@@ -214,7 +237,14 @@ type Loop struct {
 	Handler *model.Handler
 	Logger  *slog.Logger
 
-	Messages []model.Message
+	// messages is the transcript the conversation is built from. It is
+	// unexported because the field being public was the bug (A-4): the loop
+	// owns this slice, every write happens on the agent goroutine, and
+	// `agent.go` has said for as long as it existed that reading it from
+	// another goroutine races - a convention the type system could not enforce
+	// and a second reader duly violated, which is what turned `go test -race
+	// ./agent/` red. Outside the loop, read Messages().
+	messages []model.Message
 	Cost     float64
 	NCalls   int
 
@@ -235,6 +265,10 @@ type Loop struct {
 	pending Snapshot
 	runCtx  context.Context
 	queued  []model.Message
+	// work is the "the harness has armed a step" signal; see work.go. Lazily
+	// created and mu-guarded, because a Loop is built by struct literal in
+	// several places and a nil channel would silently never fire.
+	work chan struct{}
 	// scratchDir holds the temp result files of a run without a Recorder;
 	// empty otherwise. It must live until Run returns, not merely until its
 	// turn is rendered, because the trajectory written after every step
@@ -536,7 +570,10 @@ func (l *Loop) killObservation(action model.Action, sink io.Writer) env.Result {
 	return env.Result{ReturnCode: code}
 }
 
-// wakeLimit caps how much one boundary reports. Eight matches the default job
+// wakeLimit caps how much one boundary reports. It is a batching rule for
+// message size, not a limit on work: firings past the batch stay queued and are
+// delivered at the following boundaries, so no job's result is ever refused or
+// lost. Eight matches the default job
 // cap, and it keeps a pathological queue from turning one message into a log
 // dump; anything left over is still in the queue, claimed by nobody, and comes
 // back at the next boundary.
@@ -674,7 +711,17 @@ func readJobBody(path string, n int) (string, bool) {
 		// Cut the raw bytes at n and trim after, so the bound cannot exceed the
 		// slice it is applied to - trimming first and then slicing by the
 		// untrimmed length is how this panics on a report that ends in newlines.
-		return strings.TrimRight(string(buf[:n]), "\n") + "\n(truncated)", true
+		end := n
+		// A-9: the budget is in bytes and the file is UTF-8, so n can land in
+		// the middle of a rune. Back off to the last boundary that starts one -
+		// dropping the straddling character rather than emitting half of it as
+		// U+FFFD to the model. ASCII takes no iterations, so the common case
+		// costs nothing, and this leaves the byte budget as the unit it is
+		// written in instead of quietly redefining it as a rune count.
+		for end > 0 && !utf8.RuneStart(buf[end]) {
+			end--
+		}
+		return strings.TrimRight(string(buf[:end]), "\n") + "\n(truncated)", true
 	}
 	return strings.TrimRight(string(buf[:read]), "\n"), true
 }
@@ -785,10 +832,17 @@ func (l *Loop) budget() time.Duration {
 // re-truncation.
 func (l *Loop) handoff(run *job.Run, action model.Action, why string) (env.Result, bool, error) {
 	if _, err := l.Jobs.Detach(run, why); err != nil {
-		// The cap refused a run that is already burning: ending it is the only
-		// answer that does not leave a job the model cannot see or list.
-		_ = run.Kill()
-		return refusedObservation(err), false, nil
+		// The run has already burned its whole foreground wait to get here -
+		// that is the only reason a handoff on this path happens - so a
+		// bookkeeping failure must not destroy it. Manager.Start kills for
+		// exactly the opposite reason: nothing had run yet. Here the work is
+		// real, its bytes are on disk, and the process is already in its own
+		// group, so the honest answer is to say out loud that the job is
+		// untracked and let the human and the model decide. KillAll at session
+		// close still reaps it, so this leaks nothing that outlives the run.
+		l.logger().Error("jobs: could not register a promoted run; leaving it burning and untracked",
+			"id", run.ID(), "err", err)
+		return untrackedObservation(run, err), false, nil
 	}
 	path := run.OutputPath()
 	var b strings.Builder
@@ -812,8 +866,27 @@ func (l *Loop) handoff(run *job.Run, action model.Action, why string) (env.Resul
 }
 
 // refusedObservation is a job the registry would not start. It comes back as an
-// observation rather than an error because the cap refusal names the remedy, and
-// a model that receives it as a crash learns nothing it can act on.
+// observation rather than an error so a model that receives it as a crash still
+// learns something it can act on.
+
+// untrackedObservation is a run that is burning and has no row: it cannot be
+// listed, woken, or stopped through the registry, so the note says that plainly,
+// names the output path that does exist, and leaves the decision with the reader
+// rather than quietly killing forty seconds of someone's build.
+func untrackedObservation(run *job.Run, err error) env.Result {
+	return env.Result{
+		// Pending, not a return code: the process is running and has no
+		// outcome, and a -1 here would read as a crash that never happened.
+		Pending: true,
+		View: fmt.Sprintf(
+			"The command was promoted out of the foreground and is still running, but the registry could not open a row for it, so `jobs` will not list it and its ending will not be reported.\n"+
+				"id: %s\noutput is appended to %s\n"+
+				"It will be killed when the session closes. Stop it now with job_kill id %s if you do not want it to keep running.\nstore said: %v",
+			run.ID(), run.OutputPath(), run.ID(), err),
+		ExceptionInfo: err.Error(),
+		Extra:         map[string]any{"exception_type": "JobUntracked", "job_id": run.ID(), "job_output_path": run.OutputPath()},
+	}
+}
 func refusedObservation(err error) env.Result {
 	return env.Result{
 		ReturnCode:    -1,
@@ -839,8 +912,33 @@ func (l *Loop) drainQueued() []model.Message {
 	return q
 }
 
+// Messages returns a copy of the transcript, safe to read from any goroutine.
+//
+// It copies rather than handing back the slice because the loop appends to the
+// original on its own goroutine: an aliased read would be a race on the header
+// at best and on the array behind it at worst. Callers that walk the history are
+// already O(n) over it, so the copy costs what the walk costs and buys the one
+// guarantee the exported field never had.
+func (l *Loop) Messages() []model.Message {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]model.Message, len(l.messages))
+	copy(out, l.messages)
+	return out
+}
+
+// setHistory replaces the transcript under the same lock Messages() takes. It is
+// for the two moments that legitimately rebuild the whole history - a fresh Run
+// starting empty and a resume seeding itself from the store - and not for
+// appending: use addMessages for that, or the recorder and the hooks get skipped.
+func (l *Loop) setHistory(msgs []model.Message) {
+	l.mu.Lock()
+	l.messages = msgs
+	l.mu.Unlock()
+}
+
 // Snapshot is the immutable view of the loop's progress that a UI may read from
-// another goroutine. Reading Loop.Messages / NCalls / Cost directly races with
+// another goroutine. Reading Loop.messages / NCalls / Cost directly races with
 // the agent goroutine, so the loop publishes this at every safe point instead.
 type Snapshot struct {
 	Calls          int
@@ -1053,11 +1151,20 @@ func (l *Loop) TemplateVars(kwargs ...map[string]any) map[string]any {
 }
 
 func (l *Loop) render(name, template string) (string, error) {
-	return tpl.Render(name, template, l.TemplateVars())
+	// Strict, unlike the observation templates: this context is fixed, so a key
+	// the template asks for and the loop does not supply is a mistake in one of
+	// the two, and it has to be loud. A system prompt that silently lost its
+	// tool listing would otherwise be diagnosed as a bad model (A-7).
+	return tpl.RenderStrict(name, template, l.TemplateVars())
 }
 
 func (l *Loop) addMessages(msgs ...model.Message) []model.Message {
-	l.Messages = append(l.Messages, msgs...)
+	// The lock covers the append and nothing else. Holding it across the
+	// Recorder and Hooks calls below would deadlock: OnMessage reaches the front
+	// ends, and the window's OnMessage path takes l.mu itself to read Snapshot.
+	l.mu.Lock()
+	l.messages = append(l.messages, msgs...)
+	l.mu.Unlock()
 	if l.Recorder != nil {
 		for _, m := range msgs {
 			// The recorder stamps the turn number into the message's own
@@ -1126,7 +1233,7 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 			l.extraVars[k] = v
 		}
 	}
-	l.Messages = nil
+	l.setHistory(nil)
 
 	// Resume seeds the history from the session store. The stored transcript
 	// already carries the system and instance messages, so Run must not
@@ -1134,7 +1241,7 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	// the config changed under it, because the database is the source of
 	// truth for a resumed run.
 	if l.resumed != nil {
-		l.Messages = l.resumed
+		l.setHistory(l.resumed)
 		if task != "" {
 			l.addMessages(model.Message{
 				"role":    "user",
@@ -1219,8 +1326,8 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 		}
 	}
 	last := model.Message{}
-	if len(l.Messages) > 0 {
-		last = l.Messages[len(l.Messages)-1]
+	if len(l.messages) > 0 {
+		last = l.messages[len(l.messages)-1]
 	}
 	extra, _ := last["extra"].(map[string]any)
 	return extra, nil
@@ -1310,10 +1417,10 @@ func exitStatusName(err error) string {
 }
 
 func (l *Loop) lastRole() string {
-	if len(l.Messages) == 0 {
+	if len(l.messages) == 0 {
 		return ""
 	}
-	role, _ := l.Messages[len(l.Messages)-1]["role"].(string)
+	role, _ := l.messages[len(l.messages)-1]["role"].(string)
 	return role
 }
 
@@ -1407,7 +1514,7 @@ func (l *Loop) Query(ctx context.Context) (model.Message, error) {
 		l.overflowBudget--
 		l.logger().Warn("server rejected the prompt as too large; forcing compaction", "err", err, "remaining_attempts", l.overflowBudget)
 		if l.compact(ctx, proj, est, true) {
-			proj = model.ProjectContext(l.Messages)
+			proj = model.ProjectContext(l.messages)
 			est, _ = model.ContextTokens(proj)
 			l.lastCtxTokens = est
 			l.pending.CtxTokens = est
@@ -1590,15 +1697,15 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 // Serialize builds the trajectory document (rule 12).
 func (l *Loop) Serialize(extra ...map[string]any) map[string]any {
 	lastExtra := map[string]any{}
-	if len(l.Messages) > 0 {
+	if len(l.messages) > 0 {
 		// Read without creating: Extra() would add an "extra" key to the
 		// messages that never had one, and the trajectory would gain a field
 		// mid-document.
-		if e, ok := l.Messages[len(l.Messages)-1]["extra"].(map[string]any); ok {
+		if e, ok := l.messages[len(l.messages)-1]["extra"].(map[string]any); ok {
 			lastExtra = e
 		}
 	}
-	messages := withRawOutputs(l.Messages)
+	messages := withRawOutputs(l.messages)
 	agentData := map[string]any{
 		"info": map[string]any{
 			"model_stats": map[string]any{

@@ -14,10 +14,12 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
 	"github.com/VictorLowther/mini/model"
+	"github.com/VictorLowther/mini/tpl"
 )
 
 func TestShippedPromptsStateTheWindow(t *testing.T) {
@@ -106,7 +108,11 @@ func TestShippedPromptsStateTheWindow(t *testing.T) {
 		"truncated": true, "returncode": 1, "output": "tail text",
 		"elided_lines": 4211, "bytes": 400000, "path": "/tmp/s/7.log",
 	}}
-	obs, err := l.render("observation_template", obsSrc)
+	// Rendered with tpl.Render, not l.render: the observation context is
+	// per-result and legitimately sparse, which is why production keeps it
+	// forgiving while the prompt templates are strict (A-7). Asking the strict
+	// helper here would test a policy the shipped path does not have.
+	obs, err := tpl.Render("observation_template", obsSrc, l.TemplateVars())
 	if err != nil {
 		t.Fatalf("render observation: %v", err)
 	}
@@ -226,5 +232,53 @@ func TestPromptListingFollowsTheToolSet(t *testing.T) {
 	}
 	if strings.Contains(trimmed, "`jobs`") {
 		t.Error("the trimmed listing still names jobs")
+	}
+}
+
+// The CI guard A-7 was missing: render the shipped prompts the way a real run
+// does - strict, against a real environment's variables and a real model's - and
+// fail if any reference has no value behind it. Before this, a key renamed in Go
+// but not in config/configs/mini.yaml would have shipped a system prompt with a
+// hole in it, and every trajectory after it would have looked like a model
+// problem.
+func TestShippedPromptsRenderStrictly(t *testing.T) {
+	m, err := config.FromSpec("../config/configs/mini.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := agentConfig(t)
+	c.SystemTemplate = config.String(m, "agent.system_template", "")
+	c.InstanceTemplate = config.String(m, "agent.instance_template", "")
+	if c.SystemTemplate == "" || c.InstanceTemplate == "" {
+		t.Fatal("the shipped config has no prompts to check")
+	}
+	l, _ := newRecorderLoop(t, model.NewDeterministic("echo hi"), &env.Local{Timeout: 5 * time.Second})
+	l.Cfg = c
+	// The task arrives per run (Run seeds extraVars before it renders), so a
+	// bare loop has none of it and the instance template would be checked
+	// against a context no real run ever builds.
+	l.extraVars = map[string]any{"task": "the user's task"}
+
+	for _, tmpl := range []struct{ name, src string }{
+		{"system_template", c.SystemTemplate},
+		{"instance_template", c.InstanceTemplate},
+	} {
+		out, err := l.render(tmpl.name, tmpl.src)
+		if err != nil {
+			t.Fatalf("%s does not render against the shipped config: %v", tmpl.name, err)
+		}
+		// Belt for the same fact from the other side: the tool listing is the
+		// one interpolated block whose absence changes how the model behaves
+		// rather than how the prompt looks.
+		if tmpl.name == "system_template" && !strings.Contains(out, "bash") {
+			t.Error("the rendered system prompt lost its tool listing")
+		}
+	}
+	// A subagent gets the same treatment with its narrower tool set, since the
+	// conditional block it renders is the one most likely to reference a key the
+	// top-level path happens to supply.
+	l.Tools = model.SubagentTools()
+	if _, err := l.render("system_template", c.SystemTemplate); err != nil {
+		t.Fatalf("system_template does not render for a subagent: %v", err)
 	}
 }

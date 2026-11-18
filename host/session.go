@@ -194,6 +194,13 @@ func (s *Session) Close() error {
 		if n := s.Jobs.KillAll(); n > 0 {
 			s.log.Info("reaped live jobs on session close", "count", n)
 		}
+		// Hand the session row back. Best-effort by design: a process dying
+		// before this leaves a stale pid, and the resume path treats a dead
+		// owner as reclaimable, so a missed release costs a check rather than
+		// the session.
+		if err := s.Sess.Release(); err != nil {
+			s.log.Warn("session store: could not release the session owner", "err", err)
+		}
 		if s.jobCancel != nil {
 			s.jobCancel()
 		}

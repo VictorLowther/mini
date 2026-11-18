@@ -7,6 +7,24 @@ mini's job-control tooling mapped onto its architecture (SQLite transcript store
 disk, one `bash` tool, mvdan.cc/sh in-process interpreter, GUI plus headless
 front ends, local sushi server, long autonomous bash turns).
 
+> **Superseded 2026-11-18 - the job cap was removed.** §3's table row "Job cap
+> with an actionable refusal … **Yes.** Local GPU: two `torch` runs are already
+> one too many" and every later use of `MAX_JOBS` in this document no longer
+> describe mini. The cap is gone from `job`, along with its knob, on the grounds
+> that it could not do the job it was drawn to do: a backgrounded command is a
+> shell, so it is a process *tree* - `make -j64` and a fork loop are each one job -
+> and the counter is per-session, so it never bounded the box either. The
+> resource that is genuinely contended in this architecture is the model server,
+> and that is bounded where it is touched, by `model.Gate`. Process limits belong
+> to `ulimit` and cgroups, which can see the tree.
+>
+> Worth keeping honest, though: this survey is the evidence *against* the claim
+> that no harness caps concurrent jobs - `crush` has `Start(..., maxJobs)` and
+> little-coder `MAX_JOBS = 8`, both cited below. The difference is that crush
+> pairs its bound with `prune()`, so the count tracks live work rather than
+> everything ever started, and neither is guarding a GPU through `bash`. The
+> removal stands on the process-tree argument, not on precedent.
+
 Sources: `crush` (Go), `zero` (Go), `oh-my-pi`/omp (Rust), `qwen-code` (TS),
 `little-coder` + its `.pi/extensions/bg-shell` (TS), `mini-swe-agent` (Python).
 All findings read from the working copies on 2026-11-15.

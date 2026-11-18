@@ -66,17 +66,26 @@ func (m *Manager) ClaimFirings(limit int) ([]Firing, error) {
 // does not matter. The card uses it for "finished, not yet reported": the state
 // a human needs to see in the gap between a job ending and the boundary that
 // says so.
+//
+// It used to answer by scanning PendingJobEvents(32) for the id, which put a
+// bounded probe where the question has an exact answer (A-10). Past 32
+// undelivered firings - a held session, or any long run where jobs end faster
+// than boundaries arrive, and now an entirely ordinary situation because the job
+// count is unbounded - it reported "settled" for a result genuinely still owed,
+// in the one place a human reads to decide whether the harness has told the
+// model anything yet.
+//
+// An unreadable queue reports owed rather than settled. The failure being fixed
+// is a false "nothing outstanding", so the tie goes to honest pessimism and the
+// reason is logged instead of swallowed.
 func (m *Manager) HasUndeliveredFiring(id string) bool {
-	events, err := m.Session.PendingJobEvents(32)
+	n, err := m.Session.CountUndeliveredFiringsFor(id)
 	if err != nil {
-		return false
+		m.logger().Warn("job: could not read the queue; reporting the result as still owed",
+			"job", id, "err", err)
+		return true
 	}
-	for _, e := range events {
-		if e.JobID == id {
-			return true
-		}
-	}
-	return false
+	return n > 0
 }
 
 // StillRunning counts the jobs that are burning right now, which is what lets a
@@ -88,18 +97,6 @@ func (m *Manager) StillRunning() int {
 		return 0
 	}
 	return n
-}
-
-// PendingFirings reports whether anything is owed at all. The card uses it for
-// "finished, not yet reported", and it is a bounded probe rather than a read of
-// the whole queue: a session that ran a job per step for a week still answers in
-// one indexed lookup.
-func (m *Manager) PendingFirings() int {
-	events, err := m.Session.PendingJobEvents(8)
-	if err != nil {
-		return 0
-	}
-	return len(events)
 }
 
 // OwedDeliveries counts results that have happened but not been said. It is the

@@ -144,3 +144,34 @@ func TestShippedTemplatesRender(t *testing.T) {
 		}
 	}
 }
+
+// A-7: a config template that asks for a key nobody supplies must fail loudly
+// rather than ship a prompt with a hole in it.
+func TestRenderStrictRejectsUnknownKeys(t *testing.T) {
+	ctx := map[string]any{"tool_list": "bash, jobs"}
+	ok, err := RenderStrict("system_template", "Your tools: {{ .tool_list }}", ctx)
+	if err != nil {
+		t.Fatalf("a supplied key must render: %v", err)
+	}
+	if ok != "Your tools: bash, jobs" {
+		t.Errorf("rendered %q", ok)
+	}
+	if _, err := RenderStrict("system_template", "Your tools: {{ .tool_lst }}", ctx); err == nil {
+		t.Fatal("a misspelled key rendered without error; the prompt would ship with the listing missing")
+	}
+	// The forgiving path is unchanged, because the observation context is
+	// legitimately sparse.
+	got, err := Render("observation_template", "rc={{ .returncode }} job={{ .job_id }}", map[string]any{"returncode": 1})
+	if err != nil {
+		t.Fatalf("Render must stay forgiving: %v", err)
+	}
+	// Not "" but the literal "<no value>": on a map[string]any the zero value is
+	// an untyped nil, and text/template spells that out. So the forgiving path
+	// does not hide a missing key, it prints the Go internals of it into the
+	// prompt the model reads - which is the stronger argument for making the
+	// prompt templates strict, and the reason agent/prompt_test.go asserts no
+	// "<no value>" survives into a shipped prompt.
+	if got != "rc=1 job=<no value>" {
+		t.Errorf("forgiving render = %q, want the documented <no value>", got)
+	}
+}

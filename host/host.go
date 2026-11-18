@@ -75,6 +75,9 @@ type Process struct {
 	// belongs to rather than joining an undifferentiated stream
 	// (docs/parallel-sessions.md §7 step 2).
 	Logger *slog.Logger
+	// GC is the result of the collection pass New ran on the way up. Zero means
+	// the pass failed or found nothing to say.
+	GC GCReport
 
 	// OnChild is a spawned session's chance to get a front end *before it runs*,
 	// and the seam step 7.4 of docs/parallel-sessions.md exists for: the GUI opens
@@ -140,7 +143,69 @@ func New(store *session.Store, ctx context.Context) *Process {
 	} else if n > 0 {
 		p.logger().Info("removed result directories no session names", "count", n)
 	}
+	// Session collection runs at the same moment as the other two sweeps, and for
+	// the same reason: process start is when the previous run's state is known to
+	// be stale, and a tool you invoke by opening it has no daemon to hold a
+	// timer. The policy - keep the N most recent trees per project, sweep the
+	// rest past D days idle, subagents going with their parent - and its two
+	// knobs live in the store's settings table, so they can be changed without a
+	// rebuild and are read fresh here.
+	//
+	// ProcessAlive is handed in rather than consulted inside the store: a tree
+	// with a row opened by a live pid is protected, which is what keeps
+	// collection from deleting the session another window is still looking at.
+	// This process's own pid passes that check too, so the session that is
+	// starting up right now is never a candidate.
+	if report, err := p.CollectGarbage(); err != nil {
+		p.logger().Warn("session collection failed", "err", err)
+	} else {
+		p.GC = report
+		if report.Swept > 0 {
+			p.logger().Info("collected idle session trees",
+				"trees", report.Swept, "sessions", report.Sessions,
+				"bytes", report.Bytes, "idle_days", report.Config.IdleDays,
+				"keep_per_project", report.Config.Keep)
+		}
+	}
 	return p
+}
+
+// GCReport is what one collection pass did, kept on the Process so a front end
+// can tell the human that history was reclaimed rather than doing it silently.
+type GCReport struct {
+	Config   session.GCConfig
+	Swept    int
+	Sessions int
+	Bytes    int64
+	// Kept and Busy are the exempt counts, reported so the numbers can be
+	// checked against expectation instead of inferred from what vanished.
+	Kept  int
+	Busy  int
+	Fresh int
+}
+
+// CollectGarbage runs one pass of the session policy against this process's
+// store and returns what it removed. It is exported for `mini sessions gc` and
+// for a front end that wants to offer collection without restarting; New calls
+// it on the way up.
+func (p *Process) CollectGarbage() (GCReport, error) {
+	cfg, err := p.Store.GCConfigFor()
+	if err != nil {
+		return GCReport{Config: cfg}, err
+	}
+	plan, err := p.Store.RunGC(cfg, ProcessAlive)
+	if err != nil {
+		return GCReport{Config: cfg}, err
+	}
+	return GCReport{
+		Config:   cfg,
+		Swept:    len(plan.Sweep),
+		Sessions: plan.Sessions(),
+		Bytes:    plan.Bytes(),
+		Kept:     len(plan.Kept),
+		Busy:     len(plan.Busy),
+		Fresh:    plan.Fresh,
+	}, nil
 }
 
 // warnIf folds a (warnings, error) sweep into the one shape both callers want.
@@ -259,6 +324,11 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 		return nil, errors.New("host: Spec.Config is required")
 	}
 	agentCfg := agentConfigOf(spec.Config)
+	// One funnel assembles every session - GUI, headless, subagent - so the mode
+	// is validated here rather than in each front end that forgot to (A-2).
+	if err := agent.ValidateMode(agentCfg.Mode); err != nil {
+		return nil, fmt.Errorf("host: %w", err)
+	}
 	modelCfg := config.Sub(spec.Config, "model")
 	envCfg := config.Sub(spec.Config, "environment")
 
@@ -374,6 +444,20 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 		}
 	}
 
+	// A job's result reaching the queue is the moment this session owes a step,
+	// and the session may be standing in that step already with nobody watching:
+	// parked in Hooks.OnSubmit at the ready prompt, or parked in waitQuiet with
+	// its wrapper holding a child open. Both waits are inside Run, so every
+	// boundary in Run is downstream of them and no drain can be reached. The
+	// hook therefore has to reach the waiters directly - the loop's signal for a
+	// prompt that is blocking on a human, and the wake channel for a wrapper that
+	// is blocking on a registry. (docs/parallel-sessions.md 9.10: the alternative
+	// to a push here is a poller.)
+	jobs.OnFiring = func() {
+		l.NotifyWork()
+		s.notify()
+	}
+
 	// A resume loads the stored transcript and continues it; the stored system
 	// prompt wins even if the config changed underneath it, because the database
 	// is the source of truth for a resumed run. A fresh session gets nothing
@@ -388,6 +472,22 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 		s.ResumeMsgs, s.ResumeNote = msgs, fmt.Sprintf("resumed session %s (%d turns)", sess.ID, len(msgs))
 	}
 
+	// The sweep is only sound if the previous holder is gone - and "gone" used to
+	// be an assumption rather than a check, which is A-6. A second process
+	// resuming a session a GUI still holds swept that GUI's *running* jobs to
+	// orphaned and queued a firing telling its model nobody owned work that was
+	// still burning. The store's stance has always been that one session has one
+	// driver; this is what makes the stance real without inventing the lease
+	// subsystem the store deliberately does not have.
+	if holder, err := p.Store.Owner(sess.ID.String()); err != nil {
+		return nil, fmt.Errorf("host: %w", err)
+	} else if resumeBlocked(holder, os.Getpid(), ProcessAlive) {
+		return nil, fmt.Errorf("host: session %s is open in another mini process (pid %d); close it before resuming it here", sess.ID, holder)
+	}
+	if err := sess.Claim(); err != nil {
+		return nil, err
+	}
+
 	// The sweep runs before anything can start: a row still marked 'running' is a
 	// claim about a process this mini does not own, so it becomes orphaned and
 	// the human is told, which is the honest version of "still running".
@@ -399,6 +499,16 @@ func (p *Process) Open(spec Spec) (*Session, error) {
 		p.mu.Unlock()
 		jcancel()
 		return nil, errors.New("host: process is closed")
+	}
+	// The same refusal one level in. Without it a second Open of one id leaves a
+	// duplicate in p.order while p.sessions keeps only the newest object, so
+	// Process.Close closes that one twice and never reaps the first's jobs -
+	// the in-process version of the cross-process bug above.
+	if _, dup := p.sessions[s.ID]; dup {
+		p.mu.Unlock()
+		jcancel()
+		_ = s.Sess.Release()
+		return nil, fmt.Errorf("host: session %s is already open in this process", s.ID)
 	}
 	p.sessions[s.ID] = s
 	p.order = append(p.order, s.ID)
@@ -585,6 +695,24 @@ func (p *Process) processCtx() context.Context {
 // merged config. They are separate functions because cmd/mini validates model
 // presence in its own order and reports it its own way; the rules live here so a
 // session assembled by any caller is assembled the same way.
+
+// resumeBlocked is the whole cross-process rule, as a function so it can be
+// tested without staging a second process. An owner of 0 nobody holds the row;
+// our own pid is a stale stamp from a session this process already closed (the
+// release is best-effort, and a crash skips it); and a foreign pid that cannot be
+// found is a crashed holder, for whom the sweep is exactly the right thing.
+// Everything else - a live foreign pid - is the case that used to silently
+// orphan another process's running jobs.
+//
+// alive is injected because on platforms that cannot answer the question
+// ProcessAlive reports false, which disables the refusal rather than turning a
+// "maybe dead" guess into a lockout.
+func resumeBlocked(holder, mine int, alive func(int) bool) bool {
+	if holder == 0 || holder == mine {
+		return false
+	}
+	return alive(holder)
+}
 
 func agentConfigOf(merged map[string]any) *agent.Config {
 	return agent.ConfigFromMap(config.Sub(merged, "agent"))

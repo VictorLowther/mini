@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/model"
@@ -34,6 +35,14 @@ type Print struct {
 	settings Settings
 
 	in *bufio.Reader
+	// lines carries whole lines read by the one stdin reader goroutine, so a
+	// prompt can be abandoned before it is answered. bufio.Reader.ReadString
+	// only ever notices a cancellation *after* the read has unblocked, which
+	// meant an interrupted prompt kept holding its ask-queue slot - and a second
+	// session's prompt then queued behind a read nobody was waiting for any
+	// more. It also left stdin with two readers, which loses a keystroke.
+	lines    chan lineResult
+	lineOnce sync.Once
 	// asks serializes prompts; see askQueue and docs/parallel-sessions.md §9.4.
 	asks askQueue
 	// Terminal reports whether a human is on stdin. Set from os.Stdin's mode;
@@ -203,7 +212,7 @@ func (p *Print) readLine(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	line, err := p.in.ReadString('\n')
+	line, err := waitLine(ctx, p.startReader())
 	if line == "" && err != nil {
 		// A cancellation while blocked in the read is the reason we have no
 		// answer; report that rather than the EOF it unblocks with.
@@ -216,6 +225,50 @@ func (p *Print) readLine(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// lineResult is one stdin read, delivered across the goroutine boundary.
+type lineResult struct {
+	line string
+	err  error
+}
+
+// startReader begins the single stdin reader, if it is not already running. The
+// channel is buffered by one so a line typed while the harness is busy is kept
+// for the next prompt rather than dropped, and the goroutine ends at the first
+// error: a closed channel is a sticky EOF, which is what every later
+// readLine must see instead of a second blocking read on a dead stream.
+func (p *Print) startReader() chan lineResult {
+	p.lineOnce.Do(func() {
+		p.lines = make(chan lineResult, 1)
+		go func() {
+			defer close(p.lines)
+			for {
+				line, err := p.in.ReadString('\n')
+				p.lines <- lineResult{line: line, err: err}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	})
+	return p.lines
+}
+
+// waitLine takes the next line, or gives up with the ctx. Giving up is the
+// point: it is what lets a prompt be cut short to take a step the harness owes,
+// and the line that arrives afterwards simply waits in the buffer for the next
+// prompt that does read it.
+func waitLine(ctx context.Context, ch chan lineResult) (string, error) {
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			return "", io.EOF
+		}
+		return v.line, v.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 // readMultiline collects lines until a blank one, standing in for

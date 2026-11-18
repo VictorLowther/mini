@@ -246,7 +246,7 @@ func TestParallelSessionsWakeOwnJobs(t *testing.T) {
 					return fmt.Sprintf("s%d run: %v", i, err)
 				}
 				var seen []string
-				for _, m := range ps.loop.Messages {
+				for _, m := range ps.loop.messages {
 					if strings.Contains(fmt.Sprint(m["content"]), "woke") {
 						seen = append(seen, fmt.Sprint(m["content"]))
 					}
@@ -339,7 +339,7 @@ func TestSecondRunOnALiveLoopIsRefused(t *testing.T) {
 	// the model about tool results in the user role, so role alone is not the
 	// measure here and IsToolResult is.
 	var user int
-	for _, m := range ps.loop.Messages {
+	for _, m := range ps.loop.messages {
 		if m["role"] == "user" && !model.IsToolResult(m) {
 			user++
 		}

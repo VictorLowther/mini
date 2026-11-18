@@ -357,6 +357,19 @@ func TestResumeLoadsTheStoredConversation(t *testing.T) {
 		t.Fatal("the run recorded no calls; the resume has nothing to restore")
 	}
 
+	// One session has one driver (A-6). A resume used to happily build a second
+	// Session object over the same transcript, which left a duplicate in the
+	// process registry and meant Close closed one object twice while never
+	// reaping the other's jobs; `mini -r` only ever resumes from a *different*
+	// process, so closing here is what a real resume looks like.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	row, err = p.Store.Get(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	resumed, err := p.Open(Spec{Config: merged, Resume: row, Model: scripted(9)})
 	if err != nil {
 		t.Fatal(err)
@@ -394,6 +407,18 @@ func TestGlobalEnvIsAppliedOnce(t *testing.T) {
 	// win, and must not be re-read per session (docs/parallel-sessions.md §4
 	// item 2): LoadGlobalEnv is guarded so a second Open cannot mutate the
 	// environment a first session's shells are snapshotting.
+	// This test TRUNCATES the global .env, so it has to point the config
+	// directory somewhere disposable first. It did not, and every
+	// `go test ./host/` overwrote the developer's real
+	// ~/Library/Application Support/mini/.env with the one sentinel line -
+	// deleting MINI_MODEL_NAME, MINI_BASE_URL and MINI_CONFIGURED, which is what
+	// made the CLI ask for a model and URL on every single start. The wizard's
+	// gate was innocent; the test erased the answer it had just saved.
+	//
+	// MINI_STATE_DIR is already redirected per test by newProcess; this is the
+	// other half of the same isolation, and main_test.go now defaults it for the
+	// whole package so a future test cannot repeat the mistake by forgetting.
+	t.Setenv("MINI_GLOBAL_CONFIG_DIR", t.TempDir())
 	if _, err := config.EnsureConfigDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -647,13 +672,13 @@ func TestSpawnRunsAChildAndReportsToItsParent(t *testing.T) {
 	// A parent that had to spend a turn reading a file to learn what its child
 	// found out hands back exactly the cost the child was meant to save.
 	var saw string
-	for _, m := range parent.Loop.Messages {
+	for _, m := range parent.Loop.Messages() {
 		if c := fmt.Sprint(m["content"]); strings.Contains(c, "REPORT: wrote child.txt") {
 			saw = c
 		}
 	}
 	if saw == "" {
-		for _, m := range parent.Loop.Messages {
+		for _, m := range parent.Loop.Messages() {
 			t.Logf("msg role=%v: %.140s", m["role"], m["content"])
 		}
 		t.Fatal("the subagent's report never reached the parent's conversation")
@@ -721,10 +746,17 @@ func TestSendRefusesNonAgentJobs(t *testing.T) {
 	}
 }
 
-// TestAgentJobsAreExemptFromTheProcessCap is §5.7's consequence, tested rather
-// than asserted in prose: the cap bounds processes, and a parent at the cap can
-// still spawn, because the child holds no pid.
-func TestAgentJobsAreExemptFromTheProcessCap(t *testing.T) {
+// TestNoCountBoundOnTheParentsRegistry is A-8's regression, and it replaces a
+// test that only proved agent jobs were *exempt* from a cap. The bug was that
+// exemption was one-sided: subagents are registered as agent-kind jobs on the
+// parent's own manager, so they occupied slots in the count the bash cap was
+// compared against, and a parent with eight live children could not start so
+// much as `ls` - while a long command that outran its budget was destroyed at
+// the promotion point by handoff's kill.
+//
+// There is no count bound to trip now. This starts well past the old cap of 8,
+// in both kinds, interleaved, and asserts nothing is refused.
+func TestNoCountBoundOnTheParentsRegistry(t *testing.T) {
 	p, base := newProcess(t)
 	merged := testConfig(t)
 	p.ChildModel = func(string) model.Model {
@@ -736,13 +768,26 @@ func TestAgentJobsAreExemptFromTheProcessCap(t *testing.T) {
 	}
 	t.Cleanup(func() { parent.Jobs.KillAll() })
 
-	for i := 0; i < int(job.DefaultMaxJobs); i++ {
+	// Well past the old cap, and past it again after the children arrive.
+	const before, after = 10, 4
+	for i := 0; i < before; i++ {
 		if _, err := parent.Jobs.Start(job.Spec{Command: "sleep 30", Label: "hog", TCNO: 10 + i}); err != nil {
-			t.Fatalf("bash job %d was refused early: %v", i, err)
+			t.Fatalf("bash job %d was refused: %v", i, err)
 		}
 	}
-	if _, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "past the cap", Prompt: "do it"}); err != nil {
-		t.Errorf("an agent job was refused by the process cap: %v", err)
+	for i := 0; i < 3; i++ {
+		if _, err := parent.Spawn(context.Background(),
+			agent.SpawnRequest{Name: fmt.Sprintf("kid-%d", i), Prompt: "do it"}); err != nil {
+			t.Fatalf("spawn %d was refused: %v", i, err)
+		}
+	}
+	for i := 0; i < after; i++ {
+		if _, err := parent.Jobs.Start(job.Spec{Command: "sleep 30", Label: "hog", TCNO: 50 + i}); err != nil {
+			t.Fatalf("bash job %d was refused after the children: %v", i, err)
+		}
+	}
+	if n := parent.Jobs.StillRunning(); n < before+after {
+		t.Fatalf("live jobs = %d, want at least %d", n, before+after)
 	}
 }
 
@@ -979,7 +1024,7 @@ func TestSendRevivesAFinishedSubagent(t *testing.T) {
 		t.Fatal("the revived row is not mapped to a child")
 	}
 	var userTurns int
-	for _, m := range kid.Loop.Messages {
+	for _, m := range kid.Loop.Messages() {
 		if m["role"] == "user" && !model.IsToolResult(m) {
 			userTurns++
 		}

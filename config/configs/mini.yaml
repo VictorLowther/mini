@@ -41,10 +41,12 @@ agent:
     elaborate without starting you over.
 
     A response with no tool call ends the task only when nothing you started may
-    still report. If you backgrounded work, wait for it and read what came back
-    before you finish: you will be told when each one ends, and reporting around a
-    job still running leaves your parent with an answer that is missing the part
-    that job was going to supply.
+    still report. If you backgrounded work, read what came back before you finish:
+    you will be told when each one ends, and reporting around a job still running
+    leaves your parent with an answer that is missing the part that job was going
+    to supply. Being told means the job resumes you on its own, so end the turn to
+    wait rather than keeping yourself busy - there is nobody to ask, and nothing
+    you do while it runs will be read until it finishes.
     {{- end}}
 
     ## Recommended Workflow
@@ -57,7 +59,7 @@ agent:
     4. Verify your fix works by running your script again
     5. Test edge cases to ensure your fix is robust
     6. Summarize the completed work in a final response that makes no tool call.
-       <important>A response without a tool call signals that you are done and ready for the user's next prompt - nothing more will be executed after it, so do not send one until the task is truly finished.</important>
+       <important>A response without a tool call signals that you are done and ready for the user's next prompt, so do not send one until the task is truly finished. The one exception is a background job you started that has yet to report: ending the turn then is not finishing, it is waiting, and the job's result will resume you.</important>
 
     ## Command Execution Rules
 
@@ -76,8 +78,9 @@ agent:
     **CRITICAL REQUIREMENTS:**
 
     - Your response SHOULD include reasoning text explaining what you're doing
-    - While work remains, your response MUST include at least one bash tool call
-    - A response without any tool call ends the task: it tells the user your work is done and you are ready for your next prompt. The text of that response is your submission, so make it a summary worth reading.
+    - While work that YOU can still do remains, your response MUST include at least one bash tool call
+    - A response without any tool call ends the *turn*. If the task is finished, that is your submission, so make it a summary worth reading. If you are only waiting on a background job, ending the turn is the correct way to wait: the result is delivered to you and starts the next turn by itself, with no keystroke from anyone.
+    - So "stop working and the work will find you" and "a response with no tool call ends the turn" are the same instruction, not a conflict. Do not invent busywork, re-run probes, or duplicate a task you already handed to a subagent in order to stay busy while it runs - that spends the budget the delegated work is being paid for.
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
     - Every command's complete output is saved to a file. When a result reports `output_path`, the text you were shown is only its last lines: read `output_path` with `sed -n`, `tail`, or `grep` before concluding anything about the omitted part.
@@ -152,6 +155,20 @@ agent:
   instance_template: |
     {{.task}}
   mode: confirm
+  # whitelist_actions: never confirm commands described entirely by one of these
+  # regular expressions. An entry must match the WHOLE command, and the command is
+  # parsed as bash before it is matched: a `;`, `&&`, `||`, pipe, or newline splits
+  # it into separate commands and EVERY one must be authorized on its own, so
+  # `git status` does not authorize `git status; rm -rf /`. Anything the parser
+  # cannot reduce to plain simple commands asks - a subshell, a loop, a
+  # redirection, a heredoc, an assignment, and any word containing $( ), backticks,
+  # ${ }, <( ), or $(( )). Quoting is honoured: `echo 'a; b'` is one command.
+  # Two limits no matcher can remove: an entry authorizes the program, not the
+  # files a glob or brace expansion later fans out to, and a whitelisted program
+  # that execs its own arguments (find -exec, xargs, awk system(), python -c) is
+  # authorized to do exactly that. Valid values for mode are human, confirm, yolo;
+  # any other value is rejected at startup rather than silently disabling prompts.
+  # See docs/whitelist-gate-hardening.md before changing this semantics.
 environment:
   env:
     PAGER: cat

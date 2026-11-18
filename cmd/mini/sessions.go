@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"text/tabwriter"
 	"time"
 
 	"github.com/VictorLowther/mini/config"
+	"github.com/VictorLowther/mini/host"
 	"github.com/VictorLowther/mini/session"
 )
 
@@ -18,6 +20,7 @@ const sessionsHelp = `Usage:
   mini sessions [--all] [--limit N]         list sessions for this repo
   mini sessions rm <uuid-prefix>             delete one session, its transcript and its result files
   mini sessions export [-o FILE] [<uuid-prefix>]   write one session's trajectory out
+  mini sessions gc [-n] [-keep N] [-idle-days D]  collect idle sessions, or preview it
 
 Lists the stored sessions, newest update first, for the repository (or
 working directory) the command runs in. --all covers every project.
@@ -32,6 +35,17 @@ The document is rebuilt from the store, so it carries what the store kept: the
 session's own facts (id, kind, lineage, project, model, cost, steps, exit
 status) and its full message list. It has no config block, because the
 configuration a session ran under was never recorded.
+
+gc applies the retention policy: the N most recently used session trees per
+project are always exempt, and anything else is collected after D days without
+activity. A tree is a session and its subagents, which are collected with their
+parent and never judged on their own - and a tree whose child was used today
+counts as used today. Collection removes the rows and the result files together.
+-n previews the plan and deletes nothing. -keep and -idle-days override the
+numbers for that run only; add -save to persist them as the global settings,
+which live in the database rather than the config file; the same pass also runs by itself whenever mini starts. A tree
+holding a session another live process has open is skipped, so collecting from
+the command line cannot delete what a window is looking at.
 `
 
 // runSessionsCommand lists, deletes and exports sessions. STEPS counts model calls
@@ -43,6 +57,9 @@ func runSessionsCommand(args []string, stdout io.Writer) error {
 	// and would then be handed to the session lookup as a uuid prefix.
 	if len(args) > 0 && args[0] == "export" {
 		return runSessionsExport(args[1:], stdout)
+	}
+	if len(args) > 0 && args[0] == "gc" {
+		return runSessionsGC(args[1:], stdout)
 	}
 
 	fs := flag.NewFlagSet("mini sessions", flag.ContinueOnError)
@@ -191,4 +208,117 @@ func exportSession(store *session.Store, project, prefix, path string) (string, 
 		return "", err
 	}
 	return sess.ExportTrajectory(path)
+}
+
+// runSessionsGC is `mini sessions gc [-n] [-keep N] [-idle-days D]`.
+//
+// It talks to the store directly rather than going through host.New, which
+// matters twice over: New runs a collection pass of its own, so a preview
+// invoked as `gc -n` would otherwise delete on the way in, and New would also
+// bring up a job registry and a process context for a command that only reads
+// and prunes rows.
+func runSessionsGC(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("mini sessions gc", flag.ContinueOnError)
+	dry := fs.Bool("n", false, "preview the plan; delete nothing")
+	dryLong := fs.Bool("dry-run", false, "preview the plan; delete nothing")
+	keep := fs.Int("keep", 0, "override the exempt tree count for this run")
+	idle := fs.Int("idle-days", 0, "override the idle window for this run")
+	save := fs.Bool("save", false, "persist the -keep / -idle-days values as the global settings")
+	fs.Usage = func() { fmt.Fprint(fs.Output(), sessionsHelp) }
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	store, _, err := sessionsScope()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	cfg, err := store.GCConfigFor()
+	if err != nil {
+		return err
+	}
+	if *keep > 0 {
+		cfg.Keep = *keep
+	}
+	if *idle > 0 {
+		cfg.IdleDays = *idle
+	}
+	// Overriding for a preview must not rewrite the global numbers, or "what
+	// would this collect at 1 day?" quietly changes what every later run does -
+	// and the destructive direction is the one a curious user tries first. The
+	// values apply to this run unless -save says otherwise.
+	if *save {
+		if *keep <= 0 && *idle <= 0 {
+			return errors.New("gc: -save needs -keep and/or -idle-days to save")
+		}
+		if err := store.SetGCConfig(cfg); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Saved: keep %d trees per project, collect after %d idle days\n",
+			cfg.Keep, cfg.IdleDays)
+	} else if *keep > 0 || *idle > 0 {
+		fmt.Fprintf(stdout, "(overriding the stored policy for this run only; add -save to keep it)\n")
+	}
+
+	plan, err := store.PlanGC(cfg, host.ProcessAlive)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Policy: keep the %d most recent trees per project; collect the rest after %s idle\n",
+		cfg.Keep, pluralDays(cfg.IdleDays))
+	fmt.Fprintf(stdout, "Exempt: %d by recency, %d held by a live process, %d still within the window\n",
+		len(plan.Kept), len(plan.Busy), plan.Fresh)
+
+	if len(plan.Sweep) == 0 {
+		fmt.Fprintln(stdout, "Nothing to collect.")
+		return nil
+	}
+	for _, t := range plan.Sweep {
+		fmt.Fprintf(stdout, "  %s  %-28s  %d session(s), %8s  idle since %s\n",
+			t.Root.String()[:8], filepath.Base(t.Project), t.Members,
+			humanSize(t.Bytes), time.UnixMilli(t.LastUsed).Format("2006-01-02"))
+	}
+	fmt.Fprintf(stdout, "%s, %s, %s of result files\n",
+		plural(len(plan.Sweep), "tree"), plural(plan.Sessions(), "session"), humanSize(plan.Bytes()))
+
+	if *dry || *dryLong {
+		fmt.Fprintln(stdout, "Dry run: nothing was deleted.")
+		return nil
+	}
+	// Re-run through the store so the deletion path is the one New uses, and
+	// report what it actually removed rather than what the preview measured.
+	done, err := store.RunGC(cfg, host.ProcessAlive)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Collected %s (%s, %s).\n",
+		plural(len(done.Sweep), "tree"), plural(done.Sessions(), "session"), humanSize(done.Bytes()))
+	return nil
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+func pluralDays(n int) string {
+	if n == 1 {
+		return "1 day"
+	}
+	return fmt.Sprintf("%d days", n)
+}
+
+// humanSize keeps the report scannable; the numbers are disk, not tokens.
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
 }

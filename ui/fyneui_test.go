@@ -445,10 +445,10 @@ func TestGUITypeToReject(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the run never finished")
 	}
-	if !containsContent(l.Messages, "The user rejected your commands with the following message: use printf instead") {
-		t.Errorf("rejection missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "The user rejected your commands with the following message: use printf instead") {
+		t.Errorf("rejection missing:\n%s", contentsOf(l.Messages()))
 	}
-	if containsContent(l.Messages, "|not-run") {
+	if containsContent(l.Messages(), "|not-run") {
 		t.Error("the rejected command ran")
 	}
 }
@@ -474,10 +474,10 @@ func TestGUIEscCancelsTheTurn(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("esc did not interrupt the running command\nmessages:\n%s", contentsOf(l.Messages))
+		t.Fatalf("esc did not interrupt the running command\nmessages:\n%s", contentsOf(l.Messages()))
 	}
-	if !containsContent(l.Messages, "Interrupted by user: that took too long") {
-		t.Errorf("comment missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "Interrupted by user: that took too long") {
+		t.Errorf("comment missing:\n%s", contentsOf(l.Messages()))
 	}
 }
 
@@ -524,7 +524,7 @@ func TestGUISlashCommandsWorkAtThePanel(t *testing.T) {
 	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi"), Env: &env.Local{}}
 	p := newGUIForTest(t, c, l)
 
-	got := askG(t, p, Question{Kind: AskConfirm, Title: confirmationTitle(1), Cfg: c})
+	got := askG(t, p, Question{Kind: AskConfirm, Title: confirmationTitle(1, ""), Cfg: c})
 	p.typeText("/y")
 	p.enter()
 	if c.Mode != "yolo" {
@@ -534,7 +534,7 @@ func TestGUISlashCommandsWorkAtThePanel(t *testing.T) {
 		t.Errorf("/y must confirm the batch, got %+v", ans)
 	}
 
-	got = askG(t, p, Question{Kind: AskConfirm, Title: confirmationTitle(1), Cfg: c})
+	got = askG(t, p, Question{Kind: AskConfirm, Title: confirmationTitle(1, ""), Cfg: c})
 	p.typeText("/h")
 	p.enter()
 	if !p.HasQuestion() {
@@ -654,11 +654,11 @@ func TestGUISteeringLandsInTheHistory(t *testing.T) {
 	p.typeText("check the README first")
 	p.enter()
 	<-done
-	if !containsContent(l.Messages, "check the README first") {
-		t.Errorf("steering never reached the history:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "check the README first") {
+		t.Errorf("steering never reached the history:\n%s", contentsOf(l.Messages()))
 	}
 	var idxUser, idxNext int
-	for i, msg := range l.Messages {
+	for i, msg := range l.Messages() {
 		if msg["role"] == "user" && strings.Contains(msg["content"].(string), "README") {
 			idxUser = i
 		}
@@ -668,7 +668,7 @@ func TestGUISteeringLandsInTheHistory(t *testing.T) {
 		}
 	}
 	if idxNext == 0 || idxNext < idxUser {
-		t.Errorf("steering must be delivered before the next model call:\n%s", contentsOf(l.Messages))
+		t.Errorf("steering must be delivered before the next model call:\n%s", contentsOf(l.Messages()))
 	}
 	if !strings.Contains(p.transcript(), "(queued for the model's next turn)") {
 		t.Errorf("steering echo missing:\n%s", p.transcript())

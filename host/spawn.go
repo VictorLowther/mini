@@ -237,7 +237,7 @@ func (s *Session) childRunner(child *Session, prompt string) func(context.Contex
 // continuing one, and a re-drive is exactly a resume from the state in memory.
 func (s *Session) runChildTurn(ctx context.Context, task string) (map[string]any, error) {
 	if task == "" {
-		s.Loop.Resume(s.Loop.Messages)
+		s.Loop.Resume(s.Loop.Messages())
 	}
 	return s.Run(ctx, task)
 }
@@ -379,7 +379,16 @@ func (s *Session) notify() {
 func reportOf(report string) string {
 	r := strings.TrimSpace(strings.ReplaceAll(report, "\n", " "))
 	if len(r) > 200 {
-		return r[:200] + "..."
+		// A-9: cut on runes. A 200-byte budget sliced by bytes lands inside a
+		// multi-byte character whenever a report contains an accented path, CJK
+		// prose or an emoji, and the dangling prefix reaches the parent as
+		// U+FFFD. The byte-length test above keeps the common ASCII case free of
+		// the conversion. Everything else in mini that truncates for the model -
+		// agent.oneLine, session.trunc, compaction's own cut - already counts
+		// runes; this and readJobBody were the two that did not.
+		if rr := []rune(r); len(rr) > 200 {
+			return string(rr[:200]) + "..."
+		}
 	}
 	if r == "" {
 		return "reported nothing"

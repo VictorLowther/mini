@@ -169,8 +169,8 @@ func TestEnterConfirms(t *testing.T) {
 	if !strings.Contains(h.output(), "Execute 1 action(s)?") {
 		t.Errorf("output = %q", h.output())
 	}
-	if !containsContent(l.Messages, "hi") {
-		t.Errorf("messages = %s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "hi") {
+		t.Errorf("messages = %s", contentsOf(l.Messages()))
 	}
 }
 
@@ -183,24 +183,24 @@ func TestTypedTextRejectsAndReappearsInHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "Commands not executed. The user rejected your commands with the following message: no, use printf instead"
-	if !containsContent(l.Messages, want) {
-		t.Errorf("rejection missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), want) {
+		t.Errorf("rejection missing:\n%s", contentsOf(l.Messages()))
 	}
 	if kinds(h) != "confirm,new-task,new-task" {
 		t.Errorf("questions = %s", kinds(h))
 	}
-	if containsContent(l.Messages, "|not-run") {
+	if containsContent(l.Messages(), "|not-run") {
 		t.Error("the rejected command ran anyway")
 	}
-	if !containsExceptionInfo(l.Messages, "action was not executed") {
-		t.Errorf("padded observation missing:\n%s", contentsOf(l.Messages))
+	if !containsExceptionInfo(l.Messages(), "action was not executed") {
+		t.Errorf("padded observation missing:\n%s", contentsOf(l.Messages()))
 	}
 	if info["exit_status"] != "Submitted" || info["submission"] != "first\n" {
 		t.Errorf("info = %#v", info)
 	}
 	// The rejection reaches the model as a user message, not just the log.
 	var asUser bool
-	for _, m := range l.Messages {
+	for _, m := range l.Messages() {
 		if m["role"] == "user" && strings.Contains(m["content"].(string), want) {
 			asUser = true
 		}
@@ -211,7 +211,11 @@ func TestTypedTextRejectsAndReappearsInHistory(t *testing.T) {
 }
 
 func TestWhitelistedActionsNeverPrompt(t *testing.T) {
-	c := newConfig("confirm", `echo .*`, `cat \S+`)
+	// Both entries are written to match a whole command, which is what a
+	// whitelist entry now has to do. `echo .*` used to be the example here, and
+	// it is the shape that makes a whole-command rule meaningless - it matches
+	// any command that merely starts with "echo ".
+	c := newConfig("confirm", `echo \w+`, `cat \S+`)
 	l, h := pair(t, c, []any{"echo safe", submit("done")}, &env.Local{}, "\n", true)
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
@@ -221,9 +225,17 @@ func TestWhitelistedActionsNeverPrompt(t *testing.T) {
 	}
 }
 
-func TestWhitelistIsPrefixAnchored(t *testing.T) {
-	// Python matches with re.match; Go's MatchString is unanchored, so a bare
-	// "ls" must not approve "echo leak; ls /tmp".
+func TestWhitelistDoesNotMatchMidCommand(t *testing.T) {
+	// The left edge. Go's MatchString is unanchored, so without a leading "^"
+	// a bare "ls" would approve "echo leak; ls /tmp" on the strength of its
+	// last word.
+	//
+	// This test used to be called TestWhitelistIsPrefixAnchored and to fail
+	// with the words "approved a command that merely contains the pattern",
+	// which together read as though the whole command had to match. It did not,
+	// and the right edge was never tested (A-1). The right edge now lives in
+	// TestWhitelistApprovesOnlyWhatTheHumanAuthorized, and the old rule is kept
+	// honest by TestOldGateApprovedEveryBypassRow.
 	c := newConfig("confirm", "ls")
 	c.ConfirmExit = false
 	l, h := pair(t, c, []any{"echo leak; ls /tmp", submit("done")}, &env.Local{}, "\n\n", true)
@@ -231,7 +243,7 @@ func TestWhitelistIsPrefixAnchored(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(kinds(h), "confirm") {
-		t.Fatal("an unanchored whitelist pattern approved a command that merely contains the pattern")
+		t.Fatal("a whitelist pattern matched a command mid-string that it does not describe")
 	}
 }
 
@@ -247,7 +259,7 @@ func TestSlashYConfirmsAndStopsLaterPrompts(t *testing.T) {
 	if kinds(h) != "confirm,new-task" {
 		t.Errorf("questions = %s, want one confirm prompt then the exit prompt", kinds(h))
 	}
-	if !containsContent(l.Messages, "one") {
+	if !containsContent(l.Messages(), "one") {
 		t.Error("/y must also confirm the batch it was typed at")
 	}
 	if !strings.Contains(h.output(), "Switched to yolo mode") {
@@ -262,11 +274,11 @@ func TestSlashURejectsBatchAndSwitchesToHuman(t *testing.T) {
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
-	if !containsContent(l.Messages, "Commands not executed. Switching to human mode") {
-		t.Errorf("switch message missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "Commands not executed. Switching to human mode") {
+		t.Errorf("switch message missing:\n%s", contentsOf(l.Messages()))
 	}
-	if !containsContent(l.Messages, "User command: \n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```") {
-		t.Errorf("human command message missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "User command: \n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```") {
+		t.Errorf("human command message missing:\n%s", contentsOf(l.Messages()))
 	}
 }
 
@@ -282,8 +294,8 @@ func TestHumanModeSkipsTheModel(t *testing.T) {
 	if l.NCalls != 1 {
 		t.Errorf("the model must be reached only for the final submission turn, n_calls = %d", l.NCalls)
 	}
-	if !containsContent(l.Messages, "User command: \n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```") {
-		t.Errorf("messages:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "User command: \n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```") {
+		t.Errorf("messages:\n%s", contentsOf(l.Messages()))
 	}
 }
 
@@ -324,10 +336,10 @@ func TestSubmittedWithTypedTaskContinuesTheRun(t *testing.T) {
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
-	if !containsContent(l.Messages, "The user added a new task: and now do it again") {
-		t.Errorf("new task message missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "The user added a new task: and now do it again") {
+		t.Errorf("new task message missing:\n%s", contentsOf(l.Messages()))
 	}
-	if !containsContent(l.Messages, "second") {
+	if !containsContent(l.Messages(), "second") {
 		t.Error("the run did not continue after the new task")
 	}
 }
@@ -394,8 +406,8 @@ func TestInterruptIsRecordedWhenCancelled(t *testing.T) {
 	if _, err := l.Run(ctx, "T"); err == nil {
 		t.Fatal("expected the cancelled run to end with an error")
 	}
-	if !containsContent(l.Messages, "Temporary interruption caught") {
-		t.Errorf("interruption message missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "Temporary interruption caught") {
+		t.Errorf("interruption message missing:\n%s", contentsOf(l.Messages()))
 	}
 }
 
@@ -406,8 +418,8 @@ func TestMultilineCommentViaSlashM(t *testing.T) {
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
-	if !containsContent(l.Messages, "first line\nsecond line") {
-		t.Errorf("multiline rejection text missing:\n%s", contentsOf(l.Messages))
+	if !containsContent(l.Messages(), "first line\nsecond line") {
+		t.Errorf("multiline rejection text missing:\n%s", contentsOf(l.Messages()))
 	}
 }
 
@@ -439,7 +451,7 @@ func TestStreamedContentIsPrintedOnce(t *testing.T) {
 		Content:   func(s string) { h.ui.Content(s) },
 		Reasoning: func(s string) { h.ui.Reasoning(s) },
 	}
-	l.Messages = nil
+
 	l.Handler.Content("turn a")
 	l.Handler.Reasoning("thinking a")
 	h.ui.Message(model.Message{"role": "assistant", "content": "turn a"})
@@ -568,7 +580,7 @@ func TestJobToolsSkipTheConfirmationGate(t *testing.T) {
 
 func observationsOf(l *agent.Loop) []model.Message {
 	var out []model.Message
-	for _, m := range l.Messages {
+	for _, m := range l.Messages() {
 		if model.IsToolResult(m) {
 			out = append(out, m)
 		}

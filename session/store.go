@@ -28,6 +28,8 @@ import (
 type Store struct {
 	db      *sql.DB
 	tcrBase string
+	// pid is this process, stamped into sessions.opened_by on claim.
+	pid int
 }
 
 // schema has no version tracking: mini is 0.1.0 and no legacy databases
@@ -65,6 +67,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 	n_calls     INTEGER NOT NULL DEFAULT 0,
 	exit_status TEXT    NOT NULL DEFAULT '',
 	next_tcno   INTEGER NOT NULL DEFAULT 0,
+	-- opened_by is the pid of the mini process that currently holds this session,
+	-- 0 for nobody. It is not a lease: there is no heartbeat and no fencing
+	-- token, and it cannot be, because the store's stance is deliberately "no
+	-- flock/lease machinery" (see Open). What it does is make that stance
+	-- enforceable. The comment used to claim two processes driving one session
+	-- "only produces interleaved turns"; A-6 showed the real consequence is that
+	-- the second opener sweeps the first one's *running* jobs to orphaned and
+	-- queues a firing that tells the first process's model nobody owns work that
+	-- is still burning - and when that job then finishes, its outcome is
+	-- discarded. A refusal is cheaper than a lease and strictly better than a
+	-- silent wrong answer.
+	opened_by   INTEGER NOT NULL DEFAULT 0,
 	created_at  INTEGER NOT NULL,
 	updated_at  INTEGER NOT NULL
 );
@@ -191,6 +205,10 @@ func Open(path, tcrBase string) (*Store, error) {
 	// *same session* at once is unsupported and only produces interleaved
 	// turns. No flock/lease machinery.
 	db.SetMaxOpenConns(1)
+	if err := migrateSessionOwner(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := migrateJobKeys(db); err != nil {
 		db.Close()
 		return nil, err
@@ -207,7 +225,7 @@ func Open(path, tcrBase string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, tcrBase: tcrBase}, nil
+	return &Store{db: db, tcrBase: tcrBase, pid: os.Getpid()}, nil
 }
 
 // migrateJobKeys rebuilds the job tables when they were created with an
@@ -775,6 +793,66 @@ func (s *Store) Delete(id uuid.UUID) error {
 	if len(failures) > 0 {
 		return fmt.Errorf("session store: %d of %d result directories survived deletion (%s)",
 			len(failures), len(ids), strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+// migrateSessionOwner adds sessions.opened_by to a database created before it
+// existed. SQLite has no "ADD COLUMN IF NOT EXISTS", so the check is against
+// sqlite_master, matching the pragmatic style of migrateJobKeys.
+func migrateSessionOwner(db *sql.DB) error {
+	var ddl string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'`).Scan(&ddl)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // fresh database: the schema const creates the column
+	}
+	if err != nil {
+		return fmt.Errorf("session store: inspect sessions table: %w", err)
+	}
+	if strings.Contains(strings.Join(strings.Fields(ddl), " "), "opened_by") {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN opened_by INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("session store: add opened_by: %w", err)
+	}
+	return nil
+}
+
+// Owner reports the pid that holds the named session, 0 when nobody does.
+//
+// An unreadable row reports 0 rather than an owner, because the only caller uses
+// this to decide whether to *refuse* a resume: a store hiccup must not be able to
+// tell a human their own session is locked by somebody else.
+func (s *Store) Owner(id string) (int, error) {
+	var pid int
+	err := s.db.QueryRow(`SELECT opened_by FROM sessions WHERE id = ?`, id).Scan(&pid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("session store: read session owner: %w", err)
+	}
+	return pid, nil
+}
+
+// Claim stamps this process as the holder of the session row.
+func (s *Session) Claim() error {
+	_, err := s.store.db.Exec(`UPDATE sessions SET opened_by = ?, updated_at = ? WHERE id = ?`,
+		s.store.pid, time.Now().UnixMilli(), s.ID.String())
+	if err != nil {
+		return fmt.Errorf("session store: claim session: %w", err)
+	}
+	return nil
+}
+
+// Release hands the session back. It is deliberately not a close: the row
+// outlives the process, and only this process's own stamp is cleared, so a
+// release racing a newer claim by another pid cannot wipe that claim out.
+func (s *Session) Release() error {
+	_, err := s.store.db.Exec(`UPDATE sessions SET opened_by = 0 WHERE id = ? AND opened_by = ?`,
+		s.ID.String(), s.store.pid)
+	if err != nil {
+		return fmt.Errorf("session store: release session: %w", err)
 	}
 	return nil
 }

@@ -607,7 +607,7 @@ func reportRun(l *agent.Loop, info map[string]any, err error) {
 		return
 	}
 	status, _ := info["exit_status"].(string)
-	slog.Debug("run finished", "exit_status", status, "messages", len(l.Messages))
+	slog.Debug("run finished", "exit_status", status, "messages", len(l.Messages()))
 }
 
 func exitCode(info map[string]any, err error) int {

@@ -21,7 +21,7 @@ import (
 	"github.com/VictorLowther/mini/session"
 )
 
-func newMgr(t *testing.T, max int) (*Manager, *session.Session) {
+func newMgr(t *testing.T) (*Manager, *session.Session) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := session.Open(filepath.Join(dir, "sessions.db"), filepath.Join(dir, "tcr"))
@@ -34,7 +34,6 @@ func newMgr(t *testing.T, max int) (*Manager, *session.Session) {
 	}
 	m := &Manager{
 		Session:   sess,
-		MaxJobs:   max,
 		KillGrace: 500 * time.Millisecond,
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -99,7 +98,7 @@ func markerPIDs(t *testing.T, pattern string, n int) {
 }
 
 func TestCompletesAndMergesOutput(t *testing.T) {
-	m, sess := newMgr(t, 0)
+	m, sess := newMgr(t)
 	r, err := m.Start(Spec{Command: `echo to-stdout; echo to-stderr >&2; echo "line three"`, TCNO: 7, Label: "greeting"})
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +156,7 @@ func TestJobRunsInTheSameInterpreterAsForeground(t *testing.T) {
 	// uses it proves the mvdan.cc/sh interpreter is answering - the one that
 	// serves every foreground call (env/env.go:1-6) - rather than a forked
 	// system shell whose version and builtins differ per machine.
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	r, err := m.Start(Spec{Command: `v=ABC; echo "case=${v,,}"; arr=(x y z); echo "array=${arr[1]}"; [[ 2 -lt 3 ]] && echo "test=ok"`, TCNO: 91})
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +181,7 @@ func TestJobIsNotGivenATimeout(t *testing.T) {
 	// Decision 2: a job's length is nobody's business but the model's. A run
 	// that outlasts the foreground DefaultTimeout must still be alive at twice
 	// it, because the 30-second wall belongs to a tool call, not to a job.
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	r, err := m.Start(Spec{Command: "sleep 3; echo done"})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +207,7 @@ func TestJobIsNotGivenATimeout(t *testing.T) {
 }
 
 func TestFailureRecordsExitCode(t *testing.T) {
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	r, err := m.Start(Spec{Command: "echo starting; exit 3"})
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +228,7 @@ func TestKillTakesTheWholeGroup(t *testing.T) {
 	if _, err := exec.LookPath("sleep"); err != nil {
 		t.Skip("no sleep")
 	}
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	marker := markerFor(t)
 	// One backgrounded grandchild and one foreground child, both in the run's
 	// process group. Signalling only the shell would orphan the pair of them,
@@ -280,38 +279,59 @@ func TestKillTakesTheWholeGroup(t *testing.T) {
 	}
 }
 
-func TestCapRefusesAndNamesTheRemedy(t *testing.T) {
-	m, _ := newMgr(t, 1)
-	marker := markerFor(t)
-	if _, err := m.Start(Spec{Command: "sleep " + marker + " & sleep " + marker}); err != nil {
-		t.Fatal(err)
+// TestNoLimitOnLiveJobs replaces TestCapRefusesAndNamesTheRemedy. mini bounds
+// nothing here, and this is the invariant that keeps it that way: a session can
+// hold many jobs at once, all of them listed, none of them refused. The old cap
+// was a borrowed number justified by GPU contention, and it could not do the
+// job - a backgrounded command is a process *tree*, so `make -j64` is one job
+// and a fork loop is one job, while a parent that used subagents was refused its
+// `ls`. Process limits live in ulimit and cgroups, where the tree is visible.
+func TestNoLimitOnLiveJobs(t *testing.T) {
+	m, sess := newMgr(t)
+	const want = 12
+	for i := 0; i < want; i++ {
+		if _, err := m.Start(Spec{Command: "sleep 30", Label: "many", TCNO: 100 + i}); err != nil {
+			t.Fatalf("job %d was refused: %v", i, err)
+		}
 	}
-	markerPIDs(t, "sleep "+marker, 2)
+	if n, _ := sess.CountRunningJobs(); n != want {
+		t.Fatalf("running rows = %d, want %d", n, want)
+	}
+	if got := m.StillRunning(); got != want {
+		t.Fatalf("live jobs = %d, want %d", got, want)
+	}
+}
 
-	_, err := m.Start(Spec{Command: "echo should not start"})
-	if !errors.Is(err, ErrCap) {
-		t.Fatalf("second start = %v, want ErrCap", err)
+// Kind does not matter either: agent jobs and bash jobs coexist with no
+// bookkeeping shared between their counts.
+func TestMixedKindsAreAllAdmitted(t *testing.T) {
+	m, sess := newMgr(t)
+	for i := 0; i < 4; i++ {
+		if _, err := m.Start(Spec{Command: "sleep 30", Label: "bash", TCNO: 200 + i}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if !strings.Contains(err.Error(), "job_kill") {
-		t.Errorf("refusal must name the remedy: %v", err)
+	// The child runs are held open. Left to return at once they finish before
+	// the count is read, and the test measures nothing.
+	held := make(chan struct{})
+	t.Cleanup(func() { close(held) })
+	for i := 0; i < 4; i++ {
+		if _, err := m.Start(Spec{Kind: session.KindSubagent, Command: "subagent", Label: "kid",
+			TCNO: 300 + i, Run: func(context.Context, io.Writer) Result {
+				<-held
+				c := 0
+				return Result{ExitCode: &c}
+			}}); err != nil {
+			t.Fatalf("subagent %d refused: %v", i, err)
+		}
 	}
-	// The refusal costs nothing: no row, no file, no process.
-	if n, _ := m.Session.CountRunningJobs(); n != 1 {
-		t.Errorf("running rows after refusal = %d", n)
-	}
-	if rows, _ := m.Session.ListJobs(); len(rows) != 1 {
-		t.Errorf("refusal left %d rows behind", len(rows))
-	}
-	// And the cap releases when the job ends, which is the only way a long
-	// autonomous run can make room for the next one.
-	m.KillAll()
-	if _, err := m.Start(Spec{Command: "echo room now"}); err != nil {
-		t.Errorf("cap did not release after the reap: %v", err)
+	if n, _ := sess.CountRunningJobs(); n != 8 {
+		t.Fatalf("running rows = %d, want 8", n)
 	}
 }
 
 func TestKillAllReapsEveryLiveJob(t *testing.T) {
-	m, sess := newMgr(t, 0)
+	m, sess := newMgr(t)
 	marker := markerFor(t)
 	for _, tc := range []int{11, 12} {
 		if _, err := m.Start(Spec{Command: "sleep " + marker + " & sleep " + marker, TCNO: tc}); err != nil {
@@ -351,7 +371,7 @@ func TestKillAllReapsEveryLiveJob(t *testing.T) {
 }
 
 func TestSweepEndsRowsThatSurvivedARestart(t *testing.T) {
-	m, sess := newMgr(t, 0)
+	m, sess := newMgr(t)
 	// A row left 'running' by a mini that died: nothing in this process can
 	// prove anything about that pid, so the sweep must assert only that
 	// ownership was lost.
@@ -382,7 +402,7 @@ func TestSweepEndsRowsThatSurvivedARestart(t *testing.T) {
 }
 
 func TestWaitDeadlineNeverLosesTheRun(t *testing.T) {
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	r, err := m.Start(Spec{Command: "sleep " + markerFor(t) + " & sleep " + markerFor(t)})
 	if err != nil {
 		t.Fatal(err)
@@ -429,7 +449,7 @@ func TestJobIDShape(t *testing.T) {
 }
 
 func TestStartRequiresACommand(t *testing.T) {
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	if _, err := m.Start(Spec{}); err == nil {
 		t.Error("an empty command was accepted")
 	}
@@ -508,7 +528,7 @@ func (s *stubKind) stop(grace time.Duration) error {
 }
 
 func TestReapTearsEveryJobDownTogether(t *testing.T) {
-	m, sess := newMgr(t, 0)
+	m, sess := newMgr(t)
 	const jobs = 4
 	const unwind = 400 * time.Millisecond
 	for i := 1; i <= jobs; i++ {
@@ -563,7 +583,7 @@ func TestRefusedStartLeaksNoGoroutine(t *testing.T) {
 	// register's watcher waits on done for every adopted handle, so a refusal
 	// before the spawn has to close it too. This counts the goroutines, because
 	// the leak is invisible otherwise and grows with every cap refusal.
-	m, _ := newMgr(t, 1)
+	m, _ := newMgr(t)
 	r, err := m.Start(Spec{Command: "sleep " + markerFor(t), TCNO: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -572,8 +592,8 @@ func TestRefusedStartLeaksNoGoroutine(t *testing.T) {
 
 	before := runtime.NumGoroutine()
 	for i := 0; i < 50; i++ {
-		// The DB cap has not been reached (one running job, MaxJobs 1 does
-		// reach it), so every one of these refusals comes from the live set.
+		// Every one of these refusals comes from the live set's duplicate-id
+		// check, not from a count: there is no cap to reach here.
 		if _, err := m.Start(Spec{Command: "echo nope", TCNO: 1}); err == nil {
 			t.Fatal("duplicate tcno was accepted while live")
 		}
@@ -592,7 +612,7 @@ func TestRefusedStartLeaksNoGoroutine(t *testing.T) {
 // and this is why ending a run has to be the harness cancelling the context
 // every one of those commands was started under.
 func TestKillEndsEveryConcurrentExternalOfARun(t *testing.T) {
-	m, _ := newMgr(t, 0)
+	m, _ := newMgr(t)
 	marker := markerFor(t)
 	const leaves = 4
 	script := ""

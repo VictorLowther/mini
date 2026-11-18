@@ -81,6 +81,14 @@ func ProjectContext(msgs []Message) []Message {
 			if n > len(out)-head {
 				n = len(out) - head
 			}
+			if n < 0 {
+				// A kept-count read back from a corrupt or hand-edited row
+				// must not make out[len(out)-n:] a slice past the end. The
+				// projection is what every request is built from, so this is
+				// the one place a bad number would take the session down with
+				// it instead of merely looking wrong.
+				n = 0
+			}
 			rebuilt := make([]Message, 0, head+n+1)
 			rebuilt = append(rebuilt, out[:head]...)
 			rebuilt = append(rebuilt, SummaryTurn(m))

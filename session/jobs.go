@@ -226,7 +226,7 @@ WHERE session_id = ? ORDER BY started_at DESC, id DESC`, s.ID.String())
 	return out, rows.Err()
 }
 
-// CountRunningJobs backs the job cap and the GUI footer count, both of which
+// CountRunningJobs backs the GUI footer count and the wake text ("two still\n// going"), neither of which
 // have to answer "how many now" without materialising rows.
 func (s *Session) CountRunningJobs() (int, error) {
 	var n int
@@ -419,6 +419,20 @@ WHERE session_id = ? AND delivered_at IS NULL`, s.ID.String()).Scan(&n); err != 
 	return n, nil
 }
 
+// CountUndeliveredFiringsFor is the per-job question behind UndeliveredFirings:
+// does THIS job still have a result sitting in the queue. Exact, and bounded by
+// nothing, because callers use the answer to decide whether to tell a human that
+// an ended job is still owed - and an approximation there reads as "settled".
+func (s *Session) CountUndeliveredFiringsFor(jobID string) (int, error) {
+	var n int
+	if err := s.store.db.QueryRow(`SELECT count(*) FROM job_events
+WHERE session_id = ? AND job_id = ? AND delivered_at IS NULL`,
+		s.ID.String(), jobID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("session store: count owed firings for job %s: %w", jobID, err)
+	}
+	return n, nil
+}
+
 // PendingJobEvents returns firings nobody has delivered, oldest first.
 func (s *Session) PendingJobEvents(limit int) ([]JobEventRow, error) {
 	if limit <= 0 {
@@ -485,4 +499,49 @@ func or(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// ReclaimJob records a job's true ending on a row that is no longer 'running'
+// because somebody else swept it out from under the process that started it.
+//
+// FinishJob's `AND state = 'running'` is the right guard for a live row, and it
+// is what makes A-6's second half silent: a competing opener flips the row to
+// 'orphaned', our own watcher then finishes the real process, the UPDATE matches
+// nothing, and the exit code and its firing are dropped on the floor. The
+// registry - the source of truth for what happened - is left saying
+// "ownership was lost" about a job that in fact exited 0 forty seconds later.
+//
+// Only this process can call it, from the path that holds a live handle, which
+// by mini's ownership rule means it started the process. So the row is ours to
+// correct, and 'orphaned' -> the real terminal state is the honest record. It
+// reports false when the row is in some other state, because then this is not
+// our race to win.
+func (s *Session) ReclaimJob(id, state string, exitCode *int, reason string) (*JobRow, bool, error) {
+	if !Terminal(state) {
+		return nil, false, fmt.Errorf("session store: %q is not a terminal job state", state)
+	}
+	cur, err := scanJob(s.store.db.QueryRow(
+		`SELECT `+jobColumns+` FROM jobs WHERE session_id = ? AND id = ?`, s.ID.String(), id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if cur.State != JobOrphaned {
+		return nil, false, nil
+	}
+	now := time.Now().UnixMilli()
+	row, err := scanJob(s.store.db.QueryRow(`UPDATE jobs
+SET state = ?, exit_code = ?, exit_reason = ?, ended_at = ?, updated_at = ?
+WHERE session_id = ? AND id = ? AND state = ?
+RETURNING `+jobColumns,
+		state, int64p(exitCode), reason, now, now, s.ID.String(), id, JobOrphaned))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil // lost the race to another writer; that is fine
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("session store: reclaim job %s: %w", id, err)
+	}
+	return &row, true, nil
 }

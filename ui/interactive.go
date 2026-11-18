@@ -18,31 +18,38 @@ type Interactive struct {
 	whitelist []*regexp.Regexp
 }
 
-// New compiles the whitelist once. Go regexes are unanchored, so the prefix
-// semantics of Python's re.match are restored by prepending "^" (and wrapping
-// in a group, so `echo a|echo b` means either whole command).
+// New compiles the whitelist once, as whole-command matches (see whitelist.go).
 func New(ui UI, cfg *agent.Config, l *agent.Loop) (*Interactive, error) {
-	h := &Interactive{UI: ui, Cfg: cfg, Loop: l}
-	for _, pattern := range cfg.WhitelistActions {
-		re, err := regexp.Compile("^(?:" + pattern + ")")
-		if err != nil {
-			return nil, err
-		}
-		h.whitelist = append(h.whitelist, re)
+	patterns, err := compileWhitelist(cfg.WhitelistActions)
+	if err != nil {
+		return nil, err
 	}
-	return h, nil
+	return &Interactive{UI: ui, Cfg: cfg, Loop: l, whitelist: patterns}, nil
 }
 
-func (h *Interactive) shouldAskConfirmation(command string) bool {
-	if h.Cfg.Mode != "confirm" {
-		return false
+// shouldAskConfirmation is the gate, and it reports why it asked.
+//
+// The mode test is inverted on purpose. It used to read `if Mode != "confirm" {
+// return false }`, which made every value the port never defined - "Confirm",
+// "confrim", "", a stray tab-swallowed YAML string - a *silent* yolo, because the
+// only value that meant "ask" was spelled exactly right. Upstream could afford
+// that: it declares mode as Literal["human","confirm","yolo"] and pydantic rejects
+// anything else at config load. The Go port kept the comparison and dropped the
+// type, so the typo became an authorization (A-2).
+//
+// So: only the two modes that genuinely have no one to ask skip the prompt -
+// "yolo" because the human opted out, "human" because the command came *from* the
+// human - and everything else asks.
+func (h *Interactive) shouldAskConfirmation(command string) (bool, string) {
+	switch h.Cfg.Mode {
+	case "yolo", "human":
+		return false, ""
 	}
-	for _, re := range h.whitelist {
-		if re.MatchString(command) {
-			return false
-		}
+	v := whitelistChecks(command, h.whitelist)
+	if v.Allowed {
+		return false, ""
 	}
-	return true
+	return true, v.Reason
 }
 
 // BeforeExecute implements the confirm mode.
@@ -54,13 +61,17 @@ func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action,
 		is.IssueCalls(actions)
 	}
 	ask := false
+	why := ""
 	for _, a := range actions {
 		// The job tools never reach the prompt: reading the registry asks
 		// nothing of anyone, and job_kill can only end work that already
 		// passed the gate when it started. Asking before letting a runaway
 		// be stopped would make the mitigation slower than the problem.
-		if a.NeedsConfirmation() && h.shouldAskConfirmation(a.Command) {
-			ask = true
+		if !a.NeedsConfirmation() {
+			continue
+		}
+		if need, reason := h.shouldAskConfirmation(a.Command); need {
+			ask, why = true, reason
 			break
 		}
 	}
@@ -69,7 +80,7 @@ func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action,
 	}
 	ans, err := h.UI.Ask(ctx, Question{
 		Kind:    AskConfirm,
-		Title:   confirmationTitle(len(actions)),
+		Title:   confirmationTitle(len(actions), why),
 		Actions: actions,
 		Cfg:     h.Cfg,
 		// Whose commands these are. The child's loop puts its own name in the
@@ -91,15 +102,113 @@ func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action,
 	return interruptUser(rejectMessage(ans.Text), "UserRejection")
 }
 
+// askWaking is Ask with the harness's own debt as a second way to be answered.
+//
+// A prompt is a step boundary. The session is between turns, nothing is
+// streaming, the transcript is settled - which is exactly the state compaction
+// waits for and the state a job result waits to be delivered into. Both waits
+// here (the ready prompt and human mode) run inside Run, on the agent
+// goroutine, so every drain in Run sits *downstream* of them: a firing written
+// while the human is away stayed in the durable queue until the next keystroke,
+// and a requested compaction stayed armed until a turn that might never come.
+//
+// So the prompt returns early, with woke=true, when the signal says there is
+// something to do. The signal is only a hint: PendingWork is checked before
+// waking, so a stale or duplicate notify cannot cut a prompt short for nothing,
+// and an answer that arrived in the same instant is always preferred to the
+// wake - a keystroke must not lose to a job that finished a millisecond earlier.
+//
+// loop==nil (a front end with no run to hand a step back to) degrades to a plain
+// Ask rather than to a prompt that cannot be woken and cannot act.
+func (h *Interactive) askWaking(ctx context.Context, q Question) (Answer, bool, error) {
+	if h.Loop == nil {
+		a, err := h.UI.Ask(ctx, q)
+		return a, false, err
+	}
+	loop := h.Loop
+
+	// Already-armed work must not have to wait for a keystroke to be noticed.
+	if loop.PendingWork() {
+		return Answer{}, true, nil
+	}
+
+	// Ask runs inline, on the agent goroutine, exactly as it did before this
+	// function existed. That is not a style preference: an earlier version of
+	// this helper called Ask from a second goroutine behind a cancellable
+	// context, and it passed every wake test while intermittently deadlocking
+	// the window's own trajectory test. The window hands an answer to whichever
+	// Ask currently owns g.pending, so relocating the call reorders
+	// publish-vs-answer across a goroutine boundary and a keystroke can land in
+	// the gap and be lost. The only thing allowed off-goroutine here is the
+	// watcher below, and it never touches the UI - its sole effect is cancel().
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	watched := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		defer close(watched)
+		select {
+		case <-loop.WorkSignal():
+			// A hint, not an instruction: if the debt is already gone (another
+			// boundary discharged it), do not cut this prompt short for
+			// nothing - keep waiting and let the human finish answering.
+			if loop.PendingWork() {
+				cancel()
+				return
+			}
+			select {
+			case <-stop:
+			case <-loop.WorkSignal():
+				if loop.PendingWork() {
+					cancel()
+				}
+			}
+		case <-stop:
+		case <-ctx.Done():
+		}
+	}()
+
+	ans, err := h.UI.Ask(wctx, q)
+	if err == nil {
+		return ans, false, nil
+	}
+	// The prompt was cut short. Distinguish "the harness owes a step" from a
+	// genuine cancellation of the run itself: only the first is a wake, and
+	// reporting the other as one would end a cancelled run politely instead of
+	// unwinding it.
+	if wctx.Err() != nil && ctx.Err() == nil && loop.PendingWork() {
+		return Answer{}, true, nil
+	}
+	return Answer{}, false, err
+}
+
 // OnSubmit implements confirm_exit: the run only ends when the user says so.
 func (h *Interactive) OnSubmit(ctx context.Context, exitMsg model.Message) error {
 	if !h.Cfg.ConfirmExit {
 		return nil
 	}
 	for {
-		ans, err := h.UI.Ask(ctx, Question{Kind: AskNewTask, Title: newTaskTitle, Cfg: h.Cfg})
+		ans, woke, err := h.askWaking(ctx, Question{Kind: AskNewTask, Title: newTaskTitle, Cfg: h.Cfg})
 		if err != nil {
 			return err
+		}
+		if woke {
+			// A result the harness owes outranks the wait for a task: give the
+			// step back to Run, whose next boundary drains the wake and asks the
+			// model, so the report reaches the conversation without a human
+			// having to type to unblock it. No messages: the wake text is
+			// authored by the drain, not by this prompt.
+			if h.Loop.OwedDeliveries() > 0 {
+				return &model.Interrupt{Kind: model.KindUserInterruption}
+			}
+			// Compaction only: run it here, because here *is* the safe boundary
+			// it was waiting for, and stay at the prompt. The user asked for a
+			// summary, not for a turn.
+			if h.Loop.CompactionPending() {
+				h.Loop.CompactHere(ctx)
+			}
+			continue
 		}
 		switch {
 		case ans.RePrompt:
@@ -128,9 +237,21 @@ func (h *Interactive) NextHumanCommand(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	for {
-		ans, err := h.UI.Ask(ctx, Question{Kind: AskHuman, Title: promptLine(), Cfg: h.Cfg})
+		ans, woke, err := h.askWaking(ctx, Question{Kind: AskHuman, Title: promptLine(), Cfg: h.Cfg})
 		if err != nil {
 			return "", false
+		}
+		if woke {
+			// Human mode never passes the drain at the top of Query - a user
+			// command replaces the model's turn before it - so discharge the
+			// debt here and then let Query run with it already in the history.
+			if h.Loop.CompactionPending() {
+				h.Loop.CompactHere(ctx)
+			}
+			if h.Loop.DeliverOwedNow() {
+				return "", false // ask the model, now that it has something to read
+			}
+			continue // compaction alone: still the human's turn
 		}
 		if ans.RePrompt {
 			continue

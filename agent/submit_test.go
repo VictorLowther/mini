@@ -49,7 +49,7 @@ func TestSentinelEchoIsJustACommand(t *testing.T) {
 	// The marker turn earned an observation: its output is an executed
 	// command's result, not an exit.
 	observed := false
-	for _, msg := range l.Messages {
+	for _, msg := range l.messages {
 		if e, ok := msg["extra"].(map[string]any); ok && e["command"] != nil {
 			observed = true
 		}

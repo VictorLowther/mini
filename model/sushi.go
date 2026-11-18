@@ -375,9 +375,19 @@ func (s *Sushi) attempt(ctx context.Context, payload []byte, h *Handler) (*strea
 	if res.StatusCode != http.StatusOK {
 		return nil, readError(res)
 	}
-	return readStream(res.Body, h)
+	return readStream(res.Body, h, s.maxResponseBytes())
 }
 
+// maxResponseBytes is the ceiling on one streamed completion. Zero from a caller
+// that never thought about it falls back to the default window rather than to no
+// ceiling: an unset field must not silently mean unlimited.
+func (s *Sushi) maxResponseBytes() int {
+	w := s.ContextWindow
+	if w <= 0 {
+		w = DefaultContextWindow
+	}
+	return responseBytesPerContextToken * w
+}
 func (s *Sushi) client() *http.Client {
 	if s.HTTPClient != nil {
 		return s.HTTPClient

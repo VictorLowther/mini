@@ -56,6 +56,18 @@ func bigTurns(n int) []string {
 	return out
 }
 
+// mustCut is the test-side stand-in for compact's guard: a projection with no
+// assistant boundary has no cut, and a test that needed one would otherwise
+// paper over the very case pickCut now reports.
+func mustCut(t *testing.T, proj []model.Message, keep int) int {
+	t.Helper()
+	cut, ok := pickCut(proj, keep)
+	if !ok {
+		t.Fatal("pickCut found no boundary where the test assumed one")
+	}
+	return cut
+}
+
 func det(n int, summaries ...string) *model.Deterministic {
 	d := model.NewDeterministic(bigTurns(n)...)
 	d.Outputs = append(d.Outputs, done("final answer"))
@@ -374,13 +386,13 @@ func TestPickCutLandsOnAssistantGroups(t *testing.T) {
 		{"role": "assistant", "content": "a2", "extra": map[string]any{}},
 		{"role": "tool", "content": strings.Repeat("t", 4000), "extra": map[string]any{}},
 	}
-	if cut := pickCut(proj, 10); proj[cut]["role"] != "assistant" || cut != 5 {
+	if cut, ok := pickCut(proj, 10); !ok || proj[cut]["role"] != "assistant" || cut != 5 {
 		// The newest tool result alone blows the budget; the cut walks back
 		// to the assistant that issued it, so the tail is the whole last
 		// group (a tail may only grow, and only across complete groups).
 		t.Errorf("cut = %d (%v), want the assistant at 5", cut, rolesOf(proj))
 	}
-	if cut := pickCut(proj, 1_000_000); cut != 2 {
+	if cut, ok := pickCut(proj, 1_000_000); !ok || cut != 2 {
 		t.Errorf("infinite budget: cut = %d, want the first assistant", cut)
 	}
 	humanOnly := []model.Message{
@@ -388,8 +400,11 @@ func TestPickCutLandsOnAssistantGroups(t *testing.T) {
 		{"role": "user", "content": "task"},
 		{"role": "user", "content": "plain", "extra": map[string]any{}},
 	}
-	if cut := pickCut(humanOnly, 1); cut != len(humanOnly) {
-		t.Errorf("no assistant in tail: cut = %d, want %d (keep nothing)", cut, len(humanOnly))
+	// A-3's regression test. This case used to answer len(humanOnly) as a
+	// sentinel, which is not a legal index and reached proj[cut] in compact as
+	// an index-out-of-range panic that killed the process.
+	if cut, ok := pickCut(humanOnly, 1); ok {
+		t.Errorf("no assistant in tail: got cut=%d and ok=true, want ok=false", cut)
 	}
 }
 
@@ -469,7 +484,7 @@ func reportedLoop(t *testing.T, d *model.Deterministic, reported int, mutate ...
 	t.Helper()
 	l, rec := compactionLoop(t, d, mutate...)
 	big := strings.Repeat("o", 400)
-	l.Messages = []model.Message{
+	l.messages = []model.Message{
 		{"role": "system", "content": strings.Repeat("s", 2400)},
 		{"role": "user", "content": "the task"},
 		{"role": "assistant", "content": "elided middle", "extra": map[string]any{"turn": int64(3)}},
@@ -494,7 +509,7 @@ func TestCompactionScoresTheRebuildInTheReportedBasis(t *testing.T) {
 		c.CompactThresholdRatio = 0.5
 		c.CompactKeepTokens = 60
 	})
-	proj := model.ProjectContext(l.Messages)
+	proj := model.ProjectContext(l.messages)
 	estBefore, reported := model.ContextTokens(proj)
 	if !reported {
 		t.Fatal("the fixture lost its reported-usage anchor")
@@ -508,7 +523,7 @@ func TestCompactionScoresTheRebuildInTheReportedBasis(t *testing.T) {
 
 	// The same rebuild, measured in the estimator's own units, is well under
 	// that threshold: scoring in the reported basis is what catches it.
-	raw := estimateRebuild(proj, pickCut(proj, 60), "## Goal\nshort checkpoint")
+	raw := estimateRebuild(proj, mustCut(t, proj, 60), "## Goal\nshort checkpoint")
 	if threshold := l.Cfg.compactThreshold(); raw >= threshold {
 		t.Fatalf("fixture is not discriminating: raw %d already exceeds %d", raw, threshold)
 	}
@@ -525,14 +540,14 @@ func TestCompactionRowReportsTheReportedBasis(t *testing.T) {
 		c.CompactThresholdRatio = 0.5
 		c.CompactKeepTokens = 60
 	})
-	proj := model.ProjectContext(l.Messages)
+	proj := model.ProjectContext(l.messages)
 	estBefore, _ := model.ContextTokens(proj)
-	raw := estimateRebuild(proj, pickCut(proj, 60), "## Goal\nshort checkpoint")
+	raw := estimateRebuild(proj, mustCut(t, proj, 60), "## Goal\nshort checkpoint")
 	if !l.compact(context.Background(), proj, estBefore, false) {
 		t.Fatal("a rebuild that fits under its trigger in reported units should commit")
 	}
 	var row model.Message
-	for _, m := range l.Messages {
+	for _, m := range l.messages {
 		if model.IsCompaction(m) {
 			row = m
 		}

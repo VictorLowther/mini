@@ -6,6 +6,16 @@ UI, and the confirmation bubbling it carries (the one thing that makes spawning
 from a `confirm`-mode parent refuse rather than over-grant, §5.5). §8 is the
 record of what landed and where. §3.7 and decision 13 settle the last structural
 seam - how a session asks a person something when it is not in a position to use
+
+> **Superseded 2026-11-18:** four passages here argue from `DefaultMaxJobs = 8`
+> - §3.5 item 5 (line ~318), §5's comparison to the job cap (~613), the agent-kind
+> exemption (~713), and §8.6's "exempt at **both** cap sites" (~1888). The cap and
+> the exemption are both gone: `job` imposes no limit on how many runs may be live
+> or how many have ever run, and exposes no knob. The §8.6 bug report about
+> `register` counting agent handles was real and is the proximate reason for the
+> removal - fixing the accounting would have preserved a bound that cannot bind
+> anything. See the note atop `docs/jobs-research.md`.
+
 its own prompt path. The first draft of this document was written
 from mini's own source alone, before the survey in §3, and the survey disagreed
 with it in eight places. Those are

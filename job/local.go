@@ -124,9 +124,11 @@ func (m *Manager) Start(s Spec) (*Run, error) {
 		return nil, err
 	}
 	if _, err := m.Detach(r, "started in the background"); err != nil {
-		// The cap is the only reason this fails, and the run has not been
-		// launched yet when it does - Launch has already returned by then, so
-		// end what we started rather than leave an uncapped job running.
+		// The run started seconds ago and has done no work yet, and a job with
+		// no row cannot be listed, woken, or stopped by anyone - so this is the
+		// one place where ending what we started is the honest answer. Contrast
+		// Loop.handoff, which promotes a run that has already burned its whole
+		// budget: there, a bookkeeping failure must never destroy the work.
 		_ = r.Kill()
 		return nil, err
 	}
@@ -262,25 +264,21 @@ func (f *funcRun) watch(ctx context.Context, file *os.File, s Spec) {
 	}
 }
 
-// Detach registers a running launch as a job: from here it has a row, counts
-// against the session's cap, survives the turn, and can be listed and killed by
-// id. Doing this lazily is what keeps the registry about jobs - a command that
-// finished in 40ms was never one - and it is why a promoted run's row stores the
-// path it has been writing to all along instead of inventing a second file the
-// model would have to be told about.
+// Detach registers a running launch as a job: from here it has a row, survives
+// the turn, and can be listed and killed by id. Doing this lazily is what keeps
+// the registry about jobs - a command that finished in 40ms was never one - and
+// it is why a promoted run's row stores the path it has been writing to all
+// along instead of inventing a second file the model would have to be told about.
+//
+// There is no cap here and there is deliberately no knob. mini puts no limit on
+// how many tool calls may be in flight or in total: a backgrounded job is a
+// shell, so it is a process *tree*, and counting trees bounds nothing that
+// matters - `make -j64` and a fork loop are each exactly one job. Concurrency
+// belongs to the operating system (ulimit, cgroups), where the process tree is
+// actually visible, and the one real shared resource in this architecture is the
+// model server, which is already bounded where it is contended - see
+// model.Gate. What remains is refusal only where a job cannot be tracked at all.
 func (m *Manager) Detach(r *Run, reason string) (*session.JobRow, error) {
-	// The cap guards against a model multiplying GPU-heavy *processes* - two
-	// training runs on one box is already one too many (job.go:42-45). An agent
-	// job is not a process: it holds no pid, needs no stopper, and while its
-	// child waits between turns it consumes no slot either, so applying the
-	// process cap to it would bound the wrong thing and refuse a parent for a
-	// reason it cannot act on. Over-fanning-out is still checked, one level
-	// down: each child's own bash jobs count against their own session's cap.
-	if max := m.maxJobsFor(r.kind); max > 0 {
-		if n, err := m.Session.CountRunningJobs(); err == nil && n >= max {
-			return nil, fmt.Errorf("%w: %d live, stop one with job_kill first", ErrCap, n)
-		}
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.detached {
@@ -417,8 +415,30 @@ func (m *Manager) recordEndLocked(r *Run, oc outcome) *session.JobRow {
 	if err != nil {
 		if !errors.Is(err, session.ErrUnknownJob) {
 			m.logger().Error("job: could not record outcome", "id", r.id, "err", err)
+			return nil
 		}
-		return nil
+		// A-6's second half. The row stopped being 'running' while this process
+		// still held the handle - a second opener swept it - and the old code
+		// swallowed exactly that case, so the real exit code and its firing
+		// vanished and the registry kept a "process ownership was lost" story
+		// about a command that had in fact finished normally. We started the
+		// process, so we know how it ended: correct the row and deliver the
+		// firing. If the row is not ours to correct, say so loudly instead of
+		// quietly - "my row was taken over" is precisely the fact a log line is
+		// for.
+		reclaimed, ok, rerr := m.Session.ReclaimJob(r.id, oc.state, oc.code, oc.reason)
+		if rerr != nil {
+			m.logger().Error("job: could not reclaim a swept row", "id", r.id, "err", rerr)
+			return nil
+		}
+		if !ok {
+			m.logger().Warn("job: outcome not recorded, the row is no longer ours",
+				"id", r.id, "state", oc.state, "err", err)
+			return nil
+		}
+		m.logger().Warn("job: swept row reclaimed; another process opened this session while the job ran",
+			"id", reclaimed.ID, "state", reclaimed.State)
+		return reclaimed
 	}
 	m.recordExit(row)
 	return row
@@ -446,14 +466,31 @@ func (m *Manager) recordEndLocked(r *Run, oc outcome) *session.JobRow {
 // timestamp rather than the disappearance of an event.
 func (m *Manager) recordExit(row *session.JobRow) {
 	elapsed := row.StartedAt
+	fired := time.Now().UnixMilli()
 	if row.EndedAt != nil {
 		elapsed = *row.EndedAt - row.StartedAt
+		fired = *row.EndedAt
 	}
+	// `fired` no longer dereferences row.EndedAt unguarded: the guard above has
+	// always existed for `elapsed`, and reading the one and assuming the other
+	// is a nil panic in the watcher goroutine. It is unreachable from today's
+	// callers, which all pass a FinishJob RETURNING row whose ended_at cannot be
+	// NULL - but a monitor's firing will come from a row read back rather than
+	// written, and this function is documented as the one place a job's last
+	// word is written, so it will be reused before it is audited again.
 	if _, err := m.Session.RecordJobEvent(session.JobEventRow{
 		JobID: row.ID, MonitorID: "exit", Reason: row.State, Elapsed: elapsed,
-		ExitCode: row.ExitCode, FiredAt: *row.EndedAt,
+		ExitCode: row.ExitCode, FiredAt: fired,
 	}); err != nil {
 		m.logger().Error("job: could not record the exit firing", "id", row.ID, "err", err)
+		return
+	}
+	// The result is in the queue, so the debt now exists. Say so after the write
+	// and never before: a waiter woken here re-reads the store rather than
+	// trusting the hint, and a hint that arrives before the row it describes
+	// would be a wake that finds nothing and goes back to sleep.
+	if m.OnFiring != nil {
+		m.OnFiring()
 	}
 }
 

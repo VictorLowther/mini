@@ -112,7 +112,7 @@ func TestPauseLeavesTheTurnInFlightToFinish(t *testing.T) {
 	eventually(t, "the command's result to land while held", func() bool {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		for _, m := range l.Messages {
+		for _, m := range l.messages {
 			if strings.Contains(fmt.Sprint(m["content"]), "SLEPTOK") {
 				return true
 			}

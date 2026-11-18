@@ -55,8 +55,16 @@ func slash(cfg *agent.Config, input string, out io.Writer, readMore func() strin
 	return input, false
 }
 
-func confirmationTitle(n int) string {
-	return fmt.Sprintf("Execute %d action(s)? Enter to confirm, type a comment to reject, or /h to show available commands", n)
+func confirmationTitle(n int, why string) string {
+	base := fmt.Sprintf("Execute %d action(s)? Enter to confirm, type a comment to reject, or /h to show available commands", n)
+	if why == "" {
+		return base
+	}
+	// The reason is the part a human can act on. "Whitelisted" and "asked" look
+	// identical from the outside, and someone who is nagged without being told
+	// what would stop the nagging turns the gate off instead of fixing the
+	// pattern - which is how a security control dies.
+	return base + "\nWhy it is asking: " + why
 }
 
 const newTaskTitle = "Agent is ready. Type a new task."

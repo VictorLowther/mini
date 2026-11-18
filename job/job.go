@@ -24,7 +24,6 @@ package job
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -39,20 +38,11 @@ import (
 // and per docs/jobs-research.md §4 ("Numbers the prompts quote") they belong in
 // agent.TemplateVars the day a prompt states them, not retyped there.
 const (
-	// DefaultMaxJobs is the per-session cap on live jobs. little-coder uses 8;
-	// on a single-GPU box two training runs is already one too many, so the
-	// number is a guard against a model multiplying its own mistakes, and the
-	// error that carries it has to name the remedy.
-	DefaultMaxJobs = 8
 	// DefaultKillGrace is env.KillGrace: the same SIGINT-to-SIGKILL window a
 	// foreground command gets, so "the same chance to clean up" is one number in
 	// one place rather than two that have to agree.
 	DefaultKillGrace = env.KillGrace
 )
-
-// ErrCap is what Start returns at the job cap. It is a value and not a wrapped
-// message because the tool layer turns it into the model-facing refusal.
-var ErrCap = errors.New("job: session job cap reached")
 
 // unwindAllowance is how long a caller may wait for a cancelled run to return.
 // The cancel starts a chain that outlives it: env's handler waits KillGrace for
@@ -77,9 +67,6 @@ type Manager struct {
 	Session *session.Session
 	// Logger receives the lifecycle lines; nil is slog.Default().
 	Logger *slog.Logger
-	// MaxJobs bounds live jobs per session. Zero means DefaultMaxJobs; a
-	// negative value means no cap, for tests and for a human who knows better.
-	MaxJobs int
 	// KillGrace is how long a kill waits for the run to unwind. Zero means
 	// DefaultKillGrace.
 	KillGrace time.Duration
@@ -102,6 +89,22 @@ type Manager struct {
 	// session that never had a job is never quiescent-by-this-path: the caller
 	// that ends a run with no jobs outstanding handles that directly.
 	OnQuiescent func()
+	// OnFiring, when set, is called after a result has been written to the
+	// delivery queue - one call per queued firing, whether or not other jobs are
+	// still running.
+	//
+	// It is not OnQuiescent's smaller sibling, and the difference is the bug it
+	// exists to close. Quiescence is the edge the *parent of a child session*
+	// needs, because a report is only true once nothing the child started may
+	// still report. A session waiting on its own model turn needs to know about
+	// the first result, not the last: the moment a job's last word is written
+	// there is an obligation, and a session parked at an idle prompt has no
+	// boundary of its own to notice it at. The two hooks therefore fire on
+	// different transitions and both are wanted.
+	//
+	// Called from the watcher goroutine. It must not block and must not touch the
+	// transcript; the only thing to do here is raise a signal.
+	OnFiring func()
 
 	mu      sync.Mutex
 	handles map[string]*Run
@@ -128,24 +131,6 @@ func (m *Manager) logger() *slog.Logger {
 		return m.Logger
 	}
 	return slog.Default()
-}
-
-// maxJobsFor is the cap for one kind. Agent-kind jobs are exempt, because the
-// number exists to bound processes and an agent job is not one (§5.7, and the
-// comment on Detach). A negative value means "no cap", which is what
-// maxJobs()'s own convention already understands.
-func (m *Manager) maxJobsFor(kind string) int {
-	if kind == session.KindSubagent {
-		return -1
-	}
-	return m.maxJobs()
-}
-
-func (m *Manager) maxJobs() int {
-	if m.MaxJobs == 0 {
-		return DefaultMaxJobs
-	}
-	return m.MaxJobs
 }
 
 func (m *Manager) grace() time.Duration {
@@ -389,13 +374,6 @@ func (m *Manager) register(r *Run) error {
 	// assignment cannot.
 	if m.handles == nil {
 		m.handles = make(map[string]*Run)
-	}
-	// The handle cap is the same rule as Detach's row cap and has to carry the
-	// same exemption, or the second one silently wins: an agent kind is exempt
-	// because it holds no process (§5.7), and a parent at the cap that can
-	// register a row but not a handle is a parent that got refused anyway.
-	if max := m.maxJobsFor(r.kind); max > 0 && len(m.handles) >= max {
-		return fmt.Errorf("%w: %d live, stop one with job_kill first", ErrCap, len(m.handles))
 	}
 	if _, dup := m.handles[r.id]; dup {
 		return fmt.Errorf("job: %s is already live", r.id)

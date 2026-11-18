@@ -123,10 +123,10 @@ func TestRecorderSeesEveryTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(rec.seen) != len(l.Messages) {
-		t.Fatalf("recorded %d messages, history has %d", len(rec.seen), len(l.Messages))
+	if len(rec.seen) != len(l.messages) {
+		t.Fatalf("recorded %d messages, history has %d", len(rec.seen), len(l.messages))
 	}
-	for i, want := range l.Messages {
+	for i, want := range l.messages {
 		got := rec.seen[i]
 		if got["role"] != want["role"] {
 			t.Errorf("recorded %d role = %v, want %v", i, got["role"], want["role"])
@@ -337,7 +337,7 @@ func TestNoRecorderScratchLifecycle(t *testing.T) {
 	if contents != "hi\n" {
 		t.Errorf("scratch file during run = %q, want %q", contents, "hi\n")
 	}
-	obs := l.Messages[3]
+	obs := l.messages[3]
 	if !strings.Contains(obs["content"].(string), "hi") {
 		t.Errorf("observation did not render the output: %q", obs["content"])
 	}

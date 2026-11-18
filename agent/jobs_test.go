@@ -35,8 +35,18 @@ func (d *deadlineEnv) Execute(ctx context.Context, command, cwd string, sink io.
 	return env.Result{ReturnCode: 0}, nil
 }
 
-func (d *deadlineEnv) TemplateVars() map[string]any { return nil }
-func (d *deadlineEnv) Serialize() map[string]any    { return nil }
+// TemplateVars returns what env.Local would: the system prompt names
+// {{ .system }}/{{ .machine }}/{{ .release }}/{{ .version }}, and prompt
+// rendering is strict (A-7), so a fake environment that withholds them is a
+// fake that cannot host a prompt. It used to return nil and the gap rendered
+// those lines as empty strings, which is precisely the silence strictness
+// exists to remove.
+func (d *deadlineEnv) TemplateVars() map[string]any {
+	return map[string]any{
+		"system": "TestOS", "machine": "test", "release": "1.0", "version": "test",
+	}
+}
+func (d *deadlineEnv) Serialize() map[string]any { return nil }
 
 // newJobLoop wires a Loop to a real registry, so the handoff, the promotion and
 // the row all get exercised together rather than against a mock of each other.
@@ -61,7 +71,7 @@ func newJobLoop(t *testing.T, m model.Model, e env.Environment) (*Loop, *job.Man
 // observations returns the loop's tool-result messages, oldest first.
 func observations(l *Loop) []string {
 	var out []string
-	for _, msg := range l.Messages {
+	for _, msg := range l.messages {
 		if model.IsToolResult(msg) {
 			out = append(out, fmt.Sprint(msg["content"]))
 		}
@@ -491,7 +501,7 @@ func isJobWake(m model.Message) bool {
 
 func jobWakes(l *Loop) []string {
 	var out []string
-	for _, m := range l.Messages {
+	for _, m := range l.messages {
 		if isJobWake(m) {
 			out = append(out, fmt.Sprint(m["content"]))
 		}
@@ -501,7 +511,7 @@ func jobWakes(l *Loop) []string {
 
 func dumpHistory(l *Loop) string {
 	var out []string
-	for _, m := range l.Messages {
+	for _, m := range l.messages {
 		out = append(out, fmt.Sprintf("[%v] %.180s", m["role"], strings.TrimSpace(fmt.Sprint(m["content"]))))
 	}
 	return strings.Join(out, "\n---\n")
@@ -528,7 +538,7 @@ func TestStepBoundaryDeliversAnUnseenEnding(t *testing.T) {
 	if len(wakes) != 1 {
 		t.Fatalf("wake messages = %d, want exactly one:\n%s", len(wakes), dumpHistory(l))
 	}
-	if isJobWake(l.Messages[len(l.Messages)-1]) {
+	if isJobWake(l.messages[len(l.messages)-1]) {
 		t.Error("a wake landed after the exit row")
 	}
 	for _, want := range []string{"job j1 ended: completed", "exit 0", "while you were working on something else",
@@ -628,7 +638,7 @@ func TestOwedResultIsDeliveredBeforeTheRunEnds(t *testing.T) {
 			t.Errorf("wake missing %q:\n%s", want, wakes[0])
 		}
 	}
-	if !isExit(l.Messages[len(l.Messages)-1]) {
+	if !isExit(l.messages[len(l.messages)-1]) {
 		t.Errorf("history must end with the exit row:\n%s", dumpHistory(l))
 	}
 	if n := jm.OwedDeliveries(); n != 0 {
@@ -788,7 +798,65 @@ func TestResumeReportsJobsOrphanedByThePreviousRun(t *testing.T) {
 	if n := jm.OwedDeliveries(); n != 0 {
 		t.Errorf("owed after delivery = %d", n)
 	}
-	if !isExit(l.Messages[len(l.Messages)-1]) {
+	if !isExit(l.messages[len(l.messages)-1]) {
 		t.Errorf("history must end with the exit row:\\n%s", dumpHistory(l))
+	}
+}
+
+// A-8's second half, and the rule that outlives the cap: a run that has already
+// burned its foreground budget must never be destroyed because a row could not
+// be written. Manager.Start may still kill - nothing had run there - but this
+// path is work in progress, so the honest answer is "burning and untracked",
+// said out loud, with the bytes on disk and the id to stop it by.
+func TestPromotedRunSurvivesADetachFailure(t *testing.T) {
+	dir := t.TempDir()
+	st, err := session.Open(filepath.Join(dir, "sessions.db"), filepath.Join(dir, "tcr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := st.Create(session.Row{ID: uuid.NewV7(), Workdir: dir, Project: dir, ModelName: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	jm := &job.Manager{Session: sess, Local: &env.Local{Timeout: 60 * time.Second}, Logger: log}
+	l := &Loop{Cfg: agentConfig(t), Model: model.NewDeterministic("unused"),
+		Env: &env.Local{Timeout: 60 * time.Second}, Jobs: jm, CommandBudget: time.Second}
+	t.Cleanup(func() { jm.KillAll(); st.Close() })
+
+	run, err := jm.Launch(job.Spec{Command: "sleep 30", Label: "the build", TCNO: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Break the store: the row insert can no longer succeed.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	res, detached, err := l.handoff(run, model.Action{Command: "sleep 30"}, "still running after 1s")
+	if err != nil {
+		t.Fatalf("a failed handoff must still answer, not end the run: %v", err)
+	}
+	if detached {
+		t.Error("an unregistered run must not claim to have become a job")
+	}
+	if !res.Pending {
+		t.Error("the run is going, so the result must not carry an exit status")
+	}
+	if got, _ := res.Extra["exception_type"].(string); got != "JobUntracked" {
+		t.Errorf("exception_type = %q, want JobUntracked", got)
+	}
+	for _, want := range []string{"could not open a row", run.ID(), run.OutputPath()} {
+		if !strings.Contains(res.View, want) {
+			t.Errorf("the note must name %q so the model can act:\n%s", want, res.View)
+		}
+	}
+
+	// The process we refused to register is the process we must not have killed.
+	select {
+	case <-run.Done():
+		t.Fatal("handoff killed a run that was already working")
+	default:
 	}
 }

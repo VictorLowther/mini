@@ -4,10 +4,29 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
 )
+
+// responseBytesPerContextToken is A-11's ceiling, expressed per context token:
+// 8 whole contexts' worth of response bytes, at the 4 bytes per token the token
+// estimator already uses. The heuristic is the owner's, and the point is that it
+// sits far above any legitimate completion - a reply is bounded by max_tokens,
+// which is itself bounded by the context - while still being finite. At the
+// default 262144-token window that is 8 MiB per call.
+const responseBytesPerContextToken = 8 * 4
+
+func humanBytes(n int) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
+}
 
 // maxLineBytes bounds one SSE line. sushi sends each tool call complete in a
 // single delta, so a long command is one long line; the 64 KiB scanner default
@@ -31,14 +50,51 @@ type stream struct {
 // reasoning_content accumulate, tool_calls deltas are merged by index (sushi
 // sends each call whole, a fragmenting server still works), the chunk with an
 // empty choices array carries usage, and `data: [DONE]` ends the stream.
-func readStream(body io.Reader, h *Handler) (*stream, error) {
+func readStream(body io.Reader, h *Handler, maxBytes int) (*stream, error) {
 	sc := bufio.NewScanner(body)
 	buf := make([]byte, 0, 64<<10)
-	sc.Buffer(buf, maxLineBytes)
+	// Bound the buffer by the same ceiling that bounds the response, so a
+	// hostile server cannot make us allocate maxLineBytes per concurrent request
+	// before a single byte has been counted.
+	lineCap := maxLineBytes
+	if maxBytes > 0 && maxBytes < lineCap {
+		lineCap = maxBytes
+	}
+	sc.Buffer(buf, lineCap)
 	st := &stream{meta: map[string]any{}, toolCallByIX: map[int]int{}}
 	sawChunk := false
+	read := 0
+	chunksParsed := 0
 	for sc.Scan() {
 		line := sc.Bytes()
+		// A-11: count every byte off the wire, before any of the skips below,
+		// because the unbounded case is precisely the one that never becomes a
+		// chunk - a server (or a proxy, or a port pointed at the wrong service)
+		// that streams `: keepalive` comments forever. Without this the only
+		// ceilings were per-line and the scanner's own, so a response of any
+		// size grew st.content, the tool-call table, every Handler callback and
+		// the live GUI card until the process ran out of room, and the request
+		// held a model-gate slot while it did.
+		read += len(line) + 1
+		if maxBytes > 0 && read > maxBytes {
+			e := &APIError{
+				Message: fmt.Sprintf(
+					"%s sent %s of streamed response, past the %s ceiling mini allows one call "+
+						"(8x the %d-token context this client believes the model has). "+
+						"The stream was abandoned; nothing was retried.",
+					"SSE stream", humanBytes(read), humanBytes(maxBytes), maxBytes/responseBytesPerContextToken),
+				Type:      "response_too_large",
+				Retryable: false,
+			}
+			// Whether any answer arrived is the difference between a server that
+			// rambles and one that is not a model server at all - a wrong port or a
+			// proxy is the usual cause. "Too big" alone would send the reader to the
+			// wrong setting, so say which of the two this looked like.
+			if chunksParsed == 0 {
+				e.Message += "; no completion chunk had been received, so this may not be an OpenAI-compatible SSE endpoint"
+			}
+			return nil, e
+		}
 		if len(line) == 0 || line[0] == ':' {
 			continue
 		}
@@ -59,6 +115,7 @@ func readStream(body io.Reader, h *Handler) (*stream, error) {
 			return nil, &APIError{Message: "malformed SSE chunk: " + err.Error(), Retryable: true}
 		}
 		sawChunk = true
+		chunksParsed++
 		if errObj, ok := chunk["error"]; ok && errObj != nil {
 			return nil, errorFromChunk(errObj)
 		}

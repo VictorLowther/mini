@@ -222,7 +222,7 @@ SELECT ?, coalesce(max(seq), 0) + 1, 'tool', ?, '', '', ?, ?, ? FROM turns WHERE
 		// from the start, and completion fills that row instead of appending.
 		if _, err := tx.Exec(`INSERT INTO tool_calls (session_id, turn, idx, tcno, id, name, command, status, result_turn, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)`,
-			s.ID.String(), seq, i, tcno, e.id, e.name, e.command, slotSeq, now); err != nil {
+			s.ID.String(), seq, e.idx, tcno, e.id, e.name, e.command, slotSeq, now); err != nil {
 			return 0, fmt.Errorf("session store: ledger for call %d: %w", tcno, err)
 		}
 	}
@@ -240,6 +240,15 @@ type slotEntry struct {
 	id      string
 	name    string
 	command string
+	// idx is the position of this call in the turn as the loop counts it - the
+	// wire array index, or the action index when there is no array. It is not
+	// the position within this slice, and the difference is A-5: a call without
+	// an id is filtered out below, and if the survivors are stamped with their
+	// filtered position, every call after the gap is registered one slot early.
+	// OpenToolCall looks rows up by (turn, idx) using the *action* index, so
+	// that off-by-one silently pairs each command with another call's result
+	// file and tcno, and leaves an id-bearing slot permanently "aborted".
+	idx int
 }
 
 // toolCallEntries reads the calls this assistant turn issued: the wire array
@@ -259,13 +268,16 @@ func toolCallEntries(m model.Message, actions []model.Action) []slotEntry {
 	}
 	if len(raw) > 0 {
 		var out []slotEntry
-		for _, item := range raw {
+		for i, item := range raw {
 			tc, _ := item.(map[string]any)
 			id, _ := tc["id"].(string)
 			if id == "" {
+				// Skipped, but the index it occupied is not reclaimed: the
+				// calls after it keep the positions the loop will look them up
+				// by.
 				continue
 			}
-			e := slotEntry{id: id}
+			e := slotEntry{id: id, idx: i}
 			if fn, _ := tc["function"].(map[string]any); fn != nil {
 				e.name, _ = fn["name"].(string)
 				var args map[string]any
@@ -281,9 +293,9 @@ func toolCallEntries(m model.Message, actions []model.Action) []slotEntry {
 		return out
 	}
 	var out []slotEntry
-	for _, a := range actions {
+	for i, a := range actions {
 		if a.ToolCallID != "" {
-			out = append(out, slotEntry{id: a.ToolCallID, name: a.ToolName(), command: a.Command})
+			out = append(out, slotEntry{id: a.ToolCallID, name: a.ToolName(), command: a.Command, idx: i})
 		}
 	}
 	return out

@@ -92,11 +92,11 @@ func TestSuccessfulCompletion(t *testing.T) {
 	// system, user, assistant, observation, assistant, exit: the submitting
 	// turn makes no tool call, so there is nothing to execute and nothing to
 	// observe - its text is the submission.
-	if got := roles(l.Messages); got != "system,user,assistant,user,assistant,exit" {
+	if got := roles(l.messages); got != "system,user,assistant,user,assistant,exit" {
 		t.Errorf("roles = %s", got)
 	}
-	if l.Messages[3]["content"] != "<returncode>0</returncode>\n<output>\nhello world\n</output>" {
-		t.Errorf("observation = %q", l.Messages[3]["content"])
+	if l.messages[3]["content"] != "<returncode>0</returncode>\n<output>\nhello world\n</output>" {
+		t.Errorf("observation = %q", l.messages[3]["content"])
 	}
 	if l.Cost != 2.0 {
 		t.Errorf("cost = %v, want 2.0", l.Cost)
@@ -125,7 +125,7 @@ func TestHooksPathSubmitsWithoutObservation(t *testing.T) {
 	if stub.beforeCalls != 0 {
 		t.Errorf("BeforeExecute ran %d times for a turn with no actions", stub.beforeCalls)
 	}
-	if got := roles(l.Messages); got != "system,user,assistant,exit" {
+	if got := roles(l.messages); got != "system,user,assistant,exit" {
 		t.Errorf("roles = %s", got)
 	}
 }
@@ -153,7 +153,7 @@ func TestTimeoutHandling(t *testing.T) {
 		t.Fatalf("info = %#v", info)
 	}
 	timedOut := 0
-	for _, msg := range l.Messages {
+	for _, msg := range l.messages {
 		if c, ok := msg["content"].(string); ok && strings.Contains(c, "timed out") {
 			timedOut++
 		}
@@ -174,7 +174,7 @@ func TestTimeoutCapturesPartialOutput(t *testing.T) {
 		t.Fatalf("info = %#v", info)
 	}
 	var obs string
-	for _, msg := range l.Messages {
+	for _, msg := range l.messages {
 		if c, ok := msg["content"].(string); ok && strings.Contains(c, "timed out") {
 			obs = c
 		}
@@ -188,7 +188,7 @@ func TestTimeoutCapturesPartialOutput(t *testing.T) {
 	// Rule 4: the timeout reaches the message extra as exception_type, the way
 	// tests/environments/test_local.py asserts it.
 	found := false
-	for _, msg := range l.Messages {
+	for _, msg := range l.messages {
 		if e, ok := msg["extra"].(map[string]any); ok && e["exception_type"] == "TimeoutExpired" {
 			found = true
 		}
@@ -222,11 +222,11 @@ func TestCustomTemplates(t *testing.T) {
 	if info["submission"] != "custom config works" {
 		t.Fatalf("info = %#v", info)
 	}
-	if l.Messages[0]["content"] != "You are a test assistant." {
-		t.Errorf("system = %v", l.Messages[0]["content"])
+	if l.messages[0]["content"] != "You are a test assistant." {
+		t.Errorf("system = %v", l.messages[0]["content"])
 	}
-	if !strings.Contains(l.Messages[1]["content"].(string), "Test custom config") {
-		t.Errorf("instance = %v", l.Messages[1]["content"])
+	if !strings.Contains(l.messages[1]["content"].(string), "Test custom config") {
+		t.Errorf("instance = %v", l.messages[1]["content"])
 	}
 }
 
@@ -243,11 +243,11 @@ func TestTemplateVarsReachTemplates(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "calls=0 cost=0 task=T system=" + env.Uname()["system"] + " custom=yes"
-	if got := l.Messages[1]["content"]; got != want {
+	if got := l.messages[1]["content"]; got != want {
 		t.Errorf("instance template =\n%q\nwant\n%q", got, want)
 	}
-	if l.Messages[0]["content"] != "4" {
-		t.Errorf("system = %v", l.Messages[0]["content"])
+	if l.messages[0]["content"] != "4" {
+		t.Errorf("system = %v", l.messages[0]["content"])
 	}
 	vars := l.TemplateVars(map[string]any{"kwargs_only": "v"})
 	for _, k := range []string{"n_model_calls", "model_cost", "elapsed_seconds", "system", "machine", "task", "cwd", "kwargs_only"} {
@@ -275,7 +275,7 @@ func TestEmptyActionsSubmitTheRun(t *testing.T) {
 	}
 	// A turn with no actions is the submission itself: no second query, no
 	// observation.
-	if got := roles(l.Messages); got != "system,user,assistant,exit" {
+	if got := roles(l.messages); got != "system,user,assistant,exit" {
 		t.Errorf("roles = %s, want no observation for an actionless turn", got)
 	}
 }
@@ -295,7 +295,7 @@ func TestRepeatedFormatErrorsTerminate(t *testing.T) {
 		t.Errorf("n_calls = %d, want to stop at the 2nd consecutive error", l.NCalls)
 	}
 	// instance message, one user message per format error, then the exit.
-	if got := roles(l.Messages); got != "system,user,user,user,exit" {
+	if got := roles(l.messages); got != "system,user,user,user,exit" {
 		t.Errorf("roles = %s", got)
 	}
 }
@@ -350,7 +350,7 @@ func TestUncaughtErrorEndsRun(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "model exploded") {
 		t.Fatalf("err = %v", err)
 	}
-	last := l.Messages[len(l.Messages)-1]
+	last := l.messages[len(l.messages)-1]
 	if last["role"] != "exit" {
 		t.Fatalf("last = %#v", last)
 	}
@@ -445,11 +445,11 @@ func TestTurnCancellationInterruptsButKeepsTheRunAlive(t *testing.T) {
 		t.Fatalf("info = %#v", info)
 	}
 	// The completion turn ran nothing and earns no observation.
-	if got := roles(l.Messages); got != "system,user,assistant,user,user,assistant,exit" {
+	if got := roles(l.messages); got != "system,user,assistant,user,user,assistant,exit" {
 		t.Errorf("roles = %s", got)
 	}
-	if !strings.Contains(contents(l.Messages)[4], "Temporary interruption caught") {
-		t.Errorf("messages = %v", contents(l.Messages))
+	if !strings.Contains(contents(l.messages)[4], "Temporary interruption caught") {
+		t.Errorf("messages = %v", contents(l.messages))
 	}
 }
 
@@ -466,11 +466,11 @@ func TestWholeRunCancellationEndsTheLoop(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v (%T)", err, err)
 	}
-	if !strings.Contains(contents(l.Messages)[4], "Temporary interruption caught") {
-		t.Errorf("messages = %v", contents(l.Messages))
+	if !strings.Contains(contents(l.messages)[4], "Temporary interruption caught") {
+		t.Errorf("messages = %v", contents(l.messages))
 	}
-	if !strings.Contains(contents(l.Messages)[3], "action was not executed") {
-		t.Errorf("the partial observation is missing: %v", contents(l.Messages))
+	if !strings.Contains(contents(l.messages)[3], "action was not executed") {
+		t.Errorf("the partial observation is missing: %v", contents(l.messages))
 	}
 }
 
@@ -539,16 +539,16 @@ func TestRejectionSkipsExecutionButRecordsObservations(t *testing.T) {
 	}
 	// instance, assistant, padded observation, rejection, assistant, exit:
 	// the completion turn runs nothing, so it earns no observation.
-	if got := roles(l.Messages); got != "system,user,assistant,user,user,assistant,exit" {
-		t.Errorf("roles = %s\nmessages: %v", got, contents(l.Messages))
+	if got := roles(l.messages); got != "system,user,assistant,user,user,assistant,exit" {
+		t.Errorf("roles = %s\nmessages: %v", got, contents(l.messages))
 	}
-	if !strings.Contains(l.Messages[3]["content"].(string), "action was not executed") {
-		t.Errorf("padded observation missing: %v", l.Messages[3]["content"])
+	if !strings.Contains(l.messages[3]["content"].(string), "action was not executed") {
+		t.Errorf("padded observation missing: %v", l.messages[3]["content"])
 	}
-	if !strings.Contains(l.Messages[4]["content"].(string), "user rejected your commands") {
+	if !strings.Contains(l.messages[4]["content"].(string), "user rejected your commands") {
 		t.Errorf("rejection message missing")
 	}
-	if strings.Contains(l.Messages[3]["content"].(string), "not-run") {
+	if strings.Contains(l.messages[3]["content"].(string), "not-run") {
 		t.Error("the rejected command must not have been executed")
 	}
 }
@@ -577,8 +577,8 @@ func TestOnSubmitCanStartANewTask(t *testing.T) {
 	if info["submission"] != "second" {
 		t.Errorf("info = %#v", info)
 	}
-	if !strings.Contains(contents(l.Messages)[3], "The user added a new task") {
-		t.Errorf("messages = %v", contents(l.Messages))
+	if !strings.Contains(contents(l.messages)[3], "The user added a new task") {
+		t.Errorf("messages = %v", contents(l.messages))
 	}
 }
 
