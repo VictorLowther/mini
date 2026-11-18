@@ -143,6 +143,18 @@ func (h *Interactive) NextHumanCommand(ctx context.Context) (string, bool) {
 	}
 }
 
+// OnCallOpened implements agent.CallOpener: the loop has just opened the result
+// file for one of the calls this front end announced, so a window that streams live
+// output into the card can start pointing at it. Print mode does not implement the
+// other half and gets nothing forwarded, which is why this is an assertion and not
+// a UI method - an empty method on every front end is the dead-code shape this
+// package keeps deleting elsewhere.
+func (h *Interactive) OnCallOpened(action model.Action, path string) {
+	if c, ok := h.UI.(callObserver); ok {
+		c.CallStarted(action, path)
+	}
+}
+
 // OnInterrupt turns a cancelled turn into the interruption message, after
 // letting the user comment on it (Python's step() except KeyboardInterrupt).
 func (h *Interactive) OnInterrupt(ctx context.Context) error {

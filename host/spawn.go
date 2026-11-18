@@ -492,6 +492,16 @@ func (c childHooks) OnMessage(m model.Message) { c.inner.OnMessage(m) }
 
 func (c childHooks) OnInterrupt(ctx context.Context) error { return c.inner.OnInterrupt(ctx) }
 
+// OnCallOpened forwards the streaming seam when the attending front end wants it.
+// Forwarding it conditionally matters: childHooks is installed on every attended
+// child, so a method that quietly did nothing would take the live card away from a
+// tab that asked for one.
+func (c childHooks) OnCallOpened(action model.Action, path string) {
+	if o, ok := c.inner.(agent.CallOpener); ok {
+		o.OnCallOpened(action, path)
+	}
+}
+
 // bubblingHooks is a child session's route to a person. It forwards exactly one
 // thing - the gate that stands between a model and a command - to the parent's
 // hooks, and answers everything else the way an unattended session must.

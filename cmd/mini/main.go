@@ -307,8 +307,7 @@ func run(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 
 	if o.printMode {
 		p := ui.NewPrint(stdout, stdin, r.AgentCfg, r.Store)
-		p.Jobs = jobReader(r.Jobs)
-		p.Jobs = jobReader(r.Jobs)
+		p.Jobs = jobReader(r.Jobs, r.Proc)
 		p.Loop = r.Loop
 		h, err := ui.New(p, r.AgentCfg, r.Loop)
 		if err != nil {
@@ -397,7 +396,7 @@ func sessionGUI(hs *host.Session, configName string) ui.GUIOptions {
 	m, _ := hs.Model.(*model.Sushi)
 	return ui.GUIOptions{
 		Cfg: hs.Cfg, Loop: hs.Loop, Model: m, ConfigName: configName,
-		Jobs:     jobReader(hs.Jobs),
+		Jobs:     jobReader(hs.Jobs, hs.Process()),
 		JobEnd:   jobEnder(hs.Jobs),
 		Dir:      hs.Workdir,
 		Closer:   hs.Quit,

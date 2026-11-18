@@ -2380,6 +2380,43 @@ token counts needs the child's stats reachable from the parent's job row, which
 means exporting the `agentJobs` edge `host` already keeps in memory. Both are honest
 gaps rather than half-wired controls: a card that claims to be live while showing
 stale text is the lying affordance §8.6 refuses to ship.
+### 8.12 Live cards: a running command's output, and a running child's progress
+
+The two gaps §8.11 left named, closed.
+
+**A foreground call's card follows its output.** The loop opens a call's result file
+*before* executing it - `Recorder.OpenToolCall` returns the row with the file already
+open - and that is the only moment the path can be handed to a front end, because
+after the call there is only the result. So `agent` gained an optional `CallOpener`
+(`OnCallOpened(action, path)`), asserted on `Hooks` the same way `Issuer` is asserted
+on `UI`: print mode implements neither half and nothing is forced onto it.
+`Interactive` forwards to a `callObserver` the GUI implements, and the card a call was
+issued into becomes the card that tails its file - through `tailFile`, the same
+bounded window the model is given for the same path, so the card and the conversation
+cannot disagree about what a command printed. `childHooks` forwards the seam when the
+attending front end wants it, so giving a child its own tab cannot quietly take the
+live card away from it; `bubblingHooks` does not implement it, because an unattended
+child has no card to fill.
+
+**A subagent's card reports progress**: `host.Process.ChildOfJob` exposes the
+in-memory parent→child edge the registry already keeps, and the card prints the
+child's steps, cumulative tokens and cost from its live `Snapshot`. The child's
+transcript is one click away in its own tab; what the parent needs from the card is
+"is it working, and what is it costing me". A bash job's card gains no step counts it
+cannot know, and a child from an earlier process - not in the in-memory edge - says
+nothing rather than guessing.
+
+**One honest gap, so the next reader does not trust the wrong thing.** Job cards
+rewrite in place (§8.11). A *foreground* live card still takes the rebuild path once
+a second: `liveCardText` does not find its text widget through the scroll the
+transcript grid builds, so `rewriteCardLines` reports it cannot rewrite in place. The
+content is right; the once-a-second rebuild that §8.11 removed for job cards is still
+here for these, and that is exactly the jump §8.9 was written about. Fixing the handle
+lookup - not the streaming, which works - is the next step, and the test says so in
+its own comment rather than asserting something unproven.
+
+Also gone: a duplicated `p.Jobs = jobReader(...)` in the print-mode setup, which
+assigned the same value twice.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

@@ -84,6 +84,11 @@ type Session struct {
 func (s *Session) Logger() *slog.Logger { return s.log }
 
 // ParentID is the session that opened this one, or "" for a top-level one.
+// Process is the owner this session was opened by. A front end needs it for the one
+// question its own registry cannot answer: which child session an agent-job row is
+// running, so the card can report that child's progress.
+func (s *Session) Process() *Process { return s.proc }
+
 func (s *Session) ParentID() string {
 	if s.Parent == uuid.Nil() {
 		return ""

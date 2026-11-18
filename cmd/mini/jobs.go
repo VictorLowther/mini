@@ -3,6 +3,7 @@ package main
 import (
 	"time"
 
+	"github.com/VictorLowther/mini/host"
 	"github.com/VictorLowther/mini/job"
 	"github.com/VictorLowther/mini/session"
 	"github.com/VictorLowther/mini/ui"
@@ -15,16 +16,19 @@ import (
 // types and job never learns about the transcript. A card is rebuilt from the
 // store on every read, which is what lets the view hold no job state of its own
 // and therefore nothing that can go stale between the handoff and the exit.
-type jobCards struct{ m *job.Manager }
+type jobCards struct {
+	m    *job.Manager
+	proc *host.Process
+}
 
 // jobReader returns nil (not a zero-value adapter) when there is no registry, so
 // the front ends take their "no registry attached" path instead of asking a nil
 // manager a question and finding out at runtime.
-func jobReader(m *job.Manager) ui.JobReader {
+func jobReader(m *job.Manager, proc *host.Process) ui.JobReader {
 	if m == nil {
 		return nil
 	}
-	return jobCards{m}
+	return jobCards{m, proc}
 }
 
 func (j jobCards) JobCard(id string) (ui.JobCard, bool) {
@@ -62,6 +66,17 @@ func (j jobCards) JobCard(id string) (ui.JobCard, bool) {
 	}
 	if card.Reason == "" {
 		card.Reason = row.ExitReason
+	}
+	if row.Kind == session.KindSubagent && j.proc != nil {
+		// The child's live numbers come from the session, not its job row: the
+		// row knows the run is going, the loop knows how far it has got. A child
+		// from an earlier process is not in the in-memory edge, and the card then
+		// says nothing about steps rather than guessing from the row.
+		if child, ok := j.proc.ChildOfJob(row.SessionID, id); ok {
+			snap := child.Loop.Snapshot()
+			card.Kind = row.Kind
+			card.Steps, card.Tokens, card.Cost = snap.Calls, snap.ModelTokens, snap.Cost
+		}
 	}
 	if !card.Running {
 		// An ended job whose firing nobody has collected yet: the human can see

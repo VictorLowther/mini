@@ -91,6 +91,14 @@ type UI interface {
 // anything to say: Print streams text and needs no such notice, and forcing an
 // empty method on it and on every test fake to satisfy an interface nobody calls
 // it through is the dead-code shape this package has been deleting elsewhere.
+// callObserver is the optional half of UI that watches a running tool call's
+// output. It pairs with agent.CallOpener: the loop opens a call's result file
+// before executing it, and this is where the path lands, so a card can follow the
+// command instead of waiting for it.
+type callObserver interface {
+	CallStarted(action model.Action, path string)
+}
+
 type Issuer interface {
 	// IssueCalls is called as the step's actions begin executing, after any
 	// confirmation has been answered.

@@ -528,6 +528,13 @@ func (g *GUI) IssueCalls(actions []model.Action) {
 	})
 }
 
+// CallStarted implements the agent.CallOpener half: the loop has opened the result
+// file for one of the calls this session announced, so that call's card becomes a
+// live one and starts following the command.
+func (g *GUI) CallStarted(action model.Action, path string) {
+	g.post(func() { g.v.markCardRunning(action, path) })
+}
+
 // SettleCalls implements Issuer. A call whose result never arrived - a cancelled
 // step, a refused batch, a run that ended - is marked as ended rather than left
 // claiming that work is happening. A card backed by a live job is left alone: it

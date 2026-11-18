@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,7 +13,6 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
-	"path/filepath"
 
 	"github.com/VictorLowther/mini/agent"
 	"github.com/VictorLowther/mini/env"
@@ -806,5 +807,71 @@ func TestGUIExportWritesEachSessionsOwnTrajectory(t *testing.T) {
 	quiet.export("")
 	if got := transcriptText(quiet.v.root()); !strings.Contains(got, "cannot export") {
 		t.Errorf("an unbacked export said:\n%s", got)
+	}
+}
+
+// NOTE: a foreground card whose file the loop just named still takes the rebuild
+// path once per tick - liveCardText does not find its text widget through the
+// scroll the transcript grid builds, so rewriteCardLines reports it cannot rewrite
+// in place. The streamed content is right; the second-by-second rebuild that §8.11
+// removed for job cards is still there for these, and fixing the handle lookup is
+// the next step, not something to pretend this test covers.
+
+// TestGUIRunningCardStreamsTheCallsOutput is the "running" state for a foreground
+// command: the loop names the result file before executing, the card that call was
+// issued into starts tailing it, and each tick that brings new output rewrites that
+// one card in place. A two-minute build should show what it has printed, not a
+// label that says something is happening.
+func TestGUIRunningCardStreamsTheCallsOutput(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	v := a.v
+	v.rootC.Resize(fyne.NewSize(420, 320))
+	log := filepath.Join(t.TempDir(), "1.log")
+	if err := os.WriteFile(log, []byte("compiling alpha.go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	v.issueCard(block{kind: "tool", title: "make", tcid: "c1", cmd: "make -j8",
+		state: "created", transcript: []string{"$ make -j8", "issued"}})
+	v.markCardRunning(model.Action{Command: "make -j8", ToolCallID: "c1"}, log)
+	if got := transcriptText(v.root()); !strings.Contains(got, "compiling alpha.go") {
+		t.Errorf("the running card never showed the output:\n%s", got)
+	}
+	if got := transcriptText(v.root()); strings.Contains(got, "issued") {
+		t.Errorf("the card stayed in its created state:\n%s", got)
+	}
+
+	// More output arrives; the tick follows it without rebuilding the window.
+	if err := os.WriteFile(log, []byte("compiling alpha.go\nlinking beta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The transition (a card gaining a file to tail, and so a handle for its
+	// text) may rebuild once; what must not happen again is the *steady state*
+	// rebuilding every second.
+	drainPosts()
+	if !v.refreshJobCards() {
+		t.Error("a card with a live result file reported nothing running")
+	}
+	drainPosts()
+	if got := transcriptText(v.root()); !strings.Contains(got, "linking beta") {
+		t.Errorf("the second tail never reached the card:\n%s", got)
+	}
+
+}
+
+// TestGUISubagentCardReportsProgress is what a parent needs to see about a child it
+// cannot read: how far it has got. The transcript is one click away in the child's
+// own tab; the card answers "is it working, and what is it costing".
+func TestGUISubagentCardReportsProgress(t *testing.T) {
+	card := JobCard{ID: "j7", Kind: "subagent", Running: true, Elapsed: 90 * time.Second,
+		Label: "survey", OutputPath: "/dev/null", Steps: 12, Tokens: 48213, Cost: 0.14}
+	out := strings.Join(jobCardLines(card, true), "\n")
+	if !strings.Contains(out, "12 steps") || !strings.Contains(out, "48213 tokens") || !strings.Contains(out, "$0.14") {
+		t.Errorf("the subagent card says nothing useful about progress:\n%s", out)
+	}
+	// A bash job's card keeps its own shape: no invented step counts.
+	bash := JobCard{ID: "j8", Kind: "bash", Running: true, Elapsed: 5 * time.Second, OutputPath: "/dev/null"}
+	if got := strings.Join(jobCardLines(bash, true), "\n"); strings.Contains(got, "steps") {
+		t.Errorf("a plain command's card claims step counts it cannot know:\n%s", got)
 	}
 }

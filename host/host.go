@@ -558,6 +558,15 @@ func (p *Process) registerAgentJob(parentID, jobID string, child *Session) {
 // The scope is a security property, not a nicety: job ids are unique per session,
 // so an unscoped lookup would let one session send to another's subagent by
 // guessing an id - and a send is a user message into somebody's conversation.
+// ChildOfJob is the in-memory edge from a parent's agent-job row to the session
+// running it, for a front end that has the job id and wants the child's live
+// numbers - the steps it has taken, the tokens it has spent - which its own job row
+// does not carry. The map cannot survive a restart, so a child from an earlier
+// process is simply not found, and the card says nothing rather than guessing.
+func (p *Process) ChildOfJob(parentID, jobID string) (*Session, bool) {
+	return p.childOfJob(parentID, jobID)
+}
+
 func (p *Process) childOfJob(parentID, jobID string) (*Session, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

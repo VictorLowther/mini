@@ -16,6 +16,8 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/VictorLowther/mini/model"
 )
 
 // layoutProbe logs, once per width change, the size every surface in the column
@@ -659,6 +661,52 @@ func (v *guiView) focusEditor() {
 
 // ------------------------------------------------------------ the transcript --
 
+// live reports a card whose text changes while it is on screen: a call backed by a
+// job, or a foreground call whose result file the loop pointed us at.
+func (b block) live() bool {
+	return b.job != "" || (b.state == "running" && b.log != "")
+}
+
+// markCardRunning turns the card a call was issued into into the card that shows
+// what that call has printed so far. The path is the loop's own result file, opened
+// before the command ran, which is the only reason a foreground call can have a live
+// card: after the call there is only the result.
+func (v *guiView) markCardRunning(action model.Action, path string) {
+	i := v.openCard(block{tcid: action.ToolCallID, cmd: action.Command})
+	if i < 0 {
+		return // a call this transcript never announced (print mode, a replay)
+	}
+	v.committed[i].state = "running"
+	v.committed[i].log = path
+	lines := v.liveCardLines(i)
+	v.committed[i].transcript = lines
+	if !v.rewriteCardLines(i, lines) {
+		v.refreshCommitted()
+		return
+	}
+	v.repaint(v.scroll)
+}
+
+// liveCardLines is what a running card can truthfully say right now: the command,
+// then the tail of the file it is still appending to. The tail is the same bounded
+// window the model is given for the same path (see tailFile), so the card and the
+// conversation cannot grow two different ideas about what a command printed.
+func (v *guiView) liveCardLines(i int) []string {
+	b := v.committed[i]
+	head := "$ " + b.cmd
+	if len(b.transcript) > 0 && strings.HasPrefix(b.transcript[0], "$ ") {
+		head = b.transcript[0]
+	}
+	if b.log == "" {
+		return []string{head, "running"}
+	}
+	body, err := tailFile(b.log, model.MaxViewLines)
+	if err != nil || strings.TrimSpace(body) == "" {
+		return []string{head, "running - no output yet"}
+	}
+	return append([]string{head}, strings.Split(strings.TrimRight(body, "\n"), "\n")...)
+}
+
 // issueCard puts a tool call that has just been asked for into the transcript,
 // before the job backing it exists. Created here rather than when the result
 // arrives is the point: a call that runs for two minutes has to say so for two
@@ -808,26 +856,37 @@ func (v *guiView) appendBlock(b block) {
 	v.afterContentChange()
 }
 
-// refreshJobCards re-renders every card that tracks a job and reports whether any
-// of them is still running. A card is rebuilt from the registry rather than from
-// stored state, so the view holds nothing that can go stale: the elapsed time,
-// the exit status and the tail of the log all come from the same two reads a
-// freshly-built card would do.
+// refreshJobCards re-renders every card that tracks live work and reports whether
+// any of it is still burning. A card is rebuilt from what the registry (or, for a
+// foreground call, the result file the loop pointed us at) says right now, so the
+// view holds nothing that can go stale: the elapsed time, the state, the tail of the
+// output, and the fact that a handed-off call has ended but not yet been reported.
 func (v *guiView) refreshJobCards() (stillRunning bool) {
-	if v.gui == nil || v.gui.jobs == nil {
+	if v.gui == nil || len(v.committed) == 0 {
 		return false
 	}
 	rebuilt := false
 	for i := range v.committed {
-		id := v.committed[i].job
-		if id == "" {
+		var lines []string
+		switch id := v.committed[i].job; {
+		case id != "" && v.gui.jobs != nil:
+			card, found := v.gui.jobs.JobCard(id)
+			if card.ID == "" {
+				card.ID = id
+			}
+			lines = jobCardLines(card, found)
+			if found && card.Running {
+				stillRunning = true
+			}
+		case id == "" && v.committed[i].live():
+			// A foreground call, streaming from the file the loop opened for it
+			// before executing: the card follows the command instead of appearing
+			// only when it ends.
+			lines = v.liveCardLines(i)
+			stillRunning = true
+		default:
 			continue
 		}
-		card, found := v.gui.jobs.JobCard(id)
-		if card.ID == "" {
-			card.ID = id
-		}
-		lines := jobCardLines(card, found)
 		if !equalLines(lines, v.committed[i].transcript) {
 			v.committed[i].transcript = lines
 			// In place when the card is on screen. Evicting every row here is what
@@ -836,9 +895,6 @@ func (v *guiView) refreshJobCards() (stillRunning bool) {
 			if !v.rewriteCardLines(i, lines) {
 				rebuilt = true
 			}
-		}
-		if found && card.Running {
-			stillRunning = true
 		}
 	}
 	if rebuilt {

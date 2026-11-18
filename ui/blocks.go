@@ -62,6 +62,11 @@ type block struct {
 	// observation arrived, and "ended" for a call the run stopped without
 	// answering. Non-tool cards leave it "".
 	state string
+	// log is the file a running call is appending its output to, and "" once it
+	// has stopped. The loop hands it over when it opens the call's slot, which is
+	// the only moment a foreground command has a live path to show - after the
+	// call there is only the result.
+	log string
 	// job is the id this card is tracking for a call that handed off, and ""
 	// for every other block. The view refreshes cards that carry one.
 	job string

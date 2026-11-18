@@ -28,6 +28,13 @@ type JobCard struct {
 	OutputPath string
 	Reason     string
 	Elapsed    time.Duration
+	// Kind tells a card what it is tracking. A subagent's card answers a
+	// different question from a command's: not what it printed (that is in the
+	// child's own tab) but how far it has got - steps taken and tokens spent.
+	Kind   string
+	Steps  int
+	Tokens int
+	Cost   float64
 	// Notified reports that the run ended and nothing has told the model yet,
 	// which is the difference between a card that says "completed" and one that
 	// says "completed - waiting to be reported".
@@ -55,6 +62,13 @@ func jobCardLines(c JobCard, found bool) []string {
 	}
 	if c.Running {
 		out = append(out, fmt.Sprintf("job %s is still running (%s)", c.ID, c.Elapsed.Truncate(time.Second)))
+		if c.Kind == "subagent" {
+			// Progress, not prose: the parent needs to know whether the child is
+			// thinking, spinning, or stuck - and its transcript is one click away
+			// in its own tab.
+			out = append(out, fmt.Sprintf("  %d steps \u00b7 %d tokens \u00b7 $%.2f so far",
+				c.Steps, c.Tokens, c.Cost))
+		}
 	} else {
 		head := fmt.Sprintf("job %s %s after %s", c.ID, c.State, c.Elapsed.Truncate(time.Second))
 		switch {

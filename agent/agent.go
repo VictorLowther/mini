@@ -133,6 +133,18 @@ type Hooks interface {
 	OnInterrupt(ctx context.Context) error
 }
 
+// CallOpener is the optional half of Hooks: it tells a front end that one of the
+// actions it announced has its result file open, and where that file is.
+//
+// Optional for the same reason Issuer is on the UI side: the half that wants it is
+// a window that streams a running command's output into the card that call was
+// issued into, and a front end that prints text has nothing to do with the path.
+// The loop opens the slot before executing, so this is the only moment the
+// information exists to hand over - after the call there is only the result.
+type CallOpener interface {
+	OnCallOpened(action model.Action, path string)
+}
+
 // Recorder is the session store's write side. One call records one thing;
 // every method is called from the agent goroutine only. *session.Session
 // satisfies it structurally; agent never imports session, only model, so
@@ -1489,6 +1501,9 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 			if tc, err = l.scratchToolCall(action); err != nil {
 				tc = model.ToolCall{}
 			}
+		}
+		if o, ok := l.Hooks.(CallOpener); ok && tc.Path != "" {
+			o.OnCallOpened(action, tc.Path)
 		}
 		var sink io.Writer
 		if tc.File != nil {
