@@ -94,6 +94,14 @@ func (s *Session) Spawn(ctx context.Context, req agent.SpawnRequest) (agent.Spaw
 			child.Loop.Hooks = &bubblingHooks{parent: parent, child: child, label: req.Name}
 		}
 	}
+	if h := child.Loop.Hooks; h != nil {
+		// Whoever attends the child, the child's endings are not its own to
+		// negotiate. The front end a tab installs asks a human for the next task
+		// when a run submits, which on a delegated session is a deadlock with a
+		// prompt on it: the loop never returns, the agent row never goes terminal,
+		// and the parent waits on a wake that can never fire.
+		child.Loop.Hooks = childHooks{inner: h}
+	}
 
 	run, err := s.Jobs.Start(job.Spec{
 		Kind:        session.KindSubagent,
@@ -453,6 +461,36 @@ func cloneConfig(m map[string]any) map[string]any {
 	}
 	return out
 }
+
+// childHooks applies the ending rules of a delegated session on top of whichever
+// front end attends it - the gate, the messages and the interruption text all belong
+// to that front end and are forwarded untouched.
+//
+// A child's turn with no tool call is not an invitation to its own human for the
+// next task: it is the report, and only the job wrapper decides whether the run may
+// end (§5.12, §9.10). Asking instead strands everybody - Loop.Run never returns, the
+// agent row stays running, no wake is fired, and the parent waits forever for a
+// report that cannot arrive. Human mode is the same story from the other side: a
+// child takes direction through job_send, not by holding its loop open on a prompt.
+//
+// A child with no hooks of its own is deliberately left unwrapped, because nil
+// Hooks is the loop's "nobody can answer, so refuse" signal (§5.5) and a wrapper
+// over nothing would turn that refusal into silent approval.
+type childHooks struct{ inner agent.Hooks }
+
+func (c childHooks) BeforeExecute(ctx context.Context, actions []model.Action, tvars map[string]any) error {
+	return c.inner.BeforeExecute(ctx, actions, tvars)
+}
+
+// OnSubmit ends the run: the submission is the report, not a question.
+func (c childHooks) OnSubmit(context.Context, model.Message) error { return nil }
+
+// NextHumanCommand declines to hold a child open for typed commands.
+func (c childHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
+
+func (c childHooks) OnMessage(m model.Message) { c.inner.OnMessage(m) }
+
+func (c childHooks) OnInterrupt(ctx context.Context) error { return c.inner.OnInterrupt(ctx) }
 
 // bubblingHooks is a child session's route to a person. It forwards exactly one
 // thing - the gate that stands between a model and a command - to the parent's

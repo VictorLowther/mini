@@ -2026,6 +2026,23 @@ child is attendable but has no tab yet, and that ordering is asserted rather tha
 assumed (`TestGUIChildSessionIsAttendedInItsOwnTab`, which calls `OpenSession` from
 another goroutine and checks the hooks landed before the widgets did).
 
+**Routing the gate did not mean routing the ending, and getting that wrong
+deadlocked every subagent.** A child's tab installs `Interactive` as its hooks, and
+`Interactive.OnSubmit` asks *"Agent is ready. Type a new task."* in a loop until a
+human types `/quit` or another task. On a delegated session that is a deadlock with a
+prompt on it: `Loop.Run` never returns, the agent row never goes terminal, no wake is
+fired, and the parent waits forever for a report that cannot arrive - reported by the
+maintainer as "the subagent does not yield back to its parent". So `Spawn` now wraps
+whatever attends a child in `childHooks`, which forwards the gate, the messages and
+the interruption text and answers the two *ending* hooks the way `bubblingHooks`
+always has: `OnSubmit` ends the run, `NextHumanCommand` declines. A child takes
+direction through `job_send`, not by holding its own loop open.
+
+The wrapper is applied only where hooks exist. A child with no front end and no
+parent hooks keeps `nil`, because nil is the loop's "nobody can answer, so refuse"
+signal (§5.5) and a wrapper over nothing would turn that refusal into silent
+approval - which `TestUnattendedParentSpawnsUnattendedChild` still pins.
+
 The strip's label is the only surface a background session has: `TabItem` carries
 text and an icon and no widget, and DocTabs' jump menu is text-only upstream
 (consequence 2), so a prompt waiting in an unselected tab puts **⚠** on its label,

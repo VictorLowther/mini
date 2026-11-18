@@ -1186,13 +1186,13 @@ func TestOnChildAttendsASpawnedSession(t *testing.T) {
 		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{done("child report")}}
 	}
 
-	childHooks := &recordingHooks{}
+	front := &recordingHooks{}
 	var sawOrigin string
 	var sawHooks agent.Hooks
 	var alreadyRunning bool
 	p.OnChild = func(cs *Session) error {
 		sawOrigin, sawHooks, alreadyRunning = cs.Loop.Origin, cs.Loop.Hooks, cs.Running()
-		cs.Loop.Hooks = childHooks
+		cs.Loop.Hooks = front
 		return nil
 	}
 	if _, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "worker", Prompt: "go"}); err != nil {
@@ -1200,7 +1200,8 @@ func TestOnChildAttendsASpawnedSession(t *testing.T) {
 	}
 
 	// The callback saw a child that had its identity and no route yet: that is the
-	// window in which a front end must be allowed to install one.
+	// window in which a front end must be allowed to install one. The wrapper is
+	// installed by Spawn after the callback returns, so `sawHooks` stays nil.
 	if sawOrigin != "worker" {
 		t.Errorf("at the callback the child's origin was %q, want its name", sawOrigin)
 	}
@@ -1212,8 +1213,12 @@ func TestOnChildAttendsASpawnedSession(t *testing.T) {
 	}
 
 	kid := p.Children(parent.ID)[0]
-	if kid.Loop.Hooks != childHooks {
-		t.Errorf("the child kept %T, want the hooks its front end installed", kid.Loop.Hooks)
+	// The front end's hooks are there, wrapped: a child's endings belong to the
+	// parent's job contract and not to whoever is watching its tab (§8.4 gave the
+	// tab the gate and the transcript, and this wrapper is what keeps the run from
+	// asking a new-task question nobody can answer on the parent's behalf).
+	if attended, ok := kid.Loop.Hooks.(childHooks); !ok || attended.inner != agent.Hooks(front) {
+		t.Errorf("the child kept %T, want its front end's hooks wrapped for endings", kid.Loop.Hooks)
 	}
 	// And a gate asked of the child reaches the child's own front end, not its
 	// parent's human: the tab it is sitting in is the attribution now.
@@ -1224,8 +1229,8 @@ func TestOnChildAttendsASpawnedSession(t *testing.T) {
 	if parentHooks.before != 0 {
 		t.Errorf("the parent's human was asked about a child with a front end of its own (%d asks)", parentHooks.before)
 	}
-	if childHooks.before != 1 {
-		t.Errorf("the child's own front end saw %d gates, want 1", childHooks.before)
+	if front.before != 1 {
+		t.Errorf("the child's own front end saw %d gates, want 1", front.before)
 	}
 }
 
@@ -1251,5 +1256,116 @@ func TestSpawnRefusesAChildItCannotAttend(t *testing.T) {
 	}
 	if n := len(p.Children(parent.ID)); n != 0 {
 		t.Errorf("%d children left after a refused spawn, want none reaped into the roster", n)
+	}
+}
+
+// blockingSubmitHooks is a front end that behaves at the end of a run the way
+// Interactive does: asked whether the session is over, it waits for a human who
+// never answers. That is the §8.4 regression made testable. Giving a child its own
+// tab also gave it this prompt, and a child parked inside it never returns from
+// Loop.Run, never settles its agent row, and never reports - so its parent waits
+// forever on a wake that cannot arrive.
+type blockingSubmitHooks struct {
+	asked chan struct{}
+	hold  chan struct{}
+
+	mu    sync.Mutex
+	gates int
+}
+
+func (h *blockingSubmitHooks) BeforeExecute(_ context.Context, _ []model.Action, _ map[string]any) error {
+	h.mu.Lock()
+	h.gates++
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *blockingSubmitHooks) OnSubmit(context.Context, model.Message) error {
+	select {
+	case <-h.asked:
+	default:
+		close(h.asked)
+	}
+	<-h.hold // the human of a delegated session is not coming
+	return nil
+}
+
+func (h *blockingSubmitHooks) NextHumanCommand(context.Context) (string, bool) { return "", false }
+func (h *blockingSubmitHooks) OnMessage(model.Message)                         {}
+func (h *blockingSubmitHooks) OnInterrupt(context.Context) error               { return nil }
+
+func (h *blockingSubmitHooks) askedForANewTask() bool {
+	select {
+	case <-h.asked:
+		return true
+	default:
+		return false
+	}
+}
+
+// TestChildNeverAsksItsOwnHumanForTheNextTask is the yield-back bug in one place:
+// the child must report and settle its row even when the front end attending it
+// would block on a prompt, and the gate must still reach that front end - the fix
+// is about endings, not about quietly removing a child's route to a human.
+func TestChildNeverAsksItsOwnHumanForTheNextTask(t *testing.T) {
+	p, base := newProcess(t)
+	merged := testConfig(t)
+	p.ChildModel = func(string) model.Model {
+		return &model.Deterministic{CostPerCall: 1, Outputs: []model.Message{
+			done("REPORT: nothing left to do here"),
+		}}
+	}
+	attending := &blockingSubmitHooks{asked: make(chan struct{}), hold: make(chan struct{})}
+	p.OnChild = func(cs *Session) error {
+		cs.Loop.Hooks = attending
+		return nil
+	}
+
+	parent, err := p.Open(Spec{Config: yolo(t, merged), Workdir: base, Project: base, Model: scripted(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := parent.Spawn(context.Background(), agent.SpawnRequest{Name: "worker", Prompt: "wrap it up"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The row, not the manager's live handle: a scripted child finishes in
+	// milliseconds and the registry forgets the run once it does.
+	var row *session.JobRow
+	waitForHost(t, "the child's agent row to settle", func() bool {
+		got, err := parent.Sess.GetJob(reply.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row = got
+		return row.State != session.JobRunning
+	})
+	if row.State != session.JobCompleted {
+		t.Errorf("agent row settled as %q, want %q", row.State, session.JobCompleted)
+	}
+	if attending.askedForANewTask() {
+		t.Error("the child was asked for a new task at the end of its run")
+	}
+
+	// The report is where the parent will be pointed at it: the job's own file.
+	body, err := os.ReadFile(row.OutputPath)
+	if err != nil || !strings.Contains(string(body), "REPORT") {
+		t.Errorf("the child's report is not in %s: %q (%v)", row.OutputPath, string(body), err)
+	}
+
+	kids := p.Children(parent.ID)
+	if len(kids) != 1 {
+		t.Fatalf("%d children, want 1", len(kids))
+	}
+	if err := kids[0].Loop.Hooks.BeforeExecute(context.Background(),
+		[]model.Action{{Command: "rm -rf build/"}}, nil); err != nil {
+		t.Fatalf("BeforeExecute: %v", err)
+	}
+	attending.mu.Lock()
+	gates := attending.gates
+	attending.mu.Unlock()
+	if gates != 1 {
+		t.Errorf("the attending front end saw %d gates, want 1: a child's confirmations still belong to it", gates)
 	}
 }
