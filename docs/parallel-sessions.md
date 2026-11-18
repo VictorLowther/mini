@@ -2406,14 +2406,17 @@ transcript is one click away in its own tab; what the parent needs from the card
 cannot know, and a child from an earlier process - not in the in-memory edge - says
 nothing rather than guessing.
 
-**One honest gap, so the next reader does not trust the wrong thing.** Job cards
-rewrite in place (§8.11). A *foreground* live card still takes the rebuild path once
-a second: `liveCardText` does not find its text widget through the scroll the
-transcript grid builds, so `rewriteCardLines` reports it cannot rewrite in place. The
-content is right; the once-a-second rebuild that §8.11 removed for job cards is still
-here for these, and that is exactly the jump §8.9 was written about. Fixing the handle
-lookup - not the streaming, which works - is the next step, and the test says so in
-its own comment rather than asserting something unproven.
+**The gap this section first recorded, closed the same day.** The streaming worked but
+the foreground card still took the rebuild path, and the cause was one condition, not
+the widget walk: `buildRow` captured a row's text handle only when
+`committed[i].job != ""`, so a card that was live because the loop named its file -
+and not because it tracked a job - was built with no handle, and `rewriteCardLines`
+correctly reported it could not rewrite in place. It captures on `live()` now, and the
+test asserts both halves: the handle exists, and the tick that brings new output does
+not replace a single row. The first version of that assertion passed vacuously for a
+moment, because it compared row identity before the transition rebuild had settled -
+which is the same lesson as §8.1, in a different costume: a test that cannot fail is
+not a test of the feature.
 
 Also gone: a duplicated `p.Jobs = jobReader(...)` in the print-mode setup, which
 assigned the same value twice.

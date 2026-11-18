@@ -521,7 +521,7 @@ func (v *guiView) buildRow(i int) transcriptRow {
 	row := v.newRow(i)
 	v.body.Add(row)
 	r := transcriptRow{idx: i, c: row}
-	if v.committed[i].job != "" {
+	if v.committed[i].live() {
 		r.body = liveCardText(row)
 	}
 	return r

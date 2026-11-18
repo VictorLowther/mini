@@ -810,13 +810,6 @@ func TestGUIExportWritesEachSessionsOwnTrajectory(t *testing.T) {
 	}
 }
 
-// NOTE: a foreground card whose file the loop just named still takes the rebuild
-// path once per tick - liveCardText does not find its text widget through the
-// scroll the transcript grid builds, so rewriteCardLines reports it cannot rewrite
-// in place. The streamed content is right; the second-by-second rebuild that §8.11
-// removed for job cards is still there for these, and fixing the handle lookup is
-// the next step, not something to pretend this test covers.
-
 // TestGUIRunningCardStreamsTheCallsOutput is the "running" state for a foreground
 // command: the loop names the result file before executing, the card that call was
 // issued into starts tailing it, and each tick that brings new output rewrites that
@@ -849,6 +842,10 @@ func TestGUIRunningCardStreamsTheCallsOutput(t *testing.T) {
 	// text) may rebuild once; what must not happen again is the *steady state*
 	// rebuilding every second.
 	drainPosts()
+	if len(v.winRows) == 0 || v.winRows[0].body == nil {
+		t.Fatal("setup: the live card has no in-place text handle")
+	}
+	rows, first := len(v.winRows), v.winRows[0].c
 	if !v.refreshJobCards() {
 		t.Error("a card with a live result file reported nothing running")
 	}
@@ -856,7 +853,13 @@ func TestGUIRunningCardStreamsTheCallsOutput(t *testing.T) {
 	if got := transcriptText(v.root()); !strings.Contains(got, "linking beta") {
 		t.Errorf("the second tail never reached the card:\n%s", got)
 	}
-
+	// The tick that brought it must not have rebuilt the window: that rebuild is
+	// the once-a-second jump, and a card that can only be rebuilt moves the scroll
+	// offset under a reader who never touched it.
+	if len(v.winRows) != rows || v.winRows[0].c != first {
+		t.Errorf("streaming rebuilt the window (%d rows, first row replaced: %v)",
+			len(v.winRows), v.winRows[0].c != first)
+	}
 }
 
 // TestGUISubagentCardReportsProgress is what a parent needs to see about a child it
