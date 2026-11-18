@@ -2319,6 +2319,67 @@ may I write out* - which those rules never spoke to, so it gets its own door ins
 of a widened one. The window reaches it through one more `GUIOptions` port
 (`Exporter`), so `ui` still does not know a store exists, and a tab exports the
 session it shows rather than the session that happens to be visible.
+### 8.11 Tool cards have a life: created, running, finished - and no panel
+
+Three reports from the maintainer, one shape underneath them. A subagent did not
+yield back to its parent (§8.4's correction). A transcript with a backgrounded job's
+card jumped once a second instead of tracking the tail or staying where it was
+scrolled. And the panel that showed a call that was running but not yet backgrounded
+could fill the window and swallow clicks meant for the tab strip - "that panel should
+not be there; it should just be another tool card."
+
+**The panel is gone.** `Issuer.IssueCalls` now appends a card per call into the
+transcript, in state `created`, *before* any job backing it exists, and the bottom
+panel belongs to questions only. The panel was the second UI in the window: it
+competed with the transcript for the center column, its `MinSize` could push the
+window taller than the screen, and while it was up the tab strip could not be
+reached. A card cannot do any of that, and it keeps the property the panel existed
+for - a call that runs for two minutes says so for two minutes, in the column where
+the reader is already looking.
+
+**One call is one card.** `block` gained `tcid` (the tool call it tracks) and
+`state` (`created` / `running` / `finished` / `ended`), and `commitBlock` *upgrades*
+the card a call was issued into when its observation lands instead of appending a
+second card below it. `ended` is the state of a call that never got an answer - a
+cancelled step, a refused batch, a run that stopped - which `SettleCalls` marks on
+the belt that already exists; a card backed by a live job is never settled, because
+it really is still running.
+
+**The tick rewrites, it does not rebuild.** `refreshJobCards` used to call
+`refreshCommitted`, which evicts every materialized row and builds them again; under
+a running job whose elapsed line changes every second, that was a once-a-second
+rebuild of the transcript, and it moved the scroll offset under a reader who had not
+touched it. A materialized card now keeps a handle on its own text widget
+(`transcriptRow.body`, found once at build time), and `rewriteCardLines` sets that
+segment, refreshes that one widget, re-measures that one row and re-lays the column -
+no eviction, no jump. A row that is off screen needs nothing but its height
+estimate. Rebuilding stays as the fallback for cards whose shape cannot be rewritten
+in place (an accordion, or a card that gained a control).
+
+**Focus, after the change.** Initial focus is the input. Nothing in the window takes
+focus on its own any more: the panel that used to appear and disappear is gone, and
+the only automatic focus move left is selecting a tab, which puts the caret in the
+session the human just asked to look at. Card text takes focus when it is clicked,
+because that is Fyne's selection model and the click was the human's; ⌘C gives the
+keyboard back (§8.2). Typing without a preceding click therefore always reaches the
+focused session's input.
+
+Two matching rules that are easy to get wrong and are now pinned by tests: a call
+with no tool-call id - every scripted model, and any provider that omits them - is
+matched to its created card by command, and a card the belt already marked `ended`
+is revived by the result that arrives a moment later, because `OnMessage` settles
+before it commits. Without those, one call draws two cards, which is the failure
+mode this whole change was at risk of trading the panel for.
+
+**Not done, with the seams named.** Live output *streaming into a running
+foreground card* still needs the loop to tell a front end where a call's result file
+is when it opens the slot - `Recorder.OpenToolCall` already hands the loop that path
+before executing, so it is one `Hooks` method (`OnCallOpened(action, path)`) plus
+four implementations, not a redesign. And a subagent's card showing its steps and
+token counts needs the child's stats reachable from the parent's job row, which
+means exporting the `agentJobs` edge `host` already keeps in memory. Both are honest
+gaps rather than half-wired controls: a card that claims to be live while showing
+stale text is the lying affordance §8.6 refuses to ship.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

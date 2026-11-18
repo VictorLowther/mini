@@ -125,10 +125,6 @@ type GUI struct {
 	// human is not even looking at (decision 15). See askQueue and §9.4.
 	asks askQueue
 
-	// inflight are the commands the current step has started but not finished,
-	// and inflightSince when they began. See Issuer.
-	inflight []string
-
 	mu       sync.Mutex
 	pending  chan Answer
 	lastQ    Question
@@ -502,45 +498,42 @@ func (g *GUI) Write(p []byte) (int, error) {
 
 // ---------------------------------------------------------------- in-flight calls ---
 
-// IssueCalls implements Issuer. It draws the card for work that has started and
-// whose result cannot be on screen yet, then keeps the elapsed count honest once
-// a second a tick until the step settles.
+// IssueCalls implements Issuer, and it is where a tool card is born: as soon as
+// the model's tool calls are known, before any job that would back them exists.
+// Each call gets a card in the transcript in the `created` state, because the
+// alternative - a bottom panel that appears and vanishes - turned an ordinary
+// long-running command into a second UI that could fill the window and cover the
+// tab strip.
+//
+// Why the card exists at all is unchanged: the transcript is derived from
+// messages, so a call that runs for two minutes would otherwise show nothing for
+// two minutes, and "thinking" and "hung" would look identical to the one human
+// watching.
 func (g *GUI) IssueCalls(actions []model.Action) {
-	lines := make([]string, 0, len(actions))
+	cards := make([]block, 0, len(actions))
 	for _, a := range actions {
-		if d := a.Display(); d != "" {
-			lines = append(lines, d)
+		if a.Display() == "" {
+			continue
 		}
+		cards = append(cards, block{kind: "tool", title: a.Display(), tcid: a.ToolCallID, cmd: a.Command,
+			state: "created", transcript: []string{"$ " + a.Command, "issued"}})
 	}
-	g.mu.Lock()
-	g.inflight = lines
-	g.mu.Unlock()
-	if len(lines) == 0 {
+	if len(cards) == 0 {
 		return
 	}
-	g.post(func() { g.v.showRunning(g.runningSnapshot()) })
+	g.post(func() {
+		for _, c := range cards {
+			g.v.issueCard(c)
+		}
+	})
 }
 
-// SettleCalls implements Issuer.
+// SettleCalls implements Issuer. A call whose result never arrived - a cancelled
+// step, a refused batch, a run that ended - is marked as ended rather than left
+// claiming that work is happening. A card backed by a live job is left alone: it
+// *is* running, and the registry says so.
 func (g *GUI) SettleCalls() {
-	g.mu.Lock()
-	had := len(g.inflight) > 0
-	g.inflight = nil
-	g.mu.Unlock()
-	if had {
-		g.post(func() { g.v.hideRunning() })
-	}
-}
-
-func (g *GUI) runningSnapshot() []string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if len(g.inflight) == 0 {
-		return nil
-	}
-	out := make([]string, len(g.inflight))
-	copy(out, g.inflight)
-	return out
+	g.post(func() { g.v.settleCards() })
 }
 
 // ---------------------------------------------------------------- the ask loop ---

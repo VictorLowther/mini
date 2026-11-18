@@ -2,7 +2,9 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2"
 )
@@ -63,24 +65,24 @@ func TestGUITranscriptKeepsTheWorkingEdge(t *testing.T) {
 			v.scroll.Offset.Y, v.body.MinSize().Height, v.scroll.Size().Height)
 	}
 
-	// The panel: a prompt or a running card takes part of the center column, so
+	// The panel: a prompt takes part of the center column, so
 	// the same offset is no longer the bottom - and the next commit is where that
 	// used to be read as "the human scrolled up".
 	before := v.scroll.Size().Height
-	v.showRunning([]string{"python train.py"})
+	v.showQuestion(Question{Kind: AskConfirm, Title: "run this?", Cfg: a.cfg})
 	if v.scroll.Size().Height >= before {
 		t.Fatalf("setup: the panel did not shrink the viewport (%v -> %v)", before, v.scroll.Size().Height)
 	}
 	v.appendBlock(block{kind: "note", text: "a turn lands while the card is up"})
 	if !v.pinned {
-		t.Error("the running card un-pinned the transcript")
+		t.Error("the question card un-pinned the transcript")
 	}
 	if !v.atBottom() {
 		t.Errorf("the transcript stopped following the working edge (off=%v content=%v view=%v)",
 			v.scroll.Offset.Y, v.body.MinSize().Height, v.scroll.Size().Height)
 	}
 
-	v.hideRunning()
+	v.hideQuestion()
 	v.appendBlock(block{kind: "note", text: "and the next one"})
 	if !v.pinned || !v.atBottom() {
 		t.Errorf("putting the panel away lost the hold: pinned=%v off=%v content=%v view=%v",
@@ -120,5 +122,45 @@ func TestGUIUserScrollReleasesAndRestoresTheHold(t *testing.T) {
 	if !v.atBottom() {
 		t.Errorf("the restored hold did not follow (off=%v content=%v view=%v)",
 			v.scroll.Offset.Y, v.body.MinSize().Height, v.scroll.Size().Height)
+	}
+}
+
+// TestGUIJobCardTickUpdatesInPlace is the once-a-second jump: a backgrounded job's
+// card changes its lines on every tick, and that must not evict and rebuild the
+// materialized rows. The rebuild is what moved the scroll offset under a reader who
+// had not touched the scrollbar, and it is also the expensive path - every card
+// re-wrapped, the whole window re-measured - for a change to one text segment.
+func TestGUIJobCardTickUpdatesInPlace(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	reg := &jobLister{id: "j1", live: true, elapsed: 10 * time.Second}
+	b := openWithOptions(t, a, GUIOptions{TabLabel: "worker", Jobs: reg})
+	b.v.rootC.Resize(fyne.NewSize(420, 320))
+	for i := range 8 {
+		b.v.appendBlock(block{kind: "note", text: strings.Repeat("context ", 12) + string(rune('a'+i))})
+	}
+	b.v.appendBlock(block{kind: "tool", title: "train", tcid: "c1", state: "running", job: "j1",
+		transcript: []string{"$ python train.py", "job j1 is still running (10s)"}})
+	b.v.follow()
+	drainPosts()
+	if len(b.v.winRows) == 0 {
+		t.Fatal("setup: nothing materialized to update")
+	}
+	if b.v.winRows[len(b.v.winRows)-1].body == nil {
+		t.Fatal("setup: the job card has no in-place text handle")
+	}
+	before := len(b.v.winRows)
+	oldest := b.v.winRows[0].c
+
+	reg.mu.Lock()
+	reg.elapsed = 11 * time.Second // the change a real second brings
+	reg.mu.Unlock()
+	b.v.refreshJobCards()
+	drainPosts()
+
+	if len(b.v.winRows) != before || b.v.winRows[0].c != oldest {
+		t.Errorf("the tick rebuilt the window (%d rows, first row replaced: %v)", len(b.v.winRows), b.v.winRows[0].c != oldest)
+	}
+	if got := transcriptText(b.v.root()); !strings.Contains(got, "11s") {
+		t.Errorf("the new lines never reached the card:\n%s", got)
 	}
 }

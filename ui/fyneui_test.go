@@ -1446,7 +1446,28 @@ func TestGUIShowRunDoneLifecycle(t *testing.T) {
 // ordinary two-minute build was indistinguishable from a hung UI and they
 // stopped a session that was working. The card has to exist while the command
 // runs, not when its result lands.
-func TestGUIRunningCardIsPaintedAtIssueTime(t *testing.T) {
+// toolCards is the committed tool cards, with their lifecycle states, which is
+// what this test asserts on: the transcript's rendered text cannot tell a card that
+// was upgraded from one that was duplicated.
+func toolCards(p *guiPane) []block {
+	var out []block
+	p.do(func() {
+		for _, b := range p.v.committed {
+			if b.kind == "tool" {
+				out = append(out, b)
+			}
+		}
+	})
+	return out
+}
+
+// TestGUIToolCardIsPaintedAtIssueTime is the promise the running card existed to
+// keep, in its new shape: a call is visible from the moment it is issued, before
+// the job backing it exists, and the same card carries the result when it lands.
+// It used to live in a panel at the bottom of the window, where a long command's
+// output could fill the screen and cover the tab strip; now it is one card in the
+// column, and one card only.
+func TestGUIToolCardIsPaintedAtIssueTime(t *testing.T) {
 	c := newConfig("yolo")
 	// No exit prompt: this test wants the run to finish at the submission, and
 	// confirm_exit would park the loop on a question nobody is answering.
@@ -1457,14 +1478,33 @@ func TestGUIRunningCardIsPaintedAtIssueTime(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _, _ = l.Run(context.Background(), "T"); close(done) }()
 
-	waitFor(t, "the running card while the command is still in flight", func() bool {
-		s := p.panel()
-		return strings.Contains(s, "running") && strings.Contains(s, "sleep 0.7")
+	waitFor(t, "the tool card while the command is still in flight", func() bool {
+		for _, b := range toolCards(p) {
+			if strings.Contains(strings.Join(b.transcript, "\n"), "sleep 0.7") &&
+				(b.state == "created" || b.state == "running") {
+				return true
+			}
+		}
+		return false
 	})
+	// And nothing else came up to say it: the panel belongs to questions now.
+	if p.panelShown() {
+		t.Error("an in-flight call put a panel in the window")
+	}
+
 	<-done
-	waitFor(t, "the running card to go when the step settles", func() bool {
-		return !strings.Contains(p.panel(), "running")
+	waitFor(t, "the result to land in that card", func() bool {
+		cards := toolCards(p)
+		return len(cards) == 1 && cards[0].state == "finished"
 	})
+	if cards := toolCards(p); len(cards) != 1 {
+		t.Errorf("%d tool cards for one call: %+v", len(cards), cards)
+	}
+	for _, b := range toolCards(p) {
+		if strings.Contains(strings.Join(b.transcript, "\n"), "issued") {
+			t.Errorf("the card never left its created state: %v", b.transcript)
+		}
+	}
 }
 
 // TestGUIRunningCardYieldsToAPrompt pins the priority: the running card and a

@@ -635,9 +635,10 @@ func TestGUIPauseHoldsItsOwnSession(t *testing.T) {
 // card and the tick read it from the toolkit goroutine. An unguarded bool here is
 // the race, not the code under test.
 type jobLister struct {
-	id   string
-	mu   sync.Mutex
-	live bool
+	id      string
+	mu      sync.Mutex
+	live    bool
+	elapsed time.Duration // what the registry reports; a running job's card text
 }
 
 func (j *jobLister) running() bool {
@@ -660,7 +661,10 @@ func (j *jobLister) JobCard(id string) (JobCard, bool) {
 	if j.running() {
 		state = "running"
 	}
-	return JobCard{ID: id, Running: j.running(), State: state, Label: "train"}, true
+	j.mu.Lock()
+	elapsed := j.elapsed
+	j.mu.Unlock()
+	return JobCard{ID: id, Running: j.running(), State: state, Label: "train", Elapsed: elapsed}, true
 }
 
 func (j *jobLister) LiveJobs() (int, error) {

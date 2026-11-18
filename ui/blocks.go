@@ -48,6 +48,20 @@ type block struct {
 	// feedback the harness authored (rejections, interruption records,
 	// format-error prompts, new-task wrappers).
 	subtype string
+	// tcid is the tool call this card tracks, and "" for everything that is not
+	// a tool card. It is what lets the card drawn when a call is *issued* be the
+	// same card its result lands in, instead of a second one appearing below it.
+	tcid string
+	// cmd is the command the card is about, kept because a provider that omits
+	// tool-call ids (and every scripted model) still must not end up with two
+	// cards for one call: the created card and its result are matched by command
+	// when there is no id to match on.
+	cmd string
+	// state is where a tool card is in its life: "created" when the model asked
+	// for it, "running" while it or its job is going, "finished" once its
+	// observation arrived, and "ended" for a call the run stopped without
+	// answering. Non-tool cards leave it "".
+	state string
 	// job is the id this card is tracking for a call that handed off, and ""
 	// for every other block. The view refreshes cards that carry one.
 	job string
@@ -84,6 +98,12 @@ func messageBlock(m model.Message, header, task string, clearStream func(), jobs
 		if extra, ok := m["extra"].(map[string]any); ok {
 			b.subtype, _ = extra["interrupt_type"].(string)
 		}
+		if id, ok := m["tool_call_id"].(string); ok {
+			b.tcid = id
+		}
+		if extra, ok := m["extra"].(map[string]any); ok {
+			b.cmd, _ = extra["command"].(string)
+		}
 		if obs, ok := observationOf(m); ok {
 			if obs.Pending && obs.JobID != "" {
 				// A call that handed off is not finished, so the card tracks
@@ -92,6 +112,10 @@ func messageBlock(m model.Message, header, task string, clearStream func(), jobs
 				b.transcript = pendingCardLines(obs, jobs)
 			} else {
 				b.transcript = obs.lines()
+			}
+			b.state = "running"
+			if !obs.Pending {
+				b.state = "finished"
 			}
 		}
 	case "exit":

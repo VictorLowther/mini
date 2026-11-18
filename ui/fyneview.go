@@ -267,6 +267,12 @@ func (l virtualLayout) MinSize(o []fyne.CanvasObject) fyne.Size {
 type transcriptRow struct {
 	idx int
 	c   *fyne.Container
+	// body is the card's own text widget when the row has one whose content
+	// changes while it is on screen - a tool card tracking a job. Keeping the
+	// handle is what lets the tick rewrite those lines in place instead of
+	// rebuilding rows, and rebuilding rows is what made the transcript jump once a
+	// second under a running job.
+	body *widget.RichText
 }
 
 func (v *guiView) cumHeight(i int) float32 {
@@ -512,7 +518,63 @@ func (v *guiView) setLiveShown(want bool) bool {
 func (v *guiView) buildRow(i int) transcriptRow {
 	row := v.newRow(i)
 	v.body.Add(row)
-	return transcriptRow{idx: i, c: row}
+	r := transcriptRow{idx: i, c: row}
+	if v.committed[i].job != "" {
+		r.body = liveCardText(row)
+	}
+	return r
+}
+
+// liveCardText finds the text widget a card's lines live in, so an update that
+// changes only those lines can be applied to the widget. nil means the card has no
+// such single widget - a code accordion, say - and its caller rebuilds the row
+// instead, which is correct and merely less cheap.
+func liveCardText(o fyne.CanvasObject) *widget.RichText {
+	switch t := o.(type) {
+	case *area:
+		return liveCardText(t.body)
+	case *container.Scroll:
+		if rt, ok := t.Content.(*widget.RichText); ok && len(rt.Segments) == 1 {
+			if _, ok := rt.Segments[0].(*widget.TextSegment); ok {
+				return rt
+			}
+		}
+	case *fyne.Container:
+		for _, c := range t.Objects {
+			if rt := liveCardText(c); rt != nil {
+				return rt
+			}
+		}
+	}
+	return nil
+}
+
+// rewriteCardLines replaces a materialized card's text in place and lets the scroll
+// know the row may measure differently now. It returns false when the row is on
+// screen and cannot be rewritten in place, which is the caller's cue to rebuild.
+func (v *guiView) rewriteCardLines(i int, lines []string) bool {
+	for k := range v.winRows {
+		if v.winRows[k].idx != i {
+			continue
+		}
+		rt := v.winRows[k].body
+		if rt == nil {
+			return false
+		}
+		rt.Segments[0].(*widget.TextSegment).Text = strings.Join(lines, "\n")
+		rt.Refresh()
+		if i < len(v.blockH) {
+			v.blockH[i] = v.winRows[k].c.MinSize().Height
+		}
+		v.relayoutTranscript()
+		return true
+	}
+	// Not materialized: the row will be built from the numbers the caller already
+	// stored, so only the height estimate is ours to correct.
+	if i < len(v.blockH) {
+		v.blockH[i] = estimateBlockHeight(v.committed[i])
+	}
+	return true
 }
 
 // scheduleRecompute defers a window update out of a layout pass (a viewport
@@ -596,6 +658,63 @@ func (v *guiView) focusEditor() {
 }
 
 // ------------------------------------------------------------ the transcript --
+
+// issueCard puts a tool call that has just been asked for into the transcript,
+// before the job backing it exists. Created here rather than when the result
+// arrives is the point: a call that runs for two minutes has to say so for two
+// minutes, in the same column as everything else, and not in a panel that grows
+// over the window and covers the tabs.
+func (v *guiView) issueCard(b block) {
+	v.appendBlock(b)
+}
+
+// openCard is the index of the in-flight card tracking a tool call, or -1. The
+// search runs from the tail because the call being answered is the newest one.
+// A card in state "ended" still counts: settling happens as a message enters the
+// history, and the settle can arrive a moment before the observation it belongs to.
+// A late result revives the card it was issued into rather than drawing a second
+// card for the same call, which is the promise this function exists to keep.
+func (v *guiView) openCard(b block) int {
+	for i := len(v.committed) - 1; i >= 0; i-- {
+		c := &v.committed[i]
+		if c.kind != "tool" || c.state == "finished" {
+			continue
+		}
+		if b.tcid != "" && c.tcid == b.tcid {
+			return i
+		}
+		if b.tcid == "" && b.cmd != "" && c.tcid == "" && c.cmd == b.cmd {
+			return i
+		}
+	}
+	return -1
+}
+
+// settleCards marks every card that was issued but never answered as ended. A
+// cancelled step, a refused batch or a run that simply stopped leaves those calls
+// without an observation, and a transcript full of cards claiming work is happening
+// beside an idle window is the confusion the cards exist to remove. A card backed by
+// a job is not settled: it really is still running.
+func (v *guiView) settleCards() {
+	changed := false
+	for i := range v.committed {
+		b := &v.committed[i]
+		if b.tcid == "" || b.state != "created" || b.job != "" {
+			continue
+		}
+		head := ""
+		if len(b.transcript) > 0 {
+			head = b.transcript[0]
+		}
+		b.state = "ended"
+		b.transcript = []string{head, "ended without a result"}
+		changed = true
+		v.rewriteCardLines(i, b.transcript)
+	}
+	if changed {
+		v.relayoutTranscript()
+	}
+}
 
 // noteLocal appends UI feedback as ONE card, lines and all. The old per-line split
 // was harmless while a note was a bare row; now that every card carries chrome,
@@ -698,7 +817,7 @@ func (v *guiView) refreshJobCards() (stillRunning bool) {
 	if v.gui == nil || v.gui.jobs == nil {
 		return false
 	}
-	changed := false
+	rebuilt := false
 	for i := range v.committed {
 		id := v.committed[i].job
 		if id == "" {
@@ -711,14 +830,18 @@ func (v *guiView) refreshJobCards() (stillRunning bool) {
 		lines := jobCardLines(card, found)
 		if !equalLines(lines, v.committed[i].transcript) {
 			v.committed[i].transcript = lines
-			v.blockH[i] = estimateBlockHeight(v.committed[i])
-			changed = true
+			// In place when the card is on screen. Evicting every row here is what
+			// made the transcript lurch once a second: the rebuild moved the
+			// scroll offset under a reader who had not touched it.
+			if !v.rewriteCardLines(i, lines) {
+				rebuilt = true
+			}
 		}
 		if found && card.Running {
 			stillRunning = true
 		}
 	}
-	if changed {
+	if rebuilt {
 		v.refreshCommitted()
 	}
 	return stillRunning
@@ -757,6 +880,28 @@ func equalLines(a, b []string) bool {
 // the live-block rule, so a turn is rendered once and already carries its
 // header while streaming.
 func (v *guiView) commitBlock(b block) {
+	// One call, one card: the observation that answers a call rewrites the card
+	// that call was issued into, rather than drawing a second card for the same
+	// work below it.
+	if i := v.openCard(b); i >= 0 {
+		b.tcid = v.committed[i].tcid
+		b.state = "finished"
+		if b.job != "" {
+			b.state = "running"
+		}
+		v.committed[i] = b
+		// A card that gained a job is a different shape, not just different text:
+		// it now tracks the registry on every tick and may carry a control. That
+		// transition happens once per handoff, so the row is rebuilt for it;
+		// everything quieter - a result landing in a card that already existed -
+		// is rewritten in place.
+		if b.job != "" || !v.rewriteCardLines(i, b.transcript) {
+			v.refreshCommitted()
+			return
+		}
+		v.repaint(v.scroll)
+		return
+	}
 	if v.live != nil {
 		if b.kind != "assistant" {
 			// Something else ended the turn: keep what streamed as its own
@@ -1509,36 +1654,10 @@ func (v *guiView) refreshStatus() {
 
 // ---------------------------------------------------------------- questions ---
 
-// runningCardTitle is the panel heading for an in-flight step. No elapsed
-// counter, deliberately: a live one needs a per-second timer of its own, and a
-// timer that outlives the step it describes is the class of bug this file
-// already documents around the card pump - a stale "3s" is also worse than an
-// honest "running", because it reads as a measurement of the command rather than
-// of the moment the card was drawn.
-const runningCardTitle = "running \u2026"
-
-// showRunning puts the issued-but-unfinished calls in the panel card, so a long
-// command is visible the moment it starts instead of when it returns. It yields
-// to a pending question, which owns the same panel and is strictly more urgent:
-// nobody is served by a running-card hiding the prompt they were about to answer.
-// The confirm panel and the running card therefore never collide, and in the
-// unattended case that motivated this - yolo mode, nothing on screen - the panel
-// is free.
-func (v *guiView) showRunning(lines []string) {
-	if len(lines) == 0 || v.gui.HasQuestion() {
-		return
-	}
-	v.setPanel(dimRT(runningCardTitle), monoBlock(lines))
-}
-
-// hideRunning takes the card back down. Same courtesy about a live question.
-func (v *guiView) hideRunning() {
-	if v.gui.HasQuestion() {
-		return
-	}
-	v.setPanel()
-}
-
+// setPanel owns the one panel below the transcript, and only questions put
+// anything in it now: in-flight tool calls are cards in the transcript, where they
+// can grow with the conversation instead of a second UI that could fill the window
+// and cover the tab strip.
 func (v *guiView) setPanel(objs ...fyne.CanvasObject) {
 	v.panel.Objects = objs
 	if len(objs) == 0 {
