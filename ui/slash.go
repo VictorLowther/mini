@@ -73,11 +73,27 @@ const interruptionTitle = "Interrupted. Type a comment or command (/h for availa
 // TaskPrompt is the opening question when no -t/--task was given.
 const TaskPrompt = "What do you want to do?"
 
-// interruptUser raises the message shape Python's _interrupt() builds.
+// interruptUser raises the message shape Python's _interrupt() builds: the
+// harness speaking *about* an exchange, under the interrupt_type that says so.
 func interruptUser(content, itype string) error {
 	return &model.Interrupt{
 		Kind:     model.KindUserInterruption,
 		Messages: []model.Message{{"role": "user", "content": content, "extra": map[string]any{"interrupt_type": itype}}},
+	}
+}
+
+// userWords is interruptUser for the cases where the text came off the keyboard.
+// The harness still prefixes it with the sentence the model needs ("Interrupted
+// by user: ..."), but a front end must not have to see through that wrapper to
+// work out who to show it as, so the message says who spoke. Carried, exactly
+// like Question.Origin (decision 13): attribution that is derived is
+// attribution that is wrong the first time somebody adds a kind.
+func userWords(content, itype string) error {
+	return &model.Interrupt{
+		Kind: model.KindUserInterruption,
+		Messages: []model.Message{{"role": "user", "content": content, "extra": map[string]any{
+			"interrupt_type": itype, userTypedKey: true,
+		}}},
 	}
 }
 

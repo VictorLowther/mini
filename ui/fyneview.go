@@ -1160,10 +1160,8 @@ func markdownRT(text string) *widget.RichText {
 }
 
 // messageKindLabel names a message block's area and picks its side: text the
-// human typed (task, steering, human commands) sits right-justified like a
-// sent chat bubble; harness-authored feedback (rejections, interruption
-// records, format-error prompts, new-task wrappers) and everything else stay
-// on the left.
+// human typed sits right-justified like a sent chat bubble, and harness-authored
+// feedback stays on the left so the two never read alike.
 func messageKindLabel(b block) (label string, align fyne.TextAlign) {
 	switch {
 	case len(b.transcript) > 0:
@@ -1171,7 +1169,18 @@ func messageKindLabel(b block) (label string, align fyne.TextAlign) {
 	case b.kind == "assistant":
 		return "LLM output", fyne.TextAlignLeading
 	case b.kind == "user":
-		if b.subtype == "" || b.subtype == "UserSteering" {
+		// The human's side when they spoke. `typed` is that answer, carried from
+		// the site that wrote the message; the named subtypes only back-fill
+		// transcripts written before it was, and they earn their place because
+		// those wrappers quote the human rather than report on them: "" is an
+		// unwrapped entry (the first task, a human-mode command),
+		// "UserSteering" is steering, and "UserNewTask" is whatever was typed at
+		// the ready line - the session going on, not a discrete task, whatever
+		// the sentence handed to the model calls it. Everything else stays left:
+		// a rejection, a format error, a job update, a parent's message to a
+		// child, "Temporary interruption caught." - the harness talking *about*
+		// an exchange must not borrow the human's side of the transcript.
+		if b.typed || b.subtype == "" || b.subtype == "UserSteering" || b.subtype == "UserNewTask" {
 			return "user", fyne.TextAlignTrailing
 		}
 		return "harness", fyne.TextAlignLeading

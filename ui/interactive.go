@@ -226,7 +226,9 @@ func (h *Interactive) OnSubmit(ctx context.Context, exitMsg model.Message) error
 		case isModeCommand(ans.Text):
 			continue // /y or /c: the mode changed, ask again (Python recurses)
 		default:
-			return interruptUser(newTaskMessage(ans.Text), "UserNewTask")
+			// The next thing typed at the ready line is the human continuing the
+			// conversation, not the harness announcing a discrete task.
+			return userWords(newTaskMessage(ans.Text), "UserNewTask")
 		}
 	}
 }
@@ -289,7 +291,11 @@ func (h *Interactive) OnInterrupt(ctx context.Context) error {
 	if err != nil || ans.RePrompt || text == "" || isModeCommand(text) {
 		return interruptUser("Temporary interruption caught.", model.KindUserInterruption)
 	}
-	return interruptUser("Interrupted by user: "+text, model.KindUserInterruption)
+	// The comment is the human's prose; the prefix is what the model is
+	// promised. Authorship travels with it so the transcript can show it on
+	// their side. The branches above - "Temporary interruption caught." - are
+	// the harness reporting a cancellation and stay where they are.
+	return userWords("Interrupted by user: "+text, model.KindUserInterruption)
 }
 
 // OnMessage forwards every history addition to the UI.

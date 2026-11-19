@@ -43,11 +43,20 @@ type block struct {
 	transcript []string
 	// stats are the message's generation metrics (assistant turns).
 	stats metrics
-	// subtype is the message's interrupt_type for user-role rows: frontends
-	// use it to tell entries the human typed (steering, human commands) from
-	// feedback the harness authored (rejections, interruption records,
-	// format-error prompts, new-task wrappers).
+	// subtype is the message's interrupt_type for user-role rows: it names
+	// what the harness said *about* an exchange - a rejection, a format error,
+	// a job update, a parent's message to a child - and frontends use it to keep
+	// that feedback on the left, where it cannot be mistaken for what the human
+	// typed. It is a fallback now, not the answer: see typed.
 	subtype string
+	// typed says the human spoke this text themselves. It is carried from the
+	// site that wrote the message rather than read back out of the wrapper the
+	// harness put around it, because authorship is a fact about a message and
+	// guessing it is what rendered a post-interrupt comment as harness feedback:
+	// every human-typed kind that was not enumerated in the subtype table
+	// defaulted to the harness's side. Transcripts written before it existed
+	// carry nothing, so the subtype table stays as their fallback.
+	typed bool
 	// tcid is the tool call this card tracks, and "" for everything that is not
 	// a tool card. It is what lets the card drawn when a call is *issued* be the
 	// same card its result lands in, instead of a second one appearing below it.
@@ -78,6 +87,13 @@ type block struct {
 // and tool results render from the stored observation. The caller supplies
 // the header (it is per-frontend state), reads task for the note, and owns
 // the stream reset that committing an assistant turn performs.
+// userTypedKey is the extra key carrying "the human spoke this text" through
+// the transcript and the session store, so no front end has to infer it from the
+// sentence the harness wrapped around it. Print mode reads the same messages and
+// draws no distinction today; the key is there so it can start without a second
+// source of truth.
+const userTypedKey = "user_typed"
+
 func messageBlock(m model.Message, header, task string, clearStream func(), jobs JobReader) (b block, show, taskNote bool) {
 	role, _ := m["role"].(string)
 	content, _ := m["content"].(string)
@@ -102,6 +118,7 @@ func messageBlock(m model.Message, header, task string, clearStream func(), jobs
 	case "tool", "user":
 		if extra, ok := m["extra"].(map[string]any); ok {
 			b.subtype, _ = extra["interrupt_type"].(string)
+			b.typed, _ = extra[userTypedKey].(bool)
 		}
 		if id, ok := m["tool_call_id"].(string); ok {
 			b.tcid = id

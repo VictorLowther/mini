@@ -455,6 +455,41 @@ func TestGUITypeToReject(t *testing.T) {
 	}
 }
 
+// TestGUINextTurnAtTheReadyLineIsTheHuman is the other half of the report: the
+// next thing typed when the agent comes back to rest is the conversation going
+// on, not a discrete task the harness announces. A session's turns build on each
+// other, and the transcript should not imply otherwise.
+func TestGUINextTurnAtTheReadyLineIsTheHuman(t *testing.T) {
+	c := newConfig("yolo")
+	c.ConfirmExit = true
+	l := &agent.Loop{Cfg: c, Model: outputs(t, "echo hi", submit("done"), "echo the follow-up", submit("done")),
+		Env: &env.Local{Timeout: 10 * time.Second}}
+	p := newGUIForTest(t, c, l)
+	done := make(chan struct{})
+	go func() { _, _ = l.Run(context.Background(), "T"); close(done) }()
+
+	waitFor(t, "the ready prompt", func() bool {
+		return p.HasQuestion() && p.PendingQuestion().Kind == AskNewTask
+	})
+	p.typeText("now check it against the README")
+	p.enter()
+	waitFor(t, "the typed turn to be echoed", func() bool { return p.firstArea("user") != nil })
+	if !containsContent(l.Messages(), "now check it against the README") {
+		t.Errorf("the next turn never reached the history:\n%s", contentsOf(l.Messages()))
+	}
+	if a := p.firstArea("harness"); a != nil {
+		t.Errorf("the human's next turn was attributed to the harness: %q", headerText(a))
+	}
+	waitFor(t, "the follow-up turn to run", func() bool { return l.Snapshot().Calls >= 2 })
+	p.typeText("/quit")
+	p.enter()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("/quit at the ready line did not end the run\ntranscript:\n%s", p.transcript())
+	}
+}
+
 func TestGUIEscCancelsTheTurn(t *testing.T) {
 	c := newConfig("yolo")
 	c.ConfirmExit = false
@@ -480,6 +515,82 @@ func TestGUIEscCancelsTheTurn(t *testing.T) {
 	}
 	if !containsContent(l.Messages(), "Interrupted by user: that took too long") {
 		t.Errorf("comment missing:\n%s", contentsOf(l.Messages()))
+	}
+
+	// And it is the human's own card. This is the reported bug: the comment
+	// landed in a harness card because the view derived authorship from
+	// interrupt_type with an allowlist of the human's kinds, so a kind that was
+	// never enumerated defaulted to the harness's side.
+	if p.firstArea("user") == nil {
+		t.Errorf("the interruption comment did not render as a right-justified user card:\n%s", p.transcript())
+	}
+	if a := p.firstArea("harness"); a != nil {
+		t.Errorf("the interruption comment was attributed to the harness: %q", headerText(a))
+	}
+}
+
+// TestGUITranscriptSideFollowsAuthorship is the same rule as a table, because
+// the interesting case is the one nobody has thought of yet: a human-typed
+// message must read as the human's whether or not its interrupt_type appears
+// below, and a harness report must not read as theirs however much it quotes
+// them.
+func TestGUITranscriptSideFollowsAuthorship(t *testing.T) {
+	cases := []struct {
+		name string
+		b    block
+		want string
+	}{
+		{"the first task", block{kind: "user", text: "do this"}, "user"},
+		{"steering", block{kind: "user", subtype: "UserSteering", text: "check the README first"}, "user"},
+		{"what gets typed at the ready line", block{kind: "user", subtype: "UserNewTask", text: "The user added a new task: fix it"}, "user"},
+		{"a comment typed after an interrupt", block{kind: "user", subtype: "UserInterruption", typed: true, text: "Interrupted by user: that took too long"}, "user"},
+		{"a kind invented after this test was written", block{kind: "user", subtype: "SomeFutureKind", typed: true, text: "hi"}, "user"},
+		{"a rejection the harness words", block{kind: "user", subtype: "UserRejection", text: "Commands not executed."}, "harness"},
+		{"a cancellation the human never commented on", block{kind: "user", subtype: "UserInterruption", text: "Temporary interruption caught."}, "harness"},
+		{"a format error", block{kind: "user", subtype: "FormatError", text: "no action parsed"}, "harness"},
+		{"a job update", block{kind: "user", subtype: "JobUpdate", text: "the training run finished"}, "harness"},
+		{"a parent agent's message to a child", block{kind: "user", subtype: "ParentMessage", text: "stop and report"}, "harness"},
+	}
+	for _, tc := range cases {
+		got, align := messageKindLabel(tc.b)
+		if got != tc.want {
+			t.Errorf("%s: label = %q, want %q", tc.name, got, tc.want)
+		}
+		wantAlign := fyne.TextAlignLeading
+		if tc.want == "user" {
+			wantAlign = fyne.TextAlignTrailing
+		}
+		if align != wantAlign {
+			t.Errorf("%s: align = %v, want %v", tc.name, align, wantAlign)
+		}
+	}
+}
+
+// TestGUIAuthorshipTravelsInTheMessage checks the carrier, not the reading: the
+// marker has to ride the same model.Message the session store writes and replays,
+// or the fix only covers the keystroke that made it.
+func TestGUIAuthorshipTravelsInTheMessage(t *testing.T) {
+	test.NewApp()
+
+	spoken := userWords("Interrupted by user: that took too long", model.KindUserInterruption).(*model.Interrupt).Messages[0]
+	b, show, _ := messageBlock(spoken, "h", "", func() {}, nil)
+	if !show {
+		t.Fatal("the interruption comment was not shown at all")
+	}
+	if !b.typed {
+		t.Errorf("the message reached the block with no authorship: extra = %#v", spoken["extra"])
+	}
+	if got, _ := messageKindLabel(b); got != "user" {
+		t.Errorf("label = %q, want user", got)
+	}
+
+	reported := interruptUser("Temporary interruption caught.", model.KindUserInterruption).(*model.Interrupt).Messages[0]
+	b2, _, _ := messageBlock(reported, "h", "", func() {}, nil)
+	if b2.typed {
+		t.Error("a harness report about a cancellation claims the human spoke it")
+	}
+	if got, _ := messageKindLabel(b2); got != "harness" {
+		t.Errorf("label = %q, want harness", got)
 	}
 }
 

@@ -219,6 +219,13 @@ func mockSamples() []mockCard {
 			stats:     metrics{Tokens: 254, Elapsed: 3.2, Cost: 0.07}},
 		{kind: "user", subtype: "UserRejection", text: "Commands not executed. The user rejected your commands with the following message: do not grep outside the working directory."},
 		{kind: "user", subtype: "UserSteering", text: "We are going to do some redesign. Colored backgrounds are out, colored outlines are in."},
+		// The pair that used to read alike: the first is the harness reporting a
+		// cancellation on the human's side of nothing, the second is the human's
+		// own comment, which the harness only wrapped in a sentence the model is
+		// promised. Authorship decides which side each sits on.
+		{kind: "user", subtype: "UserInterruption", text: "Temporary interruption caught."},
+		{kind: "user", subtype: "UserInterruption", typed: true, text: "Interrupted by user: that took too long, just tell me where the file is"},
+		{kind: "user", subtype: "UserNewTask", text: "The user added a new task: make the outline a touch thicker."},
 		{kind: "error", text: "model stream failed: unexpected EOF - the text most likely to be copied somewhere else."},
 		{kind: "compaction", title: "compaction - 41 messages", text: "Earlier turns were summarised to stay inside the context window."},
 		{kind: "exit", text: "run finished - 21 turns, 3 tool calls, $0.42"},

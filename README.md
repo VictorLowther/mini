@@ -58,21 +58,23 @@ the test suite use.
 The transcript is a series of interleaved text areas, one per message type,
 each a rounded speech bubble outlined in its kind's colour — the outline is
 what says which kind a card is, and the interior stays the plain theme surface.
-`user` for text the human typed (right-justified, chat-app style, blue),
-`harness` for feedback the harness authored in the user's name (rejections,
-interruption records, format-error prompts — left-justified and amber, so the
-two never read alike), `thinking` (slate), `tool call` (green, fixed-width
-command grid), and `LLM output` (violet, markdown). Notes, errors and the exit
-marker take the neutral frame. Each
+`user` for text the human typed (right-justified, chat-app style, blue) — the
+first task, steering, a comment after an interrupt, and whatever they ask for
+next, whatever sentence the harness wraps around it for the model's benefit;
+`harness` for feedback the harness authored *about* an exchange (rejections, a
+cancellation with no comment, format-error prompts, job updates —
+left-justified and amber, so the two never read alike), `thinking` (slate),
+`tool call` (green, fixed-width command grid), and `LLM output` (violet,
+markdown). Notes, errors and the exit marker take the neutral frame. Each
 area's header uses the body's own font and names its kind plus the message's
-generated token count, generation time, and cost when non-zero
-(`LLM output · 254 tok · 3.1s · $0.02`). The input box stays live whenever
-the harness is waiting — including at the "Agent is ready" prompt,
-where a new task continues the run — and the only ways to leave are `/quit`,
-the native quit hotkey (⌘Q / Ctrl+Q, or the menu), or closing the window;
-Enter sends, Shift+Enter (or ⌥Enter on macOS) adds a newline — multi-line
-input is a keystroke, not a mode. Thinking toggles with ⌃⌘T on macOS (plain
-⌘T stays free for future tabs) and Ctrl+T elsewhere.
+generated token count, generation time, and cost when non-zero (`LLM output ·
+254 tok · 3.1s · $0.02`). The input box stays live whenever the harness is
+waiting — including at the "Agent is ready" prompt, where the next thing typed
+continues the conversation — and the only ways to leave are `/quit`, the native quit hotkey (⌘Q /
+Ctrl+Q, or the menu), or closing the window; Enter sends, Shift+Enter (or
+⌥Enter on macOS) adds a newline — multi-line input is a keystroke, not a mode.
+Thinking toggles with ⌃⌘T on macOS (plain ⌘T stays free for future tabs) and
+Ctrl+T elsewhere.
 
 Two pieces of interface state are sticky, kept in the session database's global
 `settings` table rather than in the config file, which is run configuration that
