@@ -87,12 +87,11 @@ type block struct {
 // and tool results render from the stored observation. The caller supplies
 // the header (it is per-frontend state), reads task for the note, and owns
 // the stream reset that committing an assistant turn performs.
-// userTypedKey is the extra key carrying "the human spoke this text" through
-// the transcript and the session store, so no front end has to infer it from the
-// sentence the harness wrapped around it. Print mode reads the same messages and
-// draws no distinction today; the key is there so it can start without a second
-// source of truth.
-const userTypedKey = "user_typed"
+// userTypedKey is model.UserTypedKey under the name this package uses: the
+// producers are the UI's own echoes and the loop's resumed task, and they must
+// not each spell the literal. Print mode reads the same messages and draws no
+// distinction today; the key is there so it can start without a second source.
+const userTypedKey = model.UserTypedKey
 
 func messageBlock(m model.Message, header, task string, clearStream func(), jobs JobReader) (b block, show, taskNote bool) {
 	role, _ := m["role"].(string)

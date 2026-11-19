@@ -348,6 +348,40 @@ func askG(t *testing.T, p *guiPane, q Question) <-chan Answer {
 	return got
 }
 
+// TestRefusedPutsTheReasonInTheCallResult is the contract the harness now keeps
+// with itself: a refused batch is reported once, per call, in the slot the model
+// reads to find out what happened to a call - and a human who refused without
+// typing anything gets no message at all rather than an empty turn.
+func TestRefusedPutsTheReasonInTheCallResult(t *testing.T) {
+	in := refused("refused by the user; do not re-run these commands unchanged", 2,
+		userWords("no, use printf instead", "UserRejection")).(*model.Interrupt)
+	if len(in.Observations) != 2 {
+		t.Fatalf("two refused actions produced %d observations", len(in.Observations))
+	}
+	for i, r := range in.Observations {
+		if r.ReturnCode != -1 {
+			t.Errorf("observation %d returncode = %d, want -1", i, r.ReturnCode)
+		}
+		if !strings.Contains(r.ExceptionInfo, "do not re-run these commands unchanged") {
+			t.Errorf("observation %d carries no reason: %q", i, r.ExceptionInfo)
+		}
+	}
+	if len(in.Messages) != 1 {
+		t.Fatalf("the human's comment became %d messages", len(in.Messages))
+	}
+	if got, _ := in.Messages[0]["content"].(string); got != "no, use printf instead" {
+		t.Errorf("comment = %q, want it verbatim", got)
+	}
+
+	silent := refused("the user took the batch back", 1, userWords("   ", "UserRejection")).(*model.Interrupt)
+	if len(silent.Messages) != 0 {
+		t.Errorf("an empty refusal comment still produced %d messages", len(silent.Messages))
+	}
+	if len(silent.Observations) != 1 {
+		t.Error("dropping the message must not drop the reason the calls did not run")
+	}
+}
+
 func TestGUIConfirmPanelDrivesTheLoop(t *testing.T) {
 	dir := t.TempDir()
 	c := newConfig("confirm")
@@ -447,8 +481,18 @@ func TestGUITypeToReject(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the run never finished")
 	}
-	if !containsContent(l.Messages(), "The user rejected your commands with the following message: use printf instead") {
-		t.Errorf("rejection missing:\n%s", contentsOf(l.Messages()))
+	// The comment reaches the history as the human's own message; the fact that
+	// the call did not run, with the reason, reaches it as that call's result.
+	// Neither one speaks in the other's voice.
+	if !containsContent(l.Messages(), "use printf instead") {
+		t.Errorf("the rejection comment never reached the history:\n%s", contentsOf(l.Messages()))
+	}
+	// (The reason is asserted in TestRefusedPutsTheReasonInTheCallResult and
+	// TestRefusedObservationsReachTheHistory. This scripted model's observation
+	// template renders rc and output only, so the reason is not visible in its
+	// history - asserting it here would be a test that cannot fail.)
+	if containsContent(l.Messages(), "The user rejected your commands") {
+		t.Error("the harness is narrating a refusal as a message the user sent again")
 	}
 	if containsContent(l.Messages(), "|not-run") {
 		t.Error("the rejected command ran")
@@ -513,8 +557,11 @@ func TestGUIEscCancelsTheTurn(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("esc did not interrupt the running command\nmessages:\n%s", contentsOf(l.Messages()))
 	}
-	if !containsContent(l.Messages(), "Interrupted by user: that took too long") {
+	if !containsContent(l.Messages(), "that took too long") {
 		t.Errorf("comment missing:\n%s", contentsOf(l.Messages()))
+	}
+	if containsContent(l.Messages(), "Interrupted by user:") {
+		t.Error("the human's comment is being quoted back at the model in the harness's voice")
 	}
 
 	// And it is the human's own card. This is the reported bug: the comment
@@ -543,7 +590,9 @@ func TestGUITranscriptSideFollowsAuthorship(t *testing.T) {
 		{"the first task", block{kind: "user", text: "do this"}, "user"},
 		{"steering", block{kind: "user", subtype: "UserSteering", text: "check the README first"}, "user"},
 		{"what gets typed at the ready line", block{kind: "user", subtype: "UserNewTask", text: "The user added a new task: fix it"}, "user"},
-		{"a comment typed after an interrupt", block{kind: "user", subtype: "UserInterruption", typed: true, text: "Interrupted by user: that took too long"}, "user"},
+		{"a comment typed after an interrupt", block{kind: "user", subtype: "UserInterruption", typed: true, text: "that took too long"}, "user"},
+		{"a rejection comment, verbatim as it is now stored", block{kind: "user", subtype: "UserRejection", typed: true, text: "no, use printf instead"}, "user"},
+		{"the same rejection from an old transcript, where the harness wrote the sentence", block{kind: "user", subtype: "UserRejection", text: "Commands not executed. The user rejected your commands with the following message: nope"}, "harness"},
 		{"a kind invented after this test was written", block{kind: "user", subtype: "SomeFutureKind", typed: true, text: "hi"}, "user"},
 		{"a rejection the harness words", block{kind: "user", subtype: "UserRejection", text: "Commands not executed."}, "harness"},
 		{"a cancellation the human never commented on", block{kind: "user", subtype: "UserInterruption", text: "Temporary interruption caught."}, "harness"},
@@ -572,7 +621,7 @@ func TestGUITranscriptSideFollowsAuthorship(t *testing.T) {
 func TestGUIAuthorshipTravelsInTheMessage(t *testing.T) {
 	test.NewApp()
 
-	spoken := userWords("Interrupted by user: that took too long", model.KindUserInterruption).(*model.Interrupt).Messages[0]
+	spoken := userWords("that took too long", model.KindUserInterruption).(*model.Interrupt).Messages[0]
 	b, show, _ := messageBlock(spoken, "h", "", func() {}, nil)
 	if !show {
 		t.Fatal("the interruption comment was not shown at all")

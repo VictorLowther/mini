@@ -3,8 +3,10 @@ package ui
 import (
 	"context"
 	"regexp"
+	"strings"
 
 	"github.com/VictorLowther/mini/agent"
+	"github.com/VictorLowther/mini/env"
 	"github.com/VictorLowther/mini/model"
 )
 
@@ -96,10 +98,46 @@ func (h *Interactive) BeforeExecute(ctx context.Context, actions []model.Action,
 		return nil
 	}
 	if ans.Text == "/u" {
-		// /u: skip the batch and hand control back to the user.
-		return interruptUser("Commands not executed. Switching to human mode", "UserRejection")
+		// /u: skip the batch and hand control back to the user. Nothing was
+		// typed, so there is no human message to show at all - the refusal lives
+		// in the calls' results, and this one sentence is the harness directing
+		// the model, which earns the harness's own card.
+		return refused("the user took the batch back without comment; do not re-run these commands",
+			len(actions),
+			interruptUser("Commands not executed. Switching to human mode", "UserRejection"))
 	}
-	return interruptUser(rejectMessage(ans.Text), "UserRejection")
+	// The comment is the human's own message, verbatim, on their side. The
+	// reason the calls did not run goes in each call's result, because that is
+	// where the model looks to find out what happened to a call. Narrating the
+	// refusal as a message the user sent is the ancestor's shape; no harness in
+	// docs/harness-turn-framing.md does it.
+	return refused("refused by the user; do not re-run these commands unchanged",
+		len(actions), userWords(ans.Text, "UserRejection"))
+}
+
+// refused attaches the reason a batch never ran to each of its calls, in the
+// observation the model reads for that call: the observation template renders
+// exception_info precisely for this. It also drops an empty human message rather
+// than sending a turn with nothing in it - sushi discards content-free messages
+// anyway, and an empty card on screen is worse than none.
+func refused(why string, n int, err error) error {
+	in, ok := err.(*model.Interrupt)
+	if !ok {
+		return err
+	}
+	res := make([]env.Result, 0, n)
+	for range n {
+		r := model.NotExecutedResult()
+		r.ExceptionInfo = "action was not executed: " + why
+		res = append(res, r)
+	}
+	in.Observations = res
+	if len(in.Messages) == 1 {
+		if txt, _ := in.Messages[0]["content"].(string); strings.TrimSpace(txt) == "" {
+			in.Messages = nil
+		}
+	}
+	return in
 }
 
 // askWaking is Ask with the harness's own debt as a second way to be answered.
@@ -227,8 +265,10 @@ func (h *Interactive) OnSubmit(ctx context.Context, exitMsg model.Message) error
 			continue // /y or /c: the mode changed, ask again (Python recurses)
 		default:
 			// The next thing typed at the ready line is the human continuing the
-			// conversation, not the harness announcing a discrete task.
-			return userWords(newTaskMessage(ans.Text), "UserNewTask")
+			// conversation, so it goes exactly as they typed it - the way the
+			// first turn of a fresh run already arrives. Announcing it as a new
+			// task asserted a boundary that is not there.
+			return userWords(ans.Text, "UserNewTask")
 		}
 	}
 }
@@ -287,15 +327,17 @@ func (h *Interactive) OnInterrupt(ctx context.Context) error {
 	ans, err := h.UI.Ask(ctx, Question{Kind: AskInterrup, Title: interruptionTitle, Cfg: h.Cfg})
 	text := ans.Text
 	// Python treats an empty comment or a bare mode command as a temporary
-	// interruption; only real prose becomes "Interrupted by user: …".
+	// interruption; only real prose becomes the human's own message.
 	if err != nil || ans.RePrompt || text == "" || isModeCommand(text) {
 		return interruptUser("Temporary interruption caught.", model.KindUserInterruption)
 	}
-	// The comment is the human's prose; the prefix is what the model is
-	// promised. Authorship travels with it so the transcript can show it on
-	// their side. The branches above - "Temporary interruption caught." - are
-	// the harness reporting a cancellation and stay where they are.
-	return userWords("Interrupted by user: "+text, model.KindUserInterruption)
+	// The comment is the human's prose and travels as they wrote it: the role
+	// already says who spoke, and "Interrupted by user:" was the harness putting
+	// words in their mouth. The cancellation itself is not lost - it reaches the
+	// model as the interrupted calls' results, the same as a refusal. The
+	// branches above - "Temporary interruption caught." - are the harness
+	// reporting a cancellation nobody commented on, and stay where they are.
+	return userWords(text, model.KindUserInterruption)
 }
 
 // OnMessage forwards every history addition to the UI.

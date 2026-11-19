@@ -60,7 +60,7 @@ each a rounded speech bubble outlined in its kind's colour — the outline is
 what says which kind a card is, and the interior stays the plain theme surface.
 `user` for text the human typed (right-justified, chat-app style, blue) — the
 first task, steering, a comment after an interrupt, and whatever they ask for
-next, whatever sentence the harness wraps around it for the model's benefit;
+next, each sent exactly as typed;
 `harness` for feedback the harness authored *about* an exchange (rejections, a
 cancellation with no comment, format-error prompts, job updates —
 left-justified and amber, so the two never read alike), `thinking` (slate),

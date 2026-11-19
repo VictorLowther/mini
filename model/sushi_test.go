@@ -313,7 +313,7 @@ func TestRequestBodyDropsExitRows(t *testing.T) {
 		{"role": "user", "content": "task"},
 		{"role": "assistant", "content": "done"},
 		{"role": "exit", "content": "done", "extra": map[string]any{"exit_status": "Submitted", "submission": "done"}},
-		{"role": "user", "content": "The user added a new task: again"},
+		{"role": "user", "content": "again"},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)

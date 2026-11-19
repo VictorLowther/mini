@@ -293,8 +293,8 @@ func TestPaddedObservationHasNoFile(t *testing.T) {
 		Kind: model.KindUserInterruption,
 		Messages: []model.Message{{
 			"role":    "user",
-			"content": "Commands not executed. The user rejected your commands with the following message: nope",
-			"extra":   map[string]any{"interrupt_type": "UserRejection"},
+			"content": "nope",
+			"extra":   map[string]any{"interrupt_type": "UserRejection", model.UserTypedKey: true},
 		}},
 	}}
 	if _, err := run(t, l, "reject the batch"); err != nil {

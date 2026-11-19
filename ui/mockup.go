@@ -217,15 +217,20 @@ func mockSamples() []mockCard {
 			reasoning: "The fills were five pale tints. Turn them into outlines and the interior still has to stay opaque, because the scroll paints stand-in rectangles under a row.",
 			text:      "The report is `docs/ux-audit-2026-11.md` - 548 lines.\n\nWhat it holds, in short:\n\n- **section 1** four owners, two front ends, one seam\n- **section 7** is where nothing will catch you\n\n```go\nsh.StrokeColor = bubbleOutline(label)\nsh.StrokeWidth = bubbleStrokeWidth(w)\n```\n\nThe hues stay; the intensity goes up.",
 			stats:     metrics{Tokens: 254, Elapsed: 3.2, Cost: 0.07}},
-		{kind: "user", subtype: "UserRejection", text: "Commands not executed. The user rejected your commands with the following message: do not grep outside the working directory."},
+		{kind: "user", subtype: "UserRejection", typed: true, text: "no, use printf instead - and do not grep outside the working directory"},
 		{kind: "user", subtype: "UserSteering", text: "We are going to do some redesign. Colored backgrounds are out, colored outlines are in."},
-		// The pair that used to read alike: the first is the harness reporting a
-		// cancellation on the human's side of nothing, the second is the human's
-		// own comment, which the harness only wrapped in a sentence the model is
-		// promised. Authorship decides which side each sits on.
+		// The pair that used to read alike, and the reason authorship is carried
+		// rather than inferred. Both arrive with no wrapper now - the harness
+		// stopped writing sentences in the human's voice - so what separates them
+		// is the marker, not the wording: the first is the harness reporting a
+		// cancellation nobody commented on, the second is that comment.
 		{kind: "user", subtype: "UserInterruption", text: "Temporary interruption caught."},
-		{kind: "user", subtype: "UserInterruption", typed: true, text: "Interrupted by user: that took too long, just tell me where the file is"},
-		{kind: "user", subtype: "UserNewTask", text: "The user added a new task: make the outline a touch thicker."},
+		{kind: "user", subtype: "UserInterruption", typed: true, text: "that took too long, just tell me where the file is"},
+		{kind: "user", subtype: "UserNewTask", typed: true, text: "make the outline a touch thicker and try the light theme"},
+		// And the same three rows as an older session stored them, when the
+		// harness did write the sentence: these still read as harness feedback,
+		// because the fallback has to keep history honest too.
+		{kind: "user", subtype: "UserRejection", text: "Commands not executed. The user rejected your commands with the following message: no, use printf instead"},
 		{kind: "error", text: "model stream failed: unexpected EOF - the text most likely to be copied somewhere else."},
 		{kind: "compaction", title: "compaction - 41 messages", text: "Earlier turns were summarised to stay inside the context window."},
 		{kind: "exit", text: "run finished - 21 turns, 3 tool calls, $0.42"},

@@ -525,8 +525,8 @@ func TestRejectionSkipsExecutionButRecordsObservations(t *testing.T) {
 			Kind: model.KindUserInterruption,
 			Messages: []model.Message{{
 				"role":    "user",
-				"content": "Commands not executed. The user rejected your commands with the following message: nope",
-				"extra":   map[string]any{"interrupt_type": "UserRejection"},
+				"content": "nope",
+				"extra":   map[string]any{"interrupt_type": "UserRejection", model.UserTypedKey: true},
 			}},
 		},
 	}
@@ -545,8 +545,12 @@ func TestRejectionSkipsExecutionButRecordsObservations(t *testing.T) {
 	if !strings.Contains(l.messages[3]["content"].(string), "action was not executed") {
 		t.Errorf("padded observation missing: %v", l.messages[3]["content"])
 	}
-	if !strings.Contains(l.messages[4]["content"].(string), "user rejected your commands") {
-		t.Errorf("rejection message missing")
+	// The comment the hook supplied is the human's own message, verbatim: the
+	// reason the batch stopped travelling in a narrated sentence is
+	// docs/harness-turn-framing.md, and it is now carried by the observation
+	// above instead.
+	if got := l.messages[4]["content"].(string); got != "nope" {
+		t.Errorf("rejection message = %q, want the comment verbatim", got)
 	}
 	if strings.Contains(l.messages[3]["content"].(string), "not-run") {
 		t.Error("the rejected command must not have been executed")
@@ -577,9 +581,83 @@ func TestOnSubmitCanStartANewTask(t *testing.T) {
 	if info["submission"] != "second" {
 		t.Errorf("info = %#v", info)
 	}
-	if !strings.Contains(contents(l.messages)[3], "The user added a new task") {
-		t.Errorf("messages = %v", contents(l.messages))
+	if got := l.messages[3]["content"].(string); got != "do it again" {
+		t.Errorf("resumed turn = %q, want the human's words verbatim", got)
 	}
+}
+
+// TestResumedTaskArrivesVerbatim is decision 4 of docs/harness-turn-framing.md:
+// a task handed to a resumed run arrives as the human's own message, marked as
+// such, and not inside a sentence the harness wrote about them. The old wrapper
+// asserted a task boundary a resumed session does not have.
+func TestResumedTaskArrivesVerbatim(t *testing.T) {
+	m := &model.Deterministic{Outputs: []model.Message{done("all set")}}
+	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	l.Resume([]model.Message{
+		{"role": "system", "content": "sys", "extra": map[string]any{}},
+		{"role": "user", "content": "the earlier turn", "extra": map[string]any{}},
+		{"role": "assistant", "content": "done", "extra": map[string]any{}},
+	})
+	if _, err := run(t, l, "check the flaky test"); err != nil {
+		t.Fatal(err)
+	}
+	var hit bool
+	for _, msg := range l.messages {
+		if s, _ := msg["content"].(string); strings.Contains(s, "The user added a new task") {
+			t.Fatalf("the harness is narrating the human's turn again: %v", contents(l.messages))
+		}
+		if msg["role"] == "user" && msg["content"] == "check the flaky test" {
+			hit = true
+			if extra, _ := msg["extra"].(map[string]any); extra[model.UserTypedKey] != true {
+				t.Error("the resumed task carries no authorship marker")
+			}
+		}
+	}
+	if !hit {
+		t.Errorf("the task never arrived as its own message: %v", contents(l.messages))
+	}
+}
+
+// TestRefusedObservationsReachTheHistory covers the loop's half of decision 3:
+// when a hook stops a batch and says why, that reason is recorded as each call's
+// result rather than left to a narrated user turn.
+func TestRefusedObservationsReachTheHistory(t *testing.T) {
+	m := &model.Deterministic{Outputs: []model.Message{
+		turn("running", "echo never-ran"),
+		done("bye"),
+	}}
+	l := newLoop(t, m, &env.Local{Timeout: 5 * time.Second})
+	l.Hooks = &stubHooks{rejectOnce: true, rejectWith: &model.Interrupt{
+		Kind:         model.KindUserInterruption,
+		Messages:     []model.Message{{"role": "user", "content": "no, use printf", "extra": map[string]any{"interrupt_type": "UserRejection", model.UserTypedKey: true}}},
+		Observations: []env.Result{{ReturnCode: -1, ExceptionInfo: "action was not executed: refused by the user"}},
+	}}
+	if _, err := run(t, l, "refusal plumbing"); err != nil {
+		t.Fatal(err)
+	}
+	if !hasContent(l.messages, "refused by the user") {
+		t.Errorf("the refusal reason never became an observation: %v", contents(l.messages))
+	}
+	if !hasContent(l.messages, "no, use printf") {
+		t.Error("the human's comment did not reach the history")
+	}
+	for _, msg := range l.messages {
+		if s, _ := msg["content"].(string); strings.Contains(s, "The user rejected your commands") {
+			t.Error("the loop narrated the refusal in the human's voice")
+		}
+	}
+}
+
+// hasContent reports whether any message in the history carries the text. The
+// ui package has this helper; the agent tests did not need it until the refusal
+// reason started travelling in the observation rather than the prompt.
+func hasContent(msgs []model.Message, want string) bool {
+	for _, m := range msgs {
+		if s, _ := m["content"].(string); strings.Contains(s, want) {
+			return true
+		}
+	}
+	return false
 }
 
 type newTaskHooks struct {
@@ -594,7 +672,7 @@ func (h *newTaskHooks) OnSubmit(context.Context, model.Message) error {
 	h.once = false
 	return &model.Interrupt{Kind: model.KindUserInterruption, Messages: []model.Message{{
 		"role":    "user",
-		"content": "The user added a new task: do it again",
+		"content": "do it again",
 		"extra":   map[string]any{"interrupt_type": "UserNewTask"},
 	}}}
 }

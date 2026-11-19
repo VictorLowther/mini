@@ -1037,6 +1037,18 @@ func (l *Loop) QueueMessage(m model.Message) {
 	l.mu.Unlock()
 }
 
+// refusedObservations unwraps the results a hook that stopped a batch supplied
+// with its interruption. It is a function rather than a field read at the call
+// site because the hook hands back an error, and the interesting half of it is
+// buried in that error's payload.
+func refusedObservations(err error) []env.Result {
+	var in *model.Interrupt
+	if errors.As(err, &in) {
+		return in.Observations
+	}
+	return nil
+}
+
 func (l *Loop) drainQueued() []model.Message {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1376,10 +1388,15 @@ func (l *Loop) Run(ctx context.Context, task string, kwargs ...map[string]any) (
 	if l.resumed != nil {
 		l.setHistory(l.resumed)
 		if task != "" {
+			// Verbatim, exactly as a fresh run sends it - instance_template is a
+			// bare {{.task}} (config/configs/mini.yaml:164). The wrapper this
+			// replaces, "The user added a new task: ...", asserted a task
+			// boundary a resumed session does not have and put the harness's
+			// sentence in the human's slot.
 			l.addMessages(model.Message{
 				"role":    "user",
-				"content": "The user added a new task: " + task,
-				"extra":   map[string]any{"interrupt_type": "UserNewTask"},
+				"content": task,
+				"extra":   map[string]any{"interrupt_type": "UserNewTask", model.UserTypedKey: true},
 			})
 		}
 	} else {
@@ -1730,7 +1747,11 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 
 	if l.Hooks != nil {
 		if err := l.Hooks.BeforeExecute(ctx, actions, l.TemplateVars()); err != nil {
-			l.addMessages(l.Model.FormatObservations(msg, results, l.TemplateVars())...)
+			// The batch did not run, and the hook that stopped it may say why:
+			// that reason belongs in each call's result, which is where the model
+			// looks for what happened to a call. With nothing supplied the
+			// padding is the plain "action was not executed" it has always been.
+			l.addMessages(l.Model.FormatObservations(msg, refusedObservations(err), l.TemplateVars())...)
 			return err
 		}
 	}

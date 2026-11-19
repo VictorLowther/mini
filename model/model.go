@@ -188,12 +188,27 @@ const (
 	KindUserInterruption  = "UserInterruption"
 )
 
+// UserTypedKey is the extra key that says "the human spoke this text themselves".
+// Authorship travels with the message instead of being guessed from the sentence
+// wrapped around it, and from here it is one name for both producers: the UI
+// marks its own echoes, and the loop marks a task arriving on a resumed session.
+// Like every other extra it never reaches the wire (Sushi.requestBody strips it)
+// - it exists for front ends reading the transcript, live or resumed.
+const UserTypedKey = "user_typed"
+
 // Interrupt carries the messages the loop appends before reacting. It lives in
 // model (not agent) because the model raises it and the agent imports the
 // model, so the dependency can only point this way.
 type Interrupt struct {
 	Kind     string
 	Messages []Message
+	// Observations is what each action of the interrupted batch gets instead of
+	// running. A hook that stops a turn before anything executes can say why in
+	// the one slot the model reads to learn what happened to a call, rather than
+	// narrating it in a message that looks like the human wrote it. Nil keeps the
+	// existing behaviour: FormatObservations pads every slot with
+	// NotExecutedResult. See docs/harness-turn-framing.md.
+	Observations []env.Result
 }
 
 func (i *Interrupt) Error() string { return i.Kind }

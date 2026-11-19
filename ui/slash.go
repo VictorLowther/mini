@@ -97,14 +97,6 @@ func userWords(content, itype string) error {
 	}
 }
 
-func rejectMessage(userText string) string {
-	return "Commands not executed. The user rejected your commands with the following message: " + strings.TrimSpace(userText)
-}
-
-func newTaskMessage(userText string) string {
-	return "The user added a new task: " + userText
-}
-
 // firstLine is the one-line summary of a multi-line message or task.
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {

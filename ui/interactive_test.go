@@ -182,9 +182,33 @@ func TestTypedTextRejectsAndReappearsInHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "Commands not executed. The user rejected your commands with the following message: no, use printf instead"
+	want := "no, use printf instead"
 	if !containsContent(l.Messages(), want) {
-		t.Errorf("rejection missing:\n%s", contentsOf(l.Messages()))
+		t.Errorf("rejection comment missing:\n%s", contentsOf(l.Messages()))
+	}
+	// The refusal is recorded as the call's own result *before* the human's
+	// comment, not after it: a user message landing between tool_results breaks
+	// provider replay for some backends. (The reason text itself is asserted in
+	// TestRefusedPutsTheReasonInTheCallResult and the agent's
+	// TestRefusedObservationsReachTheHistory - this scripted model's observation
+	// template renders rc and output only, so asserting it here would only
+	// prove that a template can print what it does not include.)
+	msgs := l.Messages()
+	comment, refusal := -1, -1
+	for i, m := range msgs {
+		txt, _ := m["content"].(string)
+		switch {
+		case m["role"] == "user" && strings.Contains(txt, "no, use printf instead"):
+			comment = i
+		case m["role"] == "tool" && strings.HasPrefix(txt, "-1"):
+			refusal = i
+		}
+	}
+	if comment < 0 || refusal < 0 {
+		t.Fatalf("missing refusal or comment in\n%s", contentsOf(msgs))
+	}
+	if refusal > comment {
+		t.Errorf("the refusal observation (%d) lands after the user message (%d): replay would break", refusal, comment)
 	}
 	if kinds(h) != "confirm,new-task,new-task" {
 		t.Errorf("questions = %s", kinds(h))
@@ -198,7 +222,8 @@ func TestTypedTextRejectsAndReappearsInHistory(t *testing.T) {
 	if info["exit_status"] != "Submitted" || info["submission"] != "first\n" {
 		t.Errorf("info = %#v", info)
 	}
-	// The rejection reaches the model as a user message, not just the log.
+	// The rejection comment reaches the model as the human's own user message,
+	// not as a sentence the harness wrote on their behalf.
 	var asUser bool
 	for _, m := range l.Messages() {
 		if m["role"] == "user" && strings.Contains(m["content"].(string), want) {
@@ -336,8 +361,11 @@ func TestSubmittedWithTypedTaskContinuesTheRun(t *testing.T) {
 	if _, err := l.Run(context.Background(), "T"); err != nil {
 		t.Fatal(err)
 	}
-	if !containsContent(l.Messages(), "The user added a new task: and now do it again") {
+	if !containsContent(l.Messages(), "and now do it again") {
 		t.Errorf("new task message missing:\n%s", contentsOf(l.Messages()))
+	}
+	if containsContent(l.Messages(), "The user added a new task") {
+		t.Error("the next turn is being announced as a discrete task again")
 	}
 	if !containsContent(l.Messages(), "second") {
 		t.Error("the run did not continue after the new task")
