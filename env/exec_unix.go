@@ -55,7 +55,7 @@ const KillGrace = 2 * time.Second
 // command is built with exec.CommandContext. The bare exec.Cmd literal this
 // replaced had no context to consult, which is exactly why the callback had to
 // be installed by hand.
-func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
+func processGroupExecHandler(killTimeout time.Duration, guard *fdGuard) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		hc := interp.HandlerCtx(ctx)
 		path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
@@ -71,6 +71,20 @@ func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
 		cmd.Stdout = hc.Stdout
 		cmd.Stderr = hc.Stderr
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+		// The guard's read side covers the fork and nothing else. This is the
+		// one moment os/exec reads the raw platform handle out of the
+		// *os.File the interpreter was given (os.startProcess -> File.Fd()), so
+		// it is the one moment that handle must not be closing underneath us -
+		// and cmd.Wait, which can run for hours, must not hold it, or a
+		// backgrounded `sleep` would park the whole tool call. See fdguard.go.
+		//
+		// A command that reaches here after its shell has ended is not refused
+		// and not given a dead descriptor: it gets a fresh append handle on the
+		// same path, so its bytes still land in the file the transcript names.
+		// `late` belongs to this goroutine alone, which is the entire point -
+		// nobody else can close it while the fork is reading it.
+		var late *os.File
 
 		killGroup := func(sig syscall.Signal) {
 			// Setsid made the child both session and process-group leader, so
@@ -120,7 +134,28 @@ func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
 		// escalation, because Cancel does that before Wait ever reaches this.
 		cmd.WaitDelay = killTimeout
 
-		if err = cmd.Start(); err == nil {
+		guard.mu.RLock()
+		if guard.stale(hc.Stdout, hc.Stderr) {
+			f, rerr := guard.reopen()
+			if rerr != nil {
+				guard.mu.RUnlock()
+				fmt.Fprintf(hc.Stderr, "env: cannot re-open %s for a command that started after its shell ended: %v\n", guard.path, rerr)
+				return interp.ExitStatus(127)
+			}
+			late = f
+			hc.Stdout, hc.Stderr = f, f
+			cmd.Stdout, cmd.Stderr = f, f
+		}
+		startErr := cmd.Start()
+		guard.mu.RUnlock()
+		if late != nil {
+			defer late.Close()
+		}
+		// The fork is over and the descriptors are no longer ours to protect:
+		// from here the child holds its own, so waiting outside the lock is what
+		// lets a long-running command run while Execute finishes.
+		err = startErr
+		if err == nil {
 			err = cmd.Wait()
 		}
 		return exitStatusFromError(ctx, hc.Stderr, err)

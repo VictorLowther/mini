@@ -135,10 +135,21 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 		}, nil
 	}
 
-	devnull, derr := os.Open(os.DevNull)
-	if derr == nil {
-		defer devnull.Close()
-	}
+	// stdin is one shared handle for the life of the process, opened nowhere
+	// per command and closed nowhere at all - see devNull. What used to be an
+	// os.Open plus a deferred Close here was half of a real race: the
+	// interpreter can hand that same handle to a background statement's
+	// goroutine, which is still reading its platform handle during fork when
+	// this function returns and destroys it.
+	devnull := devNull()
+
+	// The lifetime handshake for `out`. See fdguard.go for why the close and
+	// the fork need each other, and why Execute's return is the moment that
+	// makes the difference to everyone upstream: the job watcher and the agent
+	// loop both close the result file after this returns, and a background
+	// statement is allowed to still be starting.
+	guard := newFDGuard(out)
+	defer guard.shutdown()
 	runner, rerr := interp.New(
 		// /dev/null as stdin: immediate EOF for children and for `read`,
 		// without mvdan's pipe-copy goroutine.
@@ -151,14 +162,14 @@ func (l *Local) Execute(ctx context.Context, command, cwd string, out io.Writer)
 		// `cmd > file 2>&1`, with no copying goroutine and no cap. Wrapping
 		// the file in a counting writer would destroy that property, which is
 		// why output_bytes comes from Stat.
-		interp.StdIO(orNil(devnull, derr), out, out),
+		interp.StdIO(orNil(devnull), out, out),
 		interp.Interactive(false),
 		interp.Env(expand.ListEnviron(append(os.Environ(), l.envList()...)...)),
 		interp.Dir(dir),
 		// The singular, deprecated option on purpose: interp.ExecHandlers
 		// always appends DefaultExecHandler, which signals only the child PID
 		// and would orphan grandchildren.
-		interp.ExecHandler(processGroupExecHandler(KillGrace)),
+		interp.ExecHandler(processGroupExecHandler(KillGrace, guard)),
 	)
 	if rerr != nil {
 		return Result{ReturnCode: -1, ExceptionInfo: fmt.Sprintf("An error occurred while executing the command: %v", rerr)}, nil
@@ -232,8 +243,8 @@ func (l *Local) envList() []string {
 	return out
 }
 
-func orNil(f *os.File, err error) io.Reader {
-	if err != nil {
+func orNil(f *os.File) io.Reader {
+	if f == nil {
 		return nil
 	}
 	return f
