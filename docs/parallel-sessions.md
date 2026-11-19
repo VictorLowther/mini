@@ -2450,6 +2450,89 @@ not a test of the feature.
 
 Also gone: a duplicated `p.Jobs = jobReader(...)` in the print-mode setup, which
 assigned the same value twice.
+
+### 8.13 Bubbles carry their kind as an outline, and a window to look at it in
+
+Coloured backgrounds are out, coloured outlines are in. A transcript card is now
+the plain theme surface inside a frame in the kind's own hue - the same five
+colours the fills used, at full intensity, half the theme padding thick (2 pt at
+the default theme, floored at 1 pt). `fyneview.go`'s bubble section is the
+change; `docs/ux-audit-2026-11.md` §10 is the survey amended to match.
+
+**Why.** The fills were each accent blended 16-20% onto the theme background, and
+the survey had already recorded the complaints: side by side the pale tints were
+near-identical at a glance - only the violet was nameable - body text sat on five
+different surfaces, and every kind missing from the map (note, exit, error,
+system, and each free-form compaction title, which cannot match a fixed key) fell
+to the same 9.4% grey. An outline carries the same hue without putting the colour
+under the words it has to be read through. `bubbleFill` and `blendOnto` went with
+the fills: one client each, and the client is gone.
+
+**One polygon, not two shapes.** `canvas.ArbitraryPolygon` grew
+`StrokeColor`/`StrokeWidth` in Fyne 2.8 and both painters honour it, which was
+checked before depending on it: the GL fragment shader strokes **inward** from the
+path (`fill_mask = smoothstep(-strokeWidth + edgeSoftness, -strokeWidth -
+edgeSoftness, dist)`, so the frame lands inside the bubble's own box), while the
+software painter strokes centred but grows the texture by `VectorPad =
+StrokeWidth + 2` and offsets by `-pad`, so nothing clips there either.
+`bubble.points` did not move by a point - and did not need to: the tail's flanks
+are already part of the closed perimeter, so the tail outlines for free and no
+line is drawn across its mouth. Had the primitive not stroked, the honest version
+of this change would have been a second inset polygon and a comment explaining
+that the border was faked.
+
+**Opaque is still the property, and that is a bug story.** `bubbleAccent`'s
+entries were three-field composites, so every hue had `A: 0`. As *blend* inputs
+that was harmless - `blendOnto` set alpha on its result and never read it - and
+it is invisible to a test that only asks what colour was assigned. As a **stroke**
+the same zero is a fully transparent line: the bubble is there, the frame is not,
+and nothing fails. Every literal now says `A: 0xff`, with a comment. What caught
+it was a scratch test that rendered a real area through `test.NewWindow(...)` and
+counted painted pixels; that scratch became `TestGUIBubbleOutlinesPaint`, which
+asserts the hue forms a **ring** - accent pixels exist at the edges, none appear
+in the centre band, and they never cover more than a quarter of the card. So "the
+colour went back in the background" fails a test rather than a review. The same
+probe found that `test.NewCanvas()` cannot do this at all: it has no painter, and
+its `Capture()` returns a blank image - a convincing way to write a rendering
+test that can never fail, and the reason the test builds a window.
+
+**The header question this opens, pinned rather than answered.** `areaColor`
+takes a kind label and returns `theme.ColorNameForeground` for all of them. Under
+a tinted fill that was a readability fix (same-hue text on a same-hue surface -
+blue on blue, amber on amber - was near-unreadable). With the colour moved to the
+frame there is no readability problem left to rescue, and what is left looks like
+a hook that ignores its argument, which is indistinguishable from unfinished work;
+the survey's §7 had it on the dead-code list for exactly that reason. It is a
+decision, so a test says so: `TestGUIAreaHeadersAndAlignment` now asserts every
+kind's header stays foreground (verified non-vacuous - pointing `areaColor` at a
+hue fails it). Flipping it is one function, and that assertion is the thing that
+has to fail on purpose. Worth naming for whoever picks this up: the hierarchy
+inverted. The frame is now the loudest coloured thing on a card and the header is
+the only neutral part of it, so the header *text* is doing all the non-chromatic
+work of saying which kind this is - and for the kinds sharing the neutral frame,
+it is doing all the work, period.
+
+**A mockup command, because looking is cheaper than arguing.** `go run
+./cmd/bubblemock` opens one card of every kind through the same `blockCards` the
+app uses, with outline weight, outline strength, light/dark and the pre-redesign
+tinted fills on knobs (`ui.ShowMockup`; `mockOldTint` is a deliberate copy of the
+deleted blend so the before picture cannot drift toward the after one). It is a
+**command** and not an env-gated test for a reason worth keeping: the first
+version was a test, and a Fyne window must be built on the process's main thread,
+which a test function never is - it started, created its objects, and drew
+nothing, with no window, no error and no output. And a mockup only earns its keep
+if it reproduces the *constraints*, not just the colours: the first window
+stacked its cards at full viewport width, putting every card's right edge - and
+every scrollable card's own bar - on top of the transcript scrollbar, the exact
+mis-grab `scrollbarGutter()` exists to prevent. `newMockup` insets the column by
+that same function rather than a number, so the tool cannot disagree with the app
+silently, and `TestGUIMockupLeavesScrollbarGutter` holds it.
+
+**Not done, on purpose.** Neutral crowding: note, error, exit and compaction
+still share one frame, and it is more conspicuous now that it is a real line
+rather than a wash - deferred, to be given distinct hues or dropped. Amber on the
+light variant is the weakest of the five and stays. No hues were invented, no
+hues were changed, and nothing else about the card moved.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that

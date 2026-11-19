@@ -1,13 +1,20 @@
 # Current UX: structure, layout choices, idioms, design decisions
 
-Reviewed: `ui/` (~5,535 LOC non-test, 29 files) against `docs/parallel-sessions.md`
-(3,001 ln), `jobs-research.md`, `whitelist-gate-hardening.md`,
+Reviewed: `ui/` - then ~5,535 non-test LOC, now **5,935 across 16 files**
+(`find ui -name '*.go' ! -name '*_test.go' | xargs wc -l`, measured after §10;
+the bubble rewrite and `mockup.go` account for the growth) - against
+`docs/parallel-sessions.md`
+(3,001 ln then; it carries §8.13 now), `jobs-research.md`, `whitelist-gate-hardening.md`,
 `adversarial-review-2026-11.md`, and ~4,000 lines of tests. Fyne
 `v2.8.3-0.20261115175655` (a **dev pin**, not a release - see §5.6 and §7).
 
 Line numbers refer to `ui/fyneview.go` unless another file is named. This is a
 survey of what exists and why, written before a round of UX changes: no
 recommendations, and §6 lists the ideas the design has already rejected.
+
+**One of those changes has since landed. Read §10 first**: it lists what was
+rewritten in place (the bubble paints an outline, not a tint), what is now
+historical, and how far the `fyneview.go` line citations have drifted.
 
 ---
 
@@ -113,38 +120,57 @@ Every transcript row is now an `area` - a ruled change: *"all of the cards shoul
 be real containers instead of being just rich text widgets with background
 colors"* (§8.8). Composition is
 `Stack[ bubble, VBox[ Border{trailing: actions}(header), body ] ]`
-(`:1355-1384`).
+(`areaCard`, `:1410-1439`).
 
-The visual reference is explicit: "speech bubbles in the style of
-apptrix.org/components/widget/chat ... an opaque rounded body with a tail flaring
-to a point on the sender's side" (`:1176-1182`). **There is no border object and
-no stroke** - `canvas.NewArbitraryPolygon(nil, fill)` (`:1249`). The visible edge
-is fill-vs-background contrast, controlled by three alpha values: `0x33` for the
-five labelled kinds, `0x2a` for `LLM output`, `0x18` for anything unknown. Fills
-are theme-derived "so light and dark variants both read," and the stated reason
-fixed hues replaced theme names: "ColorNamePrimary (user) and
-ColorNameHyperlink (LLM output) are both blue in the default theme and the faint
-foreground tints ... read as 'no bubble at all'" (`:1184-1192`). Opaque was a
-fix, not a style: "the first cut used low-alpha fills on a raw canvas rectangle
-and rendered effectively invisible."
+The visual reference is still explicit - "speech bubbles in the style of
+apptrix.org/components/widget/chat ... a rounded body with a tail flaring to a
+point on the sender's side" (`:1191-1210`) - but **the kind is now the stroke**,
+since §10. The bubble is one `canvas.ArbitraryPolygon` (`:1293`) carrying
+`FillColor`, `StrokeColor` and `StrokeWidth`: the primitive strokes its own path
+in this Fyne pin, in both painters, so there is no second inset shape faking a
+border. The interior is the plain theme surface for every kind (`bubbleSurface`,
+`:1245`); the hue lives entirely in the frame (`bubbleOutline`, `:1252`), at full
+intensity and `padding/2` thick with a 1 pt floor (`bubbleStrokeWidth`, `:1265`).
+The five hues are the ones the tinted design used (`bubbleAccent`, `:1225`) and
+everything without a hue of its own takes `bubbleNeutral` (`:1238`). The reason
+they are fixed hues and not theme names has not changed: "ColorNamePrimary (user)
+and ColorNameHyperlink (LLM output) are both blue in the default theme."
 
-Sides and labels come from one table, `messageKindLabel` (`:1150-1164`, first
+What the fills were, and why they went: `bubbleFill` blended each accent onto the
+background at `0x33` (the five labelled kinds), `0x2a` (`LLM output`) or `0x18`
+(unknown) and `blendOnto` composited it; both are deleted, one client each and
+the client gone. The visible edge was fill-vs-background contrast, which asked
+the reader to decode a surface hue *through* the text sitting on it, produced
+near-identical tints side by side, and left every unlabelled kind in the same
+9.4% wash (§7). Opaque survived the redesign as a property of both halves rather
+than disappearing with the tint: of the interior, so the scroll's stand-in
+rectangles do not show through the body, and of the stroke, because a zero-alpha
+hue paints an invisible frame while every field reads correct - which is exactly
+what the old comment about low-alpha fills rendering "effectively invisible" was
+guarding, and what `A: 0xff` on every accent literal now guards.
+
+Sides and labels come from one table, `messageKindLabel` (`:1167-1181`, first
 match wins): `transcript>0` -> **tool call**; `assistant` -> **LLM output**;
 `user`/`UserSteering` -> **user** right-justified; any other `user` subtype ->
 **harness** left. That human-vs-harness side split is the README's rule "so the
 two never read alike." Headers use the *body's own font* (`TextStyle{}`), never a
-label widget, so header width tracks body width exactly.
+label widget, so header width tracks body width exactly, and the *plain theme
+foreground* for every kind (`areaColor`, `:1404`) - a decision since §10, with
+`TestGUIAreaHeadersAndAlignment` asserting it, because a function that takes a
+kind and ignores it is indistinguishable from unfinished work without one.
 
 ### 2.5 The numbers (every knob in one place)
 
 | Knob | Value | Site |
 |---|---|---|
 | **Master unit** | `theme.SizeNamePadding` (=4 by default) - everything spatial is a multiple | |
-| corner radius | x1 | `:1259` |
-| tail drop / flare base | x1.5 / x2 | `:1230, :1234` |
-| card insets | top p, bottom 2.5p, left p, right p | `:1372` |
-| tip softening | `min(radius/4, 1)` - the only hard pixel | `:1261` |
-| mono card growth cap | `min(content, 10 lines)`, measured from glyph `"M"` | `:1449-1453` |
+| corner radius | x1 | `:1308` |
+| tail drop / flare base | x1.5 / x2 | `:1271, :1275` |
+| card insets | top p, bottom 2.5p, left p, right p | `:1427` |
+| **outline width** (since §10) | `padding/2` (=2 pt at defaults), floored at 1 pt | `:1265` |
+| **bubble interior** (since §10) | theme background, uncoloured, opaque | `:1245` |
+| tip softening | `min(radius/4, 1)` - one of two hard pixels (the other is the outline floor) | `:1310` |
+| mono card growth cap | `min(content, 10 lines)`, measured from glyph `"M"` | `:1500-1509` |
 | code fold threshold | 6 lines open, >=7 accordion `[lang . N lines]` | `markdown.go:24-28` |
 | fence split | >=3 markers, indent <4 opens | `markdown.go:78-81` |
 | live repaint gap | 80 ms leading-edge, clamped >=0 | `:88` (field), `:182` (set) |
@@ -158,7 +184,7 @@ label widget, so header width tracks body width exactly.
 | default window | 960x720 | `prefs.go:59` |
 | panel action elision | 4 shown then `+N more commands`; 6 lines per action | `blocks.go:205-234` |
 
-Header text carries **no width logic at all**: `cardHeaderText` (`:1388-1400`)
+Header text carries **no width logic at all**: `cardHeaderText` (`:1443-1455`)
 builds `[]string{label}` and appends each non-zero metric (`%d tok`, `%.1fs`,
 `$%.2f`), joined with U+00B7. Truncation, wrapping and per-field elision do not
 exist here, so a long compaction title or a five-part metric run can wrap the
@@ -255,9 +281,11 @@ the rest get the full treatment. The comment claims "Input is never dropped"
    because a per-line split printed "eight bubbles for one help block" and spent
    the row budget.
 9. **Stringly-typed kind coupling, no constants.** `"LLM output"` is spelled
-   literally at `:1155, :1198, :1210, :1508`; the fill is keyed on the *display
-   label*, not the block kind, so a rename degrades a card to grey with no
-   compile error.
+   literally at `:1172, :1230, :1565, :1644`; the **outline** is keyed on the
+   *display label*, not the block kind, so a rename degrades a card to the
+   neutral frame with no compile error. Since §10 that failure is louder than it
+   used to be: the label used to key a background tint that sat alongside a
+   header naming the same kind, and now it keys the card's only colour.
 10. **Small typographic conventions:** U+00B7 middle dot as separator
     everywhere, U+2026 for in-progress, a check mark for exit, warning and pause
     glyphs as tab markers, platform key glyphs in prose, `> ` as the print prompt.
@@ -268,8 +296,14 @@ the rest get the full treatment. The comment claims "Input is never dropped"
 `askqueue_test.go:139`). **No driver is patched** - `test.Driver` and
 `OverwriteGlfwApp` appear nowhere in the tree, and the README's "runs headless
 against an injected test app" is accurate. Assertions land on **model state** (`committed`,
-`winFirst`/`winLast`, `pinned`) and **rendered text** (`strings.Contains`/
-`Count`); geometry is asserted only for scroll extents, card widths and minima.
+`winFirst`/`winLast`, `pinned`), **rendered text** (`strings.Contains`/`Count`)
+and - since §10 - **painted pixels**: `test.NewWindow(o)` plus
+`Canvas().Capture()` renders through the software painter with no driver patch,
+which is how `TestGUIBubbleOutlinesPaint` knows a frame was *drawn* rather than
+assigned. `test.NewCanvas()` cannot do this: it has no painter, so its
+`Capture()` returns a blank image, and a test written against it passes while
+proving nothing. Geometry is asserted only for scroll extents, card widths and
+minima (now including the mockup column's, `TestGUIMockupLeavesScrollbarGutter`).
 **No test asserts where a transcript row is *placed*** (row `Move`/`Resize`
 geometry is never read back), and `paintGap` is
 zeroed in tests so the stream throttle is untested. `MINI_DEBUG_LAYOUT=1` (`:28`)
@@ -346,6 +380,15 @@ is the only layout introspection.
     only content; `RetryNotice` exists because "a stalled window with no
     explanation is indistinguishable from a crash"; unstreamed errors "must land
     in the transcript or they vanish."
+14. **A kind is carried by its outline, not its background** (2026-11-18; §10 and
+    `parallel-sessions.md` §8.13). Same five hues at full intensity, `padding/2`
+    thick; interior is the plain theme surface, opaque so what paints under a row
+    does not show through it. One `ArbitraryPolygon` rather than two stacked
+    shapes, because the primitive strokes its own path in both painters - GL
+    inward from the path, software centred but padded by `VectorPad`. Every hue
+    literal states `A: 0xff`, because a zero-alpha accent is an invisible frame
+    with every field correct, and the suite has now pixel-asserted that
+    distinction. Headers stay foreground, and a test says that is chosen.
 
 ---
 
@@ -378,13 +421,19 @@ UX pass:
 - **Typed response metadata feeding the job card** - the card reads the row and
   the file itself, "which means the job card is a real component."
 - **`dialog.NewForm` for the `+`** - replaced by the picker tab (dependency cost).
+- **Tinted bubble fills as the kind marker** - retired by §10 in favour of
+  outlines (§5.14). The hues stay and the *surface* colour does not come back
+  without an answer to the two complaints that buried it: five pale tints that
+  read alike, and text sitting on five different backgrounds.
 
 ---
 
 ## 7. Drift, staleness, and the places nothing will catch you
 
-- **README vs code.** It says cards are "rounded, **bordered**" - there is no
-  stroke object. It cites `fyneui.go`/`fyneview.go` as the GUI while the window is
+- **README vs code.** It used to say cards are "rounded, **bordered**" when no
+  stroke object existed; since §10 the stroke is real, so that line reads true -
+  and it now spells the outline out, so a future reader of the README is not
+  misled in that direction again. It still cites `fyneui.go`/`fyneview.go` as the GUI while the window is
   built in `shell.go`. It calls `Print` the "`--print` front end"; it is also the
   *only* front end whenever stdout is not a TTY (`main.go:270-273`).
 - **The "cannot drift" claim is narrower than it reads.** It holds for GUI
@@ -394,17 +443,22 @@ UX pass:
   prints `sessionHeaderLine`. The test that sounds like it covers this asserts
   *trajectory JSON* equality, not transcript text.
 - **Dead code a layout change will step on:** `areaColor(kind)` ignores its
-  parameter and returns one constant - "the API is a lie" for any future tinted
-  header; `selectableRT` and `collapseSpaces` have no callers while the invariant
+  parameter and returns one constant - which §10 turned from "the API is a lie"
+  into a documented decision with an assertion behind it (`areaColor` `:1404`,
+  `TestGUIAreaHeadersAndAlignment`), and which is still the single place a
+  per-kind header hue would go; `selectableRT` and `collapseSpaces` have no callers while the invariant
   is duplicated by hand in three places; `limitLabelSteps`/`limitLabelCost`
   survive the feature that needed them; the `Loop` doc comment (`interactive.go:17`)
   still promises a limits banner; four `area` fields are written and never read.
 - **Live contradictions in comments:** `blockCards`' header says
   notes/errors/exit "stay plain rows" while the code builds `areaCard` for all
-  three; the banner claims "the five kinds are tellable at a glance" while
-  eight literal labels (`tool call`, `LLM output`, `user`, `harness`, `thinking`, `exit`, `error`, `note`) plus raw `b.kind` and compaction `b.title` passthrough reach `bubbleFill` and `note`/`exit`/`error` - the most
-  common rows - all fall to the 9.4% grey. Compaction feeds free-form `b.title`
-  in as the colour key, so it can never match.
+  three; the accent map's banner still claims "the five kinds are tellable at a
+  glance" (`:1211-1224`) while
+  eight literal labels (`tool call`, `LLM output`, `user`, `harness`, `thinking`, `exit`, `error`, `note`) plus raw `b.kind` and compaction `b.title` passthrough reach `bubbleOutline` and `note`/`exit`/`error` - the most
+  common rows - all take the same `bubbleNeutral` frame. Compaction feeds
+  free-form `b.title` in as the colour key, so it can never match. Before §10
+  that was a 9.4% wash nobody noticed; now it is a deliberate-looking line, which
+  is the honest way for the debt to show. Deferred, not resolved.
 - **Behavioural oddities:** one API call stamps `stats` on **two** cards, so
   `1234 tok . 3.2s . $0.07` prints twice, while `costLabel` drops the `$`
   whenever a duration is present; a `system` block renders grey where equivalent
@@ -416,7 +470,9 @@ UX pass:
 - **Untested but visible:** row *placement* inside the `centerLayout` /
   `recomputeWindow` path (tests resize `rootC` and assert scroll extents, offsets
   and `winFirst`/`winLast`, but never a row's own position or width); `esc`; `guiScopeNote`; confirm-panel elision; Option/Cmd+Enter;
-  transcript re-wrap on width change; exact hues; the `codeFoldAfter` boundary;
+  transcript re-wrap on width change; the exact hue of every kind but `user`
+  (one frame is pixel-asserted since §10, the other four are only compared with
+  each other); the `codeFoldAfter` boundary;
   and `bubbleTailDrop`/`bubbleTailBase` (a rename is "completely uncovered"). The
   related trap that *is* real and *is* documented in the source: `newChatInput`
   hand-builds `&widget.Entry{MultiLine: true, Wrapping: fyne.TextWrapWord}`
@@ -442,7 +498,8 @@ UX pass:
 | Change | Files | Caught by tests? |
 |---|---|---|
 | Spacing / vertical rhythm | theme padding only, `blockSpacer` (`:1543`), the x1.5 coefficient in `estimateBlockHeight` | no - estimates are never compared to measured |
-| Colour / contrast | `bubbleAccent`, `bubbleFill`, `blendOnto` (`:1193-1225`) | only "fills differ" |
+| Colour / contrast | `bubbleAccent` (`:1225`), `bubbleOutline` (`:1252`), `bubbleSurface` (`:1245`), `bubbleStrokeWidth` (`:1265`) - `bubbleFill` and `blendOnto` are gone (§10) | outlines differ by kind; `user`'s hue is pixel-asserted, the other four only compared to each other |
+| Bubble frame, tail, stroke | `bubble.points` (`:1303`), `newBubble` (`:1292`), `bubbleRenderer.Layout` (`:1338`) | the pixels, not the geometry - nothing reads the polygon's points back |
 | Card chrome | `areaCard` (`:1355`), `area.CreateRenderer` (`:1340`) | partially (`TestGUICardBodiesAreSelectable`) |
 | Header content/format | `cardHeaderText` (`:1388-1400`) - no width logic, so anything here that grows competes with wrapping | exact strings: `TestGUIAreaHeadersAndAlignment` (`fyneui_test.go:1282`) |
 | Kinds, labels, sides | `messageKindLabel` + `blockCards` + `bubbleAccent` + `costLabel` - **four string-coupled sites, no constants** | partially |
@@ -450,7 +507,8 @@ UX pass:
 | Input area | `newChatInput` (`:1978`) - mind the first-write-wins trap in §7 | `TestPaintedInputFollowsResize` |
 | Panel | `setPanel` (`:1717`) + the `questionPanel*Mode` constants (`:1756`) + `Interactive`'s answer semantics | `TestGUIConfirmPanelDrivesTheLoop` |
 | Window/tab chrome | `shell.go` `newShell`/`menus`/`label` | `TestGUIModeInTitleTracksVisibleSession` |
-| **Anything geometry** | `fyneview.go` | **nothing** - verify by hand with `MINI_DEBUG_LAYOUT=1` |
+| **Anything geometry** | `fyneview.go` | **nothing for placement** (row widths are pinned, in the app and - since §10 - in the mockup). Verify by hand: `MINI_DEBUG_LAYOUT=1`, or `go run ./cmd/bubblemock` |
+| The mockup window | `mockup.go`, `cmd/bubblemock` | `TestGUIMockupLeavesScrollbarGutter` (the gutter, not the look) |
 | Print parity | **by hand**, or adopt `messageBlock` in `print.go` and fix the two literal duplications | no equivalence test exists |
 
 ---
@@ -546,3 +604,49 @@ Citation drift corrected in the same pass: the interface (`ui.go:68-80`, not
 viewport (`:428`), `atBottom` (`:790`), and `paintGap` (`:88`/`:182`). The
 "eleven-plus labels" count is replaced by the eight literal labels plus the
 `b.kind` / `b.title` passthrough, which is what the code actually produces.
+
+---
+
+## 10. Amendment, 2026-11-18: the bubbles became outlines
+
+The survey described a design that has since changed once, in the direction it was
+written to inform: tinted fills are out, coloured outlines are in. The decision
+record is `docs/parallel-sessions.md` §8.13. This section is where **this** file
+was edited to stay true, and what it means for reading the rest of it.
+
+**Rewritten in place.** §2.4 - a bubble is an opaque theme surface inside a
+stroked frame, and the hues are `bubbleAccent` at full intensity rather than
+`blendOnto` at 16-20%. §2.5 - outline width and interior added, several citations
+moved. §4 - the string-keyed coupling now describes the outline (and a rename
+loses more than it used to), and the test-idiom paragraph records that the suite
+can assert on painted pixels. §5.14 - the decision itself. §6 - tinted fills are
+now on the rejected list, so they do not come back as a fresh idea. §7 - the
+README is no longer wrong about a stroke, the grey fall-through is a shared
+neutral frame, `areaColor` is a decision with a test rather than dead code, and
+the untested list shrank by exactly one item. §8 - the colour, frame, geometry
+and mockup rows.
+
+**Load-bearing and unchanged.** §2.3's gutter. `scrollbarGutter()` (`:316`) is why
+the mockup command had to be fixed: its first version stacked every card's right
+edge - and every scrollable card's own bar - on top of the transcript scrollbar,
+which is the mis-grab this file describes in §2.3 as "a coin flip on which
+scrollbar answers." Production had a test for it (`TestGUICardsLeaveScrollbarGutter`)
+and the tool did not, so the wrong thing rendered at full size and looked like the
+design. `TestGUIMockupLeavesScrollbarGutter` closes that.
+
+**Two things this file got right in advance.** §4's "the honesty rule" is why the
+interior stayed opaque instead of going transparent, and why a stroke has a
+floor: a colour that is assigned correctly and painted invisibly is the failure
+mode this codebase has been bitten by repeatedly, and `A: 0xff` on every accent
+literal plus the pixel test are the answer to it. §7's note that no test asserted
+anything a painter does is now, in this one corner, out of date - see §4.
+
+**Citation drift.** `ui/fyneview.go` grew from 2,123 to 2,163 lines. Citations
+below `:1195` are unaffected and still exact; in the bubble and area region every
+number in this file was re-read off the current tree (`bubbleAccent` `:1225`,
+`bubbleSurface` `:1245`, `bubbleOutline` `:1252`, `bubbleStrokeWidth` `:1265`,
+`bubble.points` `:1303`, `areaColor` `:1404`, `areaCard` `:1410-1439`,
+`cardHeaderText` `:1443-1455`, `transcriptGrid` `:1500-1509`, plus the four
+`"LLM output"` sites `:1172, :1230, :1565, :1644`); a citation elsewhere in the
+file that lands after those is short by up to 40. The §9 rule is not withdrawn:
+open the file before trusting a number.
