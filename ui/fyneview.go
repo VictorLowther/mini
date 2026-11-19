@@ -1192,53 +1192,78 @@ func quitKeyName() string {
 //
 // The transcript's message areas are speech bubbles in the style of
 // apptrix.org/components/widget/chat (the Fyne add-ons gallery chat widget
-// that defines this UI's reference look): an opaque rounded body with a tail
-// flaring to a point on the sender's side. The fills here are theme-derived
-// instead of hardcoded so light and dark variants both read. Opaque matters
-// as much as the widget: the first cut used low-alpha fills on a raw canvas
-// rectangle and rendered effectively invisible.
+// that defines this UI's reference look): a rounded body with a tail flaring to
+// a point on the sender's side.
+//
+// The kind is carried by a coloured **outline**, not by a tinted fill. The
+// fills were each accent blended 16-20% onto the theme background, which asked
+// the reader to decode a surface hue while reading the text sitting on it; side
+// by side the pale tints were near-identical at a glance and only the violet
+// was nameable. Outlines take the same hues at full intensity and leave the
+// interior the plain theme surface, so body text sits on one background
+// throughout the transcript and the colour lives where it costs nothing.
+//
+// Opaque still matters as much as the widget did: the first cut used low-alpha
+// fills on a raw canvas rectangle and rendered effectively invisible. That
+// failure is why the interior is a solid surface rather than nothing, and why
+// the stroke has a floor - see bubbleSurface and bubbleStrokeWidth.
 
-// bubbleFill is an opaque, clearly-distinct surface per message kind. It
-// blends a fixed accent hue onto the theme background rather than using
-// theme colour names directly: ColorNamePrimary (user) and
-// ColorNameHyperlink (LLM output) are both blue in the default theme and the
-// faint foreground tints of thinking/tool blended into the background until
-// they read as "no bubble at all". These hues are far apart (blue, violet,
-// green, amber, slate) so the five kinds are tellable at a glance on both
-// light and dark variants, and blended at an alpha that reads as a raised
-// surface, not wallpaper.
+// bubbleAccent is each kind's hue. The hues are the ones the tinted design
+// already used; what changed is that they are painted at full intensity instead
+// of blended down. They stay far apart (blue, violet, green, amber, slate) so
+// the five kinds are tellable at a glance on both theme variants, and they are
+// fixed rather than theme colour names for the reason that has not changed:
+// ColorNamePrimary (user) and ColorNameHyperlink (LLM output) are both blue in
+// the default theme, so two kinds would share a colour by construction.
+//
+// Every entry names A: 0xff explicitly and that is not decoration. As blend
+// inputs these hues went through blendOnto, which set alpha on the result and
+// never read it, so a zero alpha here was harmless - and a three-field literal
+// silently produces one. Painted straight as a stroke, that same zero is a
+// fully transparent line: the bubble is there, the frame is invisible, and
+// nothing fails. Opaque is the property, exactly as it was for the fills.
 var bubbleAccent = map[string]color.NRGBA{
-	"user":       {R: 0x3b, G: 0x82, B: 0xf6}, // blue
-	"harness":    {R: 0xe0, G: 0x8a, B: 0x14}, // amber
-	"thinking":   {R: 0x8a, G: 0x93, B: 0xa6}, // slate
-	"tool call":  {R: 0x2f, G: 0xa9, B: 0x5c}, // green
-	"LLM output": {R: 0x8b, G: 0x5c, B: 0xf6}, // violet
+	"user":       {R: 0x3b, G: 0x82, B: 0xf6, A: 0xff}, // blue
+	"harness":    {R: 0xe0, G: 0x8a, B: 0x14, A: 0xff}, // amber
+	"thinking":   {R: 0x8a, G: 0x93, B: 0xa6, A: 0xff}, // slate
+	"tool call":  {R: 0x2f, G: 0xa9, B: 0x5c, A: 0xff}, // green
+	"LLM output": {R: 0x8b, G: 0x5c, B: 0xf6, A: 0xff}, // violet
 }
 
-// bubbleFill's blend weights: the response surface is the most common, so it
-// stays a touch subtler; the coloured kinds get a bit more presence.
-func bubbleFill(label string) color.Color {
-	bg := theme.Color(theme.ColorNameBackground)
-	accent, ok := bubbleAccent[label]
-	if !ok {
-		return blendOnto(bg, color.NRGBA{R: 0x6b, G: 0x72, B: 0x80}, 0x18)
+// bubbleNeutral is the outline for every kind without a hue of its own: notes,
+// the exit marker, errors, system blocks and the free-form compaction titles.
+// Unlabelled feedback is meant to recede behind the five kinds that carry
+// meaning, and it does: uncoloured text on a plain background needs its frame
+// to be the least assertive thing in the row.
+var bubbleNeutral = color.NRGBA{R: 0x6b, G: 0x72, B: 0x80, A: 0xff} // slate
+
+// bubbleSurface is a bubble's interior: the theme background, uncoloured and
+// opaque. Uncoloured because the outline is the kind marker now. Opaque because
+// a bubble is not the only thing under a transcript row - the scroll's padding
+// rectangles and whatever the row did before it paint first - so a transparent
+// interior showed them through the body.
+func bubbleSurface() color.Color { return theme.Color(theme.ColorNameBackground) }
+
+// bubbleOutline is a kind's stroke colour: the same hue the fill used, turned up
+// to full strength. "Same colour, brighter" is the whole redesign - a hue at 20%
+// onto the background reads as a slightly warm grey, and an outline that faint
+// is indistinguishable from the neutral ones, which is how the five kinds stop
+// being five.
+func bubbleOutline(label string) color.Color {
+	if accent, ok := bubbleAccent[label]; ok {
+		return accent
 	}
-	alpha := uint8(0x33)
-	if label == "LLM output" {
-		alpha = 0x2a
-	}
-	return blendOnto(bg, accent, alpha)
+	return bubbleNeutral
 }
 
-// blendOnto composites accent over base at alpha (0-255) and returns an
-// opaque colour.
-func blendOnto(base, accent color.Color, alpha uint8) color.NRGBA {
-	b := color.NRGBAModel.Convert(base).(color.NRGBA)
-	a := color.NRGBAModel.Convert(accent).(color.NRGBA)
-	mix := func(x, y uint8) uint8 {
-		return uint8((uint32(x)*(255-uint32(alpha)) + uint32(y)*uint32(alpha)) / 255)
-	}
-	return color.NRGBA{R: mix(b.R, a.R), G: mix(b.G, a.G), B: mix(b.B, a.B), A: 255}
+// bubbleStrokeWidth is the outline's weight: half the theme padding, so it
+// scales with the theme like every other spatial value in this file. The floor
+// of one point is deliberate and is the second hard pixel here (the other is the
+// tip softening in points): a stroke that rounds down to nothing is the
+// invisible-bubble failure this section has been burned by twice, and that is
+// worth more than theme purity at a padding of one.
+func bubbleStrokeWidth(w fyne.Widget) float32 {
+	return max(theme.SizeForWidget(theme.SizeNamePadding, w)/2, 1)
 }
 
 // bubbleTailDrop/tailBase: how far the tail hangs below the body and how much
@@ -1252,9 +1277,11 @@ func bubbleTailBase(w fyne.Widget) float32 {
 }
 
 // bubble is the speech-bubble background: a rounded body with a tail to a
-// point on the sender's side, filled with an opaque colour. It is a real
-// widget (not a raw canvas shape) so the container renderers treat it like
-// any other object.
+// point on the sender's side, an opaque theme-surface interior and the kind's
+// colour as the outline. It is a real widget (not a raw canvas shape) so the
+// container renderers treat it like any other object, and it is a single
+// ArbitraryPolygon rather than two shapes stacked to fake a border: the Fyne
+// primitive strokes the path itself, in both painters.
 type bubble struct {
 	widget.BaseWidget
 	label string
@@ -1263,8 +1290,13 @@ type bubble struct {
 }
 
 func newBubble(label string, mine bool) *bubble {
-	b := &bubble{label: label, mine: mine, shape: canvas.NewArbitraryPolygon(nil, bubbleFill(label))}
+	shape := canvas.NewArbitraryPolygon(nil, bubbleSurface())
+	shape.StrokeColor = bubbleOutline(label)
+	b := &bubble{label: label, mine: mine, shape: shape}
 	b.ExtendBaseWidget(b)
+	// StrokeWidth is left to Layout: it is a theme lookup against the widget,
+	// and reading it here would ask the base widget for its size before it has
+	// been extended.
 	return b
 }
 
@@ -1311,7 +1343,9 @@ func (r *bubbleRenderer) Layout(s fyne.Size) {
 		return
 	}
 	r.laid = s
-	r.b.shape.FillColor = bubbleFill(r.b.label)
+	r.b.shape.FillColor = bubbleSurface()
+	r.b.shape.StrokeColor = bubbleOutline(r.b.label)
+	r.b.shape.StrokeWidth = bubbleStrokeWidth(r.b)
 	r.b.shape.Points, r.b.shape.CornerRadii = r.b.points(s)
 	r.b.shape.Resize(s)
 	canvas.Refresh(r.b.shape)
@@ -1358,17 +1392,21 @@ func (a *area) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(a.stack)
 }
 
-// areaColor is each kind's header colour. Headers use the bright theme
-// foreground rather than the bubble's own hue: a tinted fill under
-// same-hue text (blue on blue, amber on amber, disabled-grey on slate) was
-// near-unreadable, and the reference look keeps the header legible above the
-// body while the fill carries the colour. Foreground reads on every tint and
-// is one step brighter than the dimmed body text.
+// areaColor is each kind's header colour, and the answer is the same for every
+// kind: the plain theme foreground. Under a tinted fill this was a readability
+// fix (same-hue text on same-hue surface - blue on blue, amber on amber - was
+// near-unreadable). With the outline carrying the kind it is a redundancy fix:
+// a coloured header would say again what the frame already said, in a place
+// where it competes with the text. The parameter stays so a future per-kind
+// header colour is one function rather than a fourth stringly-coupled site; it
+// ignoring its argument today is the honest shape of "no per-kind header
+// colour", not a half-finished tint.
 func areaColor(string) fyne.ThemeColorName { return theme.ColorNameForeground }
 
-// areaCard builds one transcript text area for a message kind: an opaque
-// speech bubble under a header line that names the kind and the message's
-// tokens, generation time and cost, in the body's own font and a kind colour.
+// areaCard builds one transcript text area for a message kind: an outlined
+// speech bubble - opaque theme surface inside, the kind's hue on the frame -
+// under a header line that names the kind and the message's tokens, generation
+// time and cost, in the body's own font.
 func areaCard(label string, m metrics, body fyne.CanvasObject, align fyne.TextAlign) *area {
 	mine := align == fyne.TextAlignTrailing
 	header := widget.NewRichText(&widget.TextSegment{
@@ -1510,8 +1548,10 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 	case "assistant":
 		var cards []fyne.CanvasObject
 		if b.reasoning != "" {
-			// Inside a coloured bubble, foreground text only: the dim styling
-			// that reads well on the plain background is illegible on the tint.
+			// Foreground text, not the dimmed styling notes get. That used to
+			// be because dim grey was illegible on the tinted fill; the fill
+			// is gone and the choice stays, because what marks this card as
+			// reasoning is its slate outline, not a faded type weight.
 			body := mdBody(b.reasoning)
 			if !showThinking {
 				body = plainRT(hiddenThinkingMarker(b.reasoning))
@@ -1519,7 +1559,7 @@ func blockCards(b block, showThinking bool) []fyne.CanvasObject {
 			cards = append(cards, areaCard("thinking", b.stats, body, fyne.TextAlignLeading))
 		}
 		// A tool-call-only turn has empty content: no prose to show, so emit
-		// no LLM output bubble rather than an empty violet box. The turn's
+		// no LLM output bubble rather than an empty violet frame. The turn's
 		// real output is the tool call result that follows.
 		if b.text != "" {
 			cards = append(cards, areaCard("LLM output", b.stats, mdBody(b.text), fyne.TextAlignLeading))

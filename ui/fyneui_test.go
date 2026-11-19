@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/VictorLowther/mini/agent"
@@ -1275,10 +1277,10 @@ func TestGUIEmptyTurnHasNoBubble(t *testing.T) {
 }
 
 // TestGUIAreaHeadersAndAlignment is the design spec in one test: every
-// message kind gets its own opaque speech-bubble area under a header naming
+// message kind gets its own outlined speech-bubble area under a header naming
 // the kind and the message's tokens / generation time / cost (zeros omitted),
-// in the body's own font with a kind colour; text the human typed trails on
-// the right, harness-authored feedback and everything else stays left.
+// in the body's own font; text the human typed trails on the right,
+// harness-authored feedback and everything else stays left.
 func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if got := cardHeaderText("LLM output", metrics{Tokens: 254, Elapsed: 1.5, Cost: 0.03}); got != "LLM output · 254 tok · 1.5s · $0.03" {
 		t.Errorf("header = %q", got)
@@ -1295,8 +1297,11 @@ func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if got := headerText(uc); got != "user" {
 		t.Errorf("user header = %q", got)
 	}
-	if _, _, _, a := fillRGBA(uc); a != 0xffff {
-		t.Errorf("user bubble fill alpha = %#x, want opaque (translucent fills rendered invisible in the real driver)", a)
+	if _, outline, _ := bubblePaint(uc); !opaque(outline) {
+		t.Error("user bubble outline must be opaque: a hue with no alpha paints an invisible frame")
+	}
+	if fill, _, _ := bubblePaint(uc); !sameColor(fill, theme.Color(theme.ColorNameBackground)) {
+		t.Error("a bubble's interior must be the plain theme surface - the outline carries the kind now")
 	}
 	wrap, align := bodyTextProps(uc.body)
 	if wrap != fyne.TextWrapWord {
@@ -1319,10 +1324,17 @@ func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if hc.bubble.mine {
 		t.Error("harness feedback must not sit on the user's side")
 	}
-	hr, hg, hbl, _ := fillRGBA(hc)
-	ur, ug, ub, _ := fillRGBA(uc)
-	if hr == ur && hg == ug && hbl == ub {
-		t.Error("harness and user bubbles need distinguishable fills")
+	_, ho, _ := bubblePaint(hc)
+	_, uo, _ := bubblePaint(uc)
+	if sameColor(ho, uo) {
+		t.Error("harness and user bubbles need distinguishable outlines")
+	}
+	// The interiors must NOT differ: one surface for every kind is the whole
+	// point of moving the colour into the frame.
+	hf, _, _ := bubblePaint(hc)
+	uf, _, _ := bubblePaint(uc)
+	if !sameColor(hf, uf) {
+		t.Error("kind colours must not leak back into the bubble interiors")
 	}
 	if _, al := bodyTextProps(hc.body); al != fyne.TextAlignLeading {
 		t.Error("harness feedback must be left-justified")
@@ -1351,6 +1363,69 @@ func TestGUIAreaHeadersAndAlignment(t *testing.T) {
 	if seg := uc.header.Segments[0].(*widget.TextSegment); seg.Style.TextStyle.Bold || seg.Style.SizeName != "" {
 		t.Error("area header must use the body's font, unstyled")
 	}
+
+	// And no kind colour either, for every kind: the outline is the marker, and
+	// a coloured header would repeat it where it competes with the text. Pinned
+	// because areaColor takes a kind label and ignores it - which reads as
+	// unfinished work unless a test says it is a decision. The day a per-kind
+	// header hue is wanted, that function is the one place to make it and this
+	// assertion is the thing that has to change on purpose.
+	for _, a := range []*area{uc, hc, asst[0].(*area), asst[1].(*area), tool[0].(*area)} {
+		if got := headerColor(a); got != theme.ColorNameForeground {
+			t.Errorf("header of %q is %q, want the plain foreground", headerText(a), got)
+		}
+	}
+}
+
+// TestGUIBubbleOutlinesPaint is the only check that a colour decision became a
+// painted line. Setting StrokeColor on a polygon is not the same as drawing a
+// frame, and there are two ways to get it wrong with every field looking right:
+// a hue with no alpha (the accent literals are three-field composites, so A
+// silently defaults to 0), and a stroke width that rounds under a pixel. The
+// first cut of tinted fills rendered effectively invisible for exactly this
+// class of reason, so this renders a real area through a painter and reads the
+// pixels back - and it also pins the redesign itself: the hue must form a ring
+// around the card, never a surface inside it.
+func TestGUIBubbleOutlinesPaint(t *testing.T) {
+	test.NewApp()
+
+	uc := blockCards(block{kind: "user", text: "hello there my friend"}, false)[0].(*area)
+	win := test.NewWindow(uc)
+	win.Resize(fyne.NewSize(260, 70))
+	img := win.Canvas().Capture()
+	bd := img.Bounds()
+
+	if w := uc.bubble.shape.StrokeWidth; w < 1 {
+		t.Errorf("stroke width = %v, want at least a point (a hairline frame is the invisible bubble again)", w)
+	}
+
+	want := bubbleAccent["user"]
+	edge, centre := 0, 0
+	x1, x2 := bd.Min.X+bd.Dx()*2/5, bd.Min.X+bd.Dx()*3/5
+	y1, y2 := bd.Min.Y+bd.Dy()*2/5, bd.Min.Y+bd.Dy()*3/5
+	for y := bd.Min.Y; y < bd.Max.Y; y++ {
+		for x := bd.Min.X; x < bd.Max.X; x++ {
+			if !sameColor(img.At(x, y), want) {
+				continue
+			}
+			if x >= x1 && x < x2 && y >= y1 && y < y2 {
+				centre++
+			} else {
+				edge++
+			}
+		}
+	}
+	if edge == 0 {
+		t.Error("the outline painted nothing: not one pixel of the kind's accent hue reached the canvas")
+	}
+	if centre > 0 {
+		t.Errorf("%d accent pixels sit in the middle of the card: the interior is filled with the kind colour again", centre)
+	}
+	// A frame is a small fraction of the card's pixels. If the hue ever covers
+	// most of the area, whoever did it put the colour back in the background.
+	if total := bd.Dx() * bd.Dy(); edge*4 > total {
+		t.Errorf("%d accent pixels is more than a quarter of the card (%d): that is a fill, not an outline", edge, total)
+	}
 }
 
 func headerText(a *area) string {
@@ -1361,10 +1436,35 @@ func headerColor(a *area) fyne.ThemeColorName {
 	return a.header.Segments[0].(*widget.TextSegment).Style.ColorName
 }
 
-// fillRGBA returns a bubble's paint colour; opaque is the property that made
-// the first cut invisible, so tests read it directly.
-func fillRGBA(a *area) (r, g, b, alpha uint32) {
-	return a.bubble.shape.FillColor.RGBA()
+// bubblePaint returns how an area's bubble will paint: interior colour,
+// outline colour and outline weight. Tests used to read FillColor alone,
+// because the fill *was* the kind marker; now the fill is the theme surface for
+// every kind and reading it proves nothing, so the assertions sit on the stroke
+// - which is also where an invisible bubble would come from this time.
+func bubblePaint(a *area) (fill, outline color.Color, stroke float32) {
+	sh := a.bubble.shape
+	return sh.FillColor, sh.StrokeColor, sh.StrokeWidth
+}
+
+// sameColor compares two colours by their painted values, not their types: a
+// theme lookup and a literal NRGBA of the same hue must read as equal.
+func sameColor(x, y color.Color) bool {
+	if x == nil || y == nil {
+		return x == nil && y == nil
+	}
+	xr, xg, xb, xa := x.RGBA()
+	yr, yg, yb, ya := y.RGBA()
+	return xr == yr && xg == yg && xb == yb && xa == ya
+}
+
+// opaque reports whether a colour will actually paint: the failure this file
+// keeps recording is a colour that is set correctly and drawn invisibly.
+func opaque(c color.Color) bool {
+	if c == nil {
+		return false
+	}
+	_, _, _, a := c.RGBA()
+	return a == 0xffff
 }
 
 // firstArea finds a committed area by kind label.

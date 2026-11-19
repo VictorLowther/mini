@@ -55,11 +55,14 @@ the test suite use.
 ### The window
 
 The transcript is a series of interleaved text areas, one per message type,
-each on a subtly tinted, rounded, bordered card — `user` for text the human
-typed (right-justified, chat-app style), `harness` for feedback the harness
-authored in the user's name (rejections, interruption records, format-error
-prompts — left-justified, so the two never read alike), `thinking`,
-`tool call` (fixed-width command grid), and `LLM output` (markdown). Each
+each a rounded speech bubble outlined in its kind's colour — the outline is
+what says which kind a card is, and the interior stays the plain theme surface.
+`user` for text the human typed (right-justified, chat-app style, blue),
+`harness` for feedback the harness authored in the user's name (rejections,
+interruption records, format-error prompts — left-justified and amber, so the
+two never read alike), `thinking` (slate), `tool call` (green, fixed-width
+command grid), and `LLM output` (violet, markdown). Notes, errors and the exit
+marker take the neutral frame. Each
 area's header uses the body's own font and names its kind plus the message's
 generated token count, generation time, and cost when non-zero
 (`LLM output · 254 tok · 3.1s · $0.02`). The input box stays live whenever
@@ -92,3 +95,4 @@ runs headless against an injected test app — no display needed:
 ```bash
 go test ./...
 ```
+
