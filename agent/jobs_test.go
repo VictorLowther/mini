@@ -541,8 +541,12 @@ func TestStepBoundaryDeliversAnUnseenEnding(t *testing.T) {
 	if isJobWake(l.messages[len(l.messages)-1]) {
 		t.Error("a wake landed after the exit row")
 	}
+	// The record, not the output: id, state, exit, path, counts, guidance. `echo
+	// bye` writes one line, so the guidance reads it whole rather than tailing
+	// it, and the body itself stays in the file.
 	for _, want := range []string{"job j1 ended: completed", "exit 0", "while you were working on something else",
-		"read it with: tail -n 100", "Nothing else is running"} {
+		"-------------------- job j1 --------------------",
+		"1 line, 4 bytes", "read it with: cat", "Nothing else is running"} {
 		if !strings.Contains(wakes[0], want) {
 			t.Errorf("wake missing %q:\n%s", want, wakes[0])
 		}

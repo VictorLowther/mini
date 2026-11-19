@@ -668,12 +668,16 @@ func TestSpawnRunsAChildAndReportsToItsParent(t *testing.T) {
 		t.Fatal("the agent row is still running after the child reported")
 	}
 
-	// The report text reached the parent's conversation - not a pointer to it.
-	// A parent that had to spend a turn reading a file to learn what its child
-	// found out hands back exactly the cost the child was meant to save.
+	// What reaches the parent's conversation is the record of the ending: the id,
+	// how it ended, what it was called, where the report is, and how big it is.
+	// It is not the report body. That was the old contract, argued on the cost of
+	// a turn spent fetching the answer, and it held while a wake carried one job;
+	// a boundary now carries the whole pending set, so eight of them inlining
+	// their bodies would spend the parent's context on a message nobody asked
+	// for. The counts are what make the read a decision instead of a guess.
 	var saw string
 	for _, m := range parent.Loop.Messages() {
-		if c := fmt.Sprint(m["content"]); strings.Contains(c, "REPORT: wrote child.txt") {
+		if c := fmt.Sprint(m["content"]); strings.Contains(c, "job "+row.ID+" ended") {
 			saw = c
 		}
 	}
@@ -681,10 +685,19 @@ func TestSpawnRunsAChildAndReportsToItsParent(t *testing.T) {
 		for _, m := range parent.Loop.Messages() {
 			t.Logf("msg role=%v: %.140s", m["role"], m["content"])
 		}
-		t.Fatal("the subagent's report never reached the parent's conversation")
+		t.Fatal("the subagent's ending never reached the parent's conversation")
 	}
 	if !strings.Contains(saw, "explore repo") {
 		t.Errorf("the wake does not name the subagent it is about: %.200s", saw)
+	}
+	if !strings.Contains(saw, row.OutputPath) {
+		t.Errorf("the wake must point at the report file: %s", saw)
+	}
+	if !strings.Contains(saw, "bytes,") {
+		t.Errorf("the wake must size the output so the parent can choose a read: %s", saw)
+	}
+	if strings.Contains(saw, "REPORT: wrote child.txt") {
+		t.Errorf("the wake inlined the report body; it carries a path now:\n%s", saw)
 	}
 
 	// And the full report is in the row's own file, where `jobs` points.

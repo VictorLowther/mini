@@ -224,7 +224,8 @@ func (s *Session) childRunner(child *Session, prompt string) func(context.Contex
 			report = endingOf(child, lastInfo)
 		}
 		// The full report goes in the job's own file, where `jobs` already points
-		// and nothing truncates it; the parent's wake carries the capped body.
+		// and nothing truncates it; the parent's wake carries the path and the
+		// counts, and the parent reads the body when it wants it.
 		fmt.Fprint(out, report)
 		code := 0
 		return job.Result{ExitCode: &code, Reason: reportOf(report)}
@@ -385,7 +386,8 @@ func reportOf(report string) string {
 		// U+FFFD. The byte-length test above keeps the common ASCII case free of
 		// the conversion. Everything else in mini that truncates for the model -
 		// agent.oneLine, session.trunc, compaction's own cut - already counts
-		// runes; this and readJobBody were the two that did not.
+		// runes; of the two that did not, this is now the only one left, since a
+		// delivery stopped inlining a report body and so stopped cutting one.
 		if rr := []rune(r); len(rr) > 200 {
 			return string(rr[:200]) + "..."
 		}

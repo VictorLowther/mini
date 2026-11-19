@@ -6,6 +6,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/VictorLowther/mini/config"
 	"github.com/VictorLowther/mini/env"
@@ -591,8 +591,16 @@ func (l *Loop) killObservation(action model.Action, sink io.Writer) env.Result {
 const wakeLimit = 8
 
 // jobWake drains the firing queue into the message the design promises: one
-// appended user message at a step boundary, a digest per firing, bounded, and
-// never an edit to anything already in history.
+// appended user message at a step boundary, bounded, holding one delivery section
+// per firing, and never an edit to anything already in history.
+//
+// The batch is what the shape is for. Every ending still owed at this boundary
+// goes into the same message, each in its own labelled section, so eight jobs
+// that finished during one turn cost one turn of attention rather than eight
+// messages and eight holes in the transcript. That is only readable because a
+// delivery is self-contained - id, exit, path, counts, guidance - so the sections
+// concatenate in any order and any one of them survives being quoted back or
+// clipped without losing which job it reported.
 //
 // It returns zero or one message - an empty slice when there is nothing to say,
 // because a wake that says nothing costs a message, a turn of attention, and a
@@ -620,15 +628,22 @@ func (l *Loop) jobWake() []model.Message {
 	}
 	var b strings.Builder
 	if len(fire) == 1 {
-		b.WriteString("A background job ended while you were working on something else.\n\n")
+		b.WriteString("A background job ended while you were working on something else.\n")
 	} else {
-		fmt.Fprintf(&b, "%d background jobs ended while you were working on something else.\n\n", len(fire))
+		fmt.Fprintf(&b, "%d background jobs ended while you were working on something else.\n", len(fire))
 	}
+	// The pending set is concatenated into this one message rather than appended
+	// as one message per job: the model sees every ending in a single turn, and
+	// the transcript keeps one harness-authored hole instead of one per job. Each
+	// record carries the facts the others do not - id, exit, path, counts - which
+	// is what lets a section be read on its own, quoted back, or survive a front
+	// end clipping the message, without losing which job it was about.
 	for _, f := range fire {
 		row := f.Job
-		describeEndedJob(&b, &row)
-		b.WriteString("\n")
+		b.WriteString(wakeSection(row.ID))
+		b.WriteString(jobDelivery(&row))
 	}
+	b.WriteString("\n")
 	if still := l.Jobs.StillRunning(); still > 0 {
 		fmt.Fprintf(&b, "%d other job(s) still running: call jobs to list them or job_kill to stop one. \n", still)
 		b.WriteString("Do not poll their logs - you will be told when each one ends.\n")
@@ -648,93 +663,190 @@ func (l *Loop) jobWake() []model.Message {
 	}}
 }
 
-// describeEndedJob is the salient detail set: what it was, how it ended, how long
-// it ran, and where its bytes are - the four things needed to decide the next
-// move without another call. The monitor wakes will reuse it verbatim, which is
-// why it is a function and not a few lines inside the wait.
-func describeEndedJob(b *strings.Builder, j *session.JobRow) {
-	fmt.Fprintf(b, "job %s ended: %s after %s", j.ID, j.State, jobAge(*j))
+// jobDelivery is one ended job's half of a wake: the record of an ending that
+// happened while the model was busy elsewhere, and nothing else. It carries the
+// facts that decide the next move - which job, how it ended, how long it ran,
+// where its bytes are, and how many of them there are - and then the guidance
+// for reading the file itself.
+//
+// It does not carry the output. An earlier version inlined a subagent's report
+// body up to the observation window, on the argument that making the parent pay
+// a turn to fetch the answer handed back the cost the child was meant to save.
+// That reasoning held only while a wake was a one-job event. A boundary now
+// reports the whole pending set at once, so applying it eight times over turns
+// the design's cheapest message into eight bodies, competes with the live
+// transcript for the context window, and spends it on jobs the model may not
+// care about - and the one kind it never applied to, a bash job, was already
+// just a pointer. So the delivery is uniform: a pointer for every kind, with the
+// counts that make reading it a decision instead of a guess. "142 lines, 9 KB"
+// says the whole thing fits in one read; "410 thousand lines, 900 MB" says do not
+// read this, grep it. The body is not lost, only moved to the one place that can
+// hold all of it: the file, at the path in the record.
+//
+// It returns a string rather than writing into a builder, because a delivery is
+// now a unit that gets concatenated - see jobWake - and a function with a
+// builder in its signature cannot be joined to anything. A monitor firing will
+// want the same record for the same reason, which is why it is a function at all
+// and not a few lines inside the wake.
+func jobDelivery(j *session.JobRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "job %s ended: %s after %s", j.ID, j.State, jobAge(*j))
 	switch {
 	case j.ExitCode != nil && *j.ExitCode != 0:
-		fmt.Fprintf(b, " (exit %d)", *j.ExitCode)
+		fmt.Fprintf(&b, " (exit %d)", *j.ExitCode)
 	case j.ExitCode != nil:
 		b.WriteString(" (exit 0)")
 	case j.State == session.JobKilled:
 		b.WriteString(" (killed; no exit code - the run was interrupted, not finished)")
 	}
 	if j.ExitReason != "" && j.ExitReason != "killed on request" {
-		fmt.Fprintf(b, "\n  reason=%s", oneLine(j.ExitReason, 120))
+		fmt.Fprintf(&b, "\n  reason=%s", oneLine(j.ExitReason, 120))
 	}
 	if j.Label != "" {
-		fmt.Fprintf(b, "\n  label=%s", j.Label)
+		fmt.Fprintf(&b, "\n  label=%s", j.Label)
 	}
 	if j.Command != "" {
-		fmt.Fprintf(b, "\n  cmd=%s", oneLine(j.Command, 200))
+		fmt.Fprintf(&b, "\n  cmd=%s", oneLine(j.Command, 200))
 	}
-	fmt.Fprintf(b, "\n  out=%s", j.OutputPath)
-	if size, age, ok := jobFileStat(j.OutputPath); ok {
-		fmt.Fprintf(b, "  (%s, last write %s)", size, age)
+	info := jobOutputStat(j.OutputPath)
+	fmt.Fprintf(&b, "\n  out=%s", j.OutputPath)
+	if !info.Exists {
+		b.WriteString("  (no file at that path: the job ended before writing anything)")
+	} else {
+		fmt.Fprintf(&b, "  (%s)", info.String())
 	}
-	// A subagent's ending is its report, and the report has to arrive in the
-	// wake rather than one turn later after a read: the whole value of spawning
-	// is that a second context does work this one cannot hold, and paying a turn
-	// to fetch the answer would give the cost back. A bash job's ending is
-	// instead a pointer, because a build log is not something to paste.
-	//
-	// Both follow the same truncate-and-spill rule as any other observation -
-	// body inline up to the window, path for the rest - so the design's one
-	// output shape holds for a kind that had not been imagined when it was
-	// written (docs/parallel-sessions.md "Report contract").
-	if j.Kind == session.KindSubagent {
-		if body, ok := readJobBody(j.OutputPath, model.MaxViewChars); ok {
-			fmt.Fprintf(b, "\n\n%s\n", body)
-			if strings.HasSuffix(body, "(truncated)") {
-				fmt.Fprintf(b, "  the full report is in %s\n", j.OutputPath)
-			}
-			return
-		}
-		fmt.Fprintf(b, "  (the subagent left no report in %s)\n", j.OutputPath)
-		return
-	}
-	fmt.Fprintf(b, "\n  read it with: tail -n %d %s   (or grep -n PATTERN %s)\n",
-		model.MaxViewLines, j.OutputPath, j.OutputPath)
+	fmt.Fprintf(&b, "\n%s\n", jobReadGuidance(j, info))
+	return b.String()
 }
 
-// readJobBody returns the first n bytes of a job's output file, marked as
-// truncated when there is more. Head rather than tail: a report leads with its
-// answer, while a build log - the other kind of job file - ends with it, which
-// is why the two cases above do not share this helper's excerpt rule.
-func readJobBody(path string, n int) (string, bool) {
+// jobOutputInfo is what a job's output file amounts to. Bytes and lines are
+// exact as far as the scan got - Short says when it did not - and Age is the
+// file's own, so an empty log, a stalled one, and a finished one are three
+// different answers rather than one path and a hope.
+type jobOutputInfo struct {
+	Exists bool
+	Lines  int64
+	Bytes  int64
+	Age    string
+	Short  error
+}
+
+func (i jobOutputInfo) String() string {
+	if !i.Exists {
+		return "no output file"
+	}
+	s := fmt.Sprintf("%s, %s, last write %s", countOf(i.Lines, "line"), countOf(i.Bytes, "byte"), i.Age)
+	if i.Short != nil {
+		s += fmt.Sprintf(", counts stop here: %v", i.Short)
+	}
+	return s
+}
+
+// jobOutputStat counts a job's output bytes and lines.
+//
+// Only a delivery calls it, and that is the whole reason it exists next to
+// jobFileStat rather than replacing it: the listing runs over every row in the
+// registry, where a line count would be a full scan per job over logs that are
+// routinely hundreds of megabytes, and jobFileStat's comment says so. A wake
+// counts at most wakeLimit files, and it counts them because the model is about
+// to decide whether to read them - which is exactly when the line count stops
+// being a luxury and becomes the answer to the question being asked.
+//
+// The scan is streaming over a fixed buffer, so no file is ever held in memory
+// and the cost is one pass of disk bandwidth. Lines counts newline-terminated
+// lines plus a final partial one, so a report that does not end in a newline
+// still reports the line it has; that can be one above what `wc -l` says, and
+// the figure is meant to size a read, not to agree with a shell builtin.
+//
+// A read that fails halfway reports what was confirmed and names the error in
+// Short rather than passing off a truncated scan as a complete count.
+func jobOutputStat(path string) jobOutputInfo {
+	var info jobOutputInfo
 	if path == "" {
-		return "", false
+		return info
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false
+		return info
 	}
 	defer f.Close()
-	buf := make([]byte, n+1)
-	read, _ := io.ReadFull(f, buf)
-	if read == 0 {
-		return "", true
+	info.Exists = true
+	if st, err := f.Stat(); err == nil {
+		info.Age = time.Since(st.ModTime()).Truncate(time.Second).String()
+	} else {
+		info.Age = "unknown"
 	}
-	if read > n {
-		// Cut the raw bytes at n and trim after, so the bound cannot exceed the
-		// slice it is applied to - trimming first and then slicing by the
-		// untrimmed length is how this panics on a report that ends in newlines.
-		end := n
-		// A-9: the budget is in bytes and the file is UTF-8, so n can land in
-		// the middle of a rune. Back off to the last boundary that starts one -
-		// dropping the straddling character rather than emitting half of it as
-		// U+FFFD to the model. ASCII takes no iterations, so the common case
-		// costs nothing, and this leaves the byte budget as the unit it is
-		// written in instead of quietly redefining it as a rune count.
-		for end > 0 && !utf8.RuneStart(buf[end]) {
-			end--
+	const chunk = 256 << 10
+	buf := make([]byte, chunk)
+	var last byte
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			info.Bytes += int64(n)
+			info.Lines += int64(bytes.Count(buf[:n], jobNewline))
+			last = buf[n-1]
 		}
-		return strings.TrimRight(string(buf[:end]), "\n") + "\n(truncated)", true
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				info.Short = err
+			}
+			break
+		}
 	}
-	return strings.TrimRight(string(buf[:read]), "\n"), true
+	if info.Bytes > 0 && last != '\n' {
+		info.Lines++
+	}
+	return info
+}
+
+var jobNewline = []byte{'\n'}
+
+// jobReadGuidance is the "so how do I look at this" line, and it is why the
+// counts are in the record at all: with no body inline, the guidance is the only
+// way in, so it has to be actionable without a guess beforehand.
+//
+// Two things vary, both from what the file is. A build log ends with its answer,
+// so it is tailed; a subagent's report leads with it, so it is headed - the
+// excerpt rule the inline body used to apply on the model's behalf now shapes the
+// command instead of costing a message. And a file small enough for one read is
+// called what it is, because instructing the model to tail twelve lines is worse
+// than telling it the whole output is right there.
+func jobReadGuidance(j *session.JobRow, info jobOutputInfo) string {
+	if !info.Exists {
+		return "  nothing to read yet: there is no output file at that path."
+	}
+	if info.Bytes == 0 && info.Short == nil {
+		return fmt.Sprintf("  the job wrote nothing: %s is empty.", j.OutputPath)
+	}
+	if info.Short != nil {
+		// The counts are what the scan confirmed before it failed, so the one
+		// thing the guidance must not do is promise a clean read of a file the
+		// harness could not count. The model can still try; it should know the
+		// size figures came with an asterisk.
+		return fmt.Sprintf("  the output could not be counted (%v) - read it with: tail -n %d %s",
+			info.Short, model.MaxViewLines, j.OutputPath)
+	}
+	if info.Lines <= model.MaxViewLines && info.Bytes <= model.MaxViewChars {
+		return fmt.Sprintf("  read it with: cat %s   (the whole output is %s, so one read holds it all)",
+			j.OutputPath, countOf(info.Lines, "line"))
+	}
+	read, end := fmt.Sprintf("tail -n %d", model.MaxViewLines), "last"
+	if j.Kind == session.KindSubagent {
+		// A report leads with its answer; a log ends with it.
+		read, end = fmt.Sprintf("sed -n '1,%dp'", model.MaxViewLines), "first"
+	}
+	return fmt.Sprintf("  read it with: %s %s   (or grep -n PATTERN %s for the %s %d lines)",
+		read, j.OutputPath, j.OutputPath, end, model.MaxViewLines)
+}
+
+// wakeSection is the seam between two delivered jobs in one message. A boundary
+// reports the whole pending set, and a concatenation without seams reads as one
+// long job that mentions several ids, so each section is introduced by a rule
+// naming the job it opens. Naming it twice - in the separator and again in the
+// first line of the record - is deliberate: a section quoted back, or clipped by
+// a front end, still says which job it belongs to.
+func wakeSection(id string) string {
+	return "\n" + strings.Repeat("-", 20) + " job " + id + " " + strings.Repeat("-", 20) + "\n"
 }
 
 // lastJobSummary picks out the most recent ended job for the "nothing is
@@ -807,6 +919,16 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%.0f KB", float64(n)/(1<<10))
 	}
 	return fmt.Sprintf("%d B", n)
+}
+
+// countOf renders a count with its unit and its plural, because a record that
+// says "1 lines" on the first job of a batch is the kind of detail that makes a
+// model wonder whether the number is trustworthy.
+func countOf(n int64, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
 }
 
 // oneLine keeps a multi-line command from breaking the listing's shape.

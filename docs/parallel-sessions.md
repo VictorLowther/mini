@@ -1796,12 +1796,32 @@ deliberate absence of places is the design:
   four-way select is a real select over wake, context and a watchdog, and the
   watchdog exists so a forgotten server cannot park a goroutine forever; the
   report is whatever the child's eventual quiescent turn says.
-- **The report body rides the wake.** `describeEndedJob` reads an agent row's file
-  and inlines it up to the observation window, path for the rest - same
-  truncate-and-spill rule as every other result. A bash job's ending is a pointer
-  because a build log is not something to paste; a subagent's ending *is* the
-  payload, and making the parent spend a turn fetching it hands back exactly the
-  cost the child was meant to save.
+- **The report body does not ride the wake; the record does.** This bullet ruled
+  the opposite for a while, so it is rewritten with its predecessor named rather
+  than deleted: `describeEndedJob` used to read an agent row's file and inline the
+  body up to the observation window, on the argument that a parent paying a turn
+  to fetch its child's answer hands back exactly the cost the child was meant to
+  save. The argument was sound while a wake reported one job. It cannot survive
+  batching: a boundary drains the whole pending set, so eight jobs ending in one
+  turn made one message out of eight bodies - spent on work the model may not care
+  about, and taken out of the window the live transcript needs. It was also never
+  applied to a bash job, whose ending had always been a pointer, so the design had
+  two shapes for one event.
+  Now there is one: `jobDelivery` reports the job id, how it ended (state and exit
+  code), the output path, and the output's **line and byte counts**, then the
+  guidance for reading the file itself - headed for a subagent report, which leads
+  with its answer, tailed for a log, which ends with it, and `cat` when the counts
+  say one read holds the whole thing. The counts are what make the read a decision
+  instead of a guess, and they are why the turn the old rule was written to save
+  is not simply lost: "3 lines" costs one cheap read, "410k lines" says grep
+  instead of reading. Counting is a streaming scan of at most `wakeLimit` files per
+  boundary, which is precisely the case `jobFileStat` declines - a listing walks
+  every row in the registry, where a line count would be a full pass over logs
+  that run to hundreds of megabytes.
+  Batching follows from the record being self-contained: sections are concatenated
+  into a single wake message, each introduced by a rule naming its job, so a batch
+  costs one turn of attention instead of one per job, and any section quoted back
+  or clipped by a front end still says which job it reported.
 - **A watchdog is not a timer.** Found by re-reading this code, not by a test, and
   worth the space because it is the kind of bug no suite catches: the wrapper's
   30-second belt returned "re-drive now" on every tick, so a child waiting on an
