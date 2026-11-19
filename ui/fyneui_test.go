@@ -731,6 +731,56 @@ func TestGUICardsLeaveScrollbarGutter(t *testing.T) {
 	})
 }
 
+// TestGUIMockupLeavesScrollbarGutter holds the mockup window to the invariant
+// above. The mockup renders through the production card code but lays its own
+// column out, so it can put every card's right edge - and every scrollable
+// card's own bar - exactly on top of the transcript scrollbar while the real app
+// is fine. That is not cosmetic: the window exists so someone can judge the
+// transcript's edges, and a reviewer who cannot tell which bar they are grabbing
+// is judging the wrong thing. It got it wrong once, which is why it is pinned.
+func TestGUIMockupLeavesScrollbarGutter(t *testing.T) {
+	test.NewApp()
+
+	m := newMockup()
+	sc := container.NewVScroll(m.column)
+	win := test.NewWindow(sc)
+	win.Resize(fyne.NewSize(600, 800))
+
+	g := scrollbarGutter()
+	if g <= 0 {
+		t.Fatal("theme reported no scrollbar size")
+	}
+	bodyW := sc.Size().Width
+	if bodyW <= 0 {
+		t.Fatal("the mockup's scroll was never laid out")
+	}
+	if len(m.cards) < 2 {
+		t.Fatalf("the mockup rendered %d cards; it has stopped being a transcript", len(m.cards))
+	}
+	// A tool call is the card that grows a scrollbar of its own. If the samples
+	// ever stop containing one, the whole test quietly stops proving anything.
+	var sawScrolling bool
+	for _, c := range m.cards {
+		if c.label == "tool call" {
+			sawScrolling = true
+		}
+	}
+	if !sawScrolling {
+		t.Error("no tool call card in the samples: nothing here has a scrollbar to collide with")
+	}
+
+	for i, c := range m.cards {
+		if c.area.Size().Width <= 0 {
+			t.Errorf("card %d (%s) was never sized", i, c.label)
+			continue
+		}
+		if right := c.area.Position().X + c.area.Size().Width; right > bodyW-g+0.5 {
+			t.Errorf("card %d (%s) reaches x=%v in a %v viewport: it intrudes on the transcript scrollbar's %v gutter",
+				i, c.label, right, bodyW, g)
+		}
+	}
+}
+
 // TestGUIStreamedTurnRendersLikeTheCommittedTurn: the live preview carries the
 // header from its first chunk and the commit replaces it exactly once.
 func TestGUIStreamedTurnRendersLikeTheCommittedTurn(t *testing.T) {

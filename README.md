@@ -15,6 +15,7 @@ prompts driving agents like the one reading this file.
 | Package | Contents |
 |---|---|
 | `cmd/mini` | The `mini` CLI: flag parsing, config resolution, `mini config` and `mini sessions` subcommands, trajectory output. |
+| `cmd/bubblemock` | Dev-only: opens one card of every transcript kind through `ui`'s real rendering path, with outline weight, outline strength, light/dark and the pre-outline tinted fills on knobs, so an interface change can be looked at. `go run ./cmd/bubblemock`. It is a command and not a test because a Fyne window must be built on the process's main thread — see the comment on `ui.ShowMockup`. |
 | `agent` | The linear query–execute loop (port of `agents/default.py` + interactive control flow): step/cost/wall-time limits, format-error retries, trajectory JSON dumping, and session compaction (`compaction.go`): a rare, cache-reading summary event near the window edge - the live context is otherwise append-only. See `docs/compaction-research.md`. A turn's tool calls are a **batch and run concurrently** — sound because `env.Local` is stateless by contract (one fresh shell per action, so no call can depend on a sibling), and confined to the waiting: opening a call, announcing it to the front end, completing its row and appending to the transcript all stay on the agent goroutine, in issue order. `agent.max_parallel_calls` sizes the fan-out (0 = `agent.DefaultMaxParallelCalls`, negative = the whole batch at once); results are always reported in the order they were issued, whatever order they finished in. |
 | `env` | Command execution. `Local` interprets bash in-process via `mvdan.cc/sh` (so `[[ ]]`, arrays, heredocs behave identically everywhere); `exec_*.go` handle process plumbing per-OS. |
 | `model` | HTTP/SSE client for the sushi server: streaming (`stream.go`), tool-call → action parsing (`actions.go`), cost stats (`stats.go`), the transcript→context projection and token estimation (`compaction.go`), the startup model-info lookup that decides the context window (`info.go`: what `GET /v1/models` reports for this model, else `agent.context_window`, else `model.DefaultContextWindow`), and a scriptable `testmodel`. |
@@ -96,3 +97,9 @@ runs headless against an injected test app — no display needed:
 go test ./...
 ```
 
+The bubble mockup is the one thing that does need a display, since it opens a
+real window on purpose:
+
+```bash
+go run ./cmd/bubblemock
+```
