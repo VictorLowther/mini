@@ -12,7 +12,7 @@ Line numbers refer to `ui/fyneview.go` unless another file is named. This is a
 survey of what exists and why, written before a round of UX changes: no
 recommendations, and §6 lists the ideas the design has already rejected.
 
-**Two of those changes have since landed - read §10 and §11 first.** They record
+**Three of those changes have since landed - read §10, §11 and §12 first.** They record
 what was rewritten in place (the bubble paints an outline, not a tint; and which
 side a card sits on is who spoke, not what the wrapper is named), what is now
 historical, and how far the `fyneview.go` line citations have drifted.
@@ -37,7 +37,7 @@ The code splits **by ownership, not convenience** (`shell.go:19-30`):
 **not** on `UI`, because "forcing an empty method on it and on every test fake to
 satisfy an interface nobody calls it through is the dead-code shape this package
 has been deleting elsewhere" (`ui.go:90-93`). Same reasoning for
-`OnCallOpened` (`interactive.go:267-272`). This is a house idiom: *capability
+`OnCallOpened` (`interactive.go:315-320`). This is a house idiom: *capability
 arrives as an optional seam, and its absence is rendered honestly rather than
 faked.*
 
@@ -187,7 +187,7 @@ kind and ignores it is indistinguishable from unfinished work without one.
 | window size guard | [200, 65536] both sides; +/-0.5 pt compare | `prefs.go:66-67`, `:102`, `:127-133` |
 | settings call bound | 2 s "so a locked DB costs a slow keystroke, not a hung window" | `session/settings.go:30-32` |
 | default window | 960x720 | `prefs.go:59` |
-| panel action elision | 4 shown then `+N more commands`; 6 lines per action | `blocks.go:205-234` |
+| panel action elision | 4 shown then `+N more commands`; 6 lines per action | `blocks.go:219-233` |
 
 Header text carries **no width logic at all**: `cardHeaderText` (`:1452-1464`)
 builds `[]string{label}` and appends each non-zero metric (`%d tok`, `%.1fs`,
@@ -454,7 +454,7 @@ UX pass:
   `TestGUIAreaHeadersAndAlignment`), and which is still the single place a
   per-kind header hue would go; `selectableRT` and `collapseSpaces` have no callers while the invariant
   is duplicated by hand in three places; `limitLabelSteps`/`limitLabelCost`
-  survive the feature that needed them; the `Loop` doc comment (`interactive.go:17`)
+  survive the feature that needed them; the `Loop` doc comment (`interactive.go:19`)
   still promises a limits banner; four `area` fields are written and never read.
 - **Live contradictions in comments:** `blockCards`' header says
   notes/errors/exit "stay plain rows" while the code builds `areaCard` for all
@@ -701,6 +701,9 @@ the model still says *"The user added a new task: ..."*, and so does the prompt
 title (`newTaskTitle`, `slash.go:70`) - **that wording is a prompt decision, not
 a display one**, and it is the next thing to revisit here.
 
+> **Superseded by §12.** The model-facing wrapper is gone from every path; the
+> prompt title is the only wording that still speaks of tasks.
+
 **What stayed harness, on purpose:** rejections, format errors, job updates, a
 parent's message to a child, and "Temporary interruption caught." - a
 cancellation the human chose not to comment on. The test is who wrote the
@@ -721,3 +724,61 @@ report.
 the §8 table's `questionPanel*Mode` row (never re-verified by the §9 pass) names
 constants that do not exist at all, so that row now says so instead of pointing
 nowhere.
+
+---
+
+## 12. Amendment, 2026-11-18: the harness stopped narrating the human's turns
+
+§11 left the wrapper sentences in place and promised to revisit them. The
+survey in `docs/harness-turn-framing.md` settled it: `"The user added a new
+task:"` exists in mini and in its Python ancestor and in **none** of crush, zero,
+oh-my-pi, qwen-code or little-coder, and `extra["interrupt_type"]` never reaches
+the model on either side of the port (`model/sushi.go:296-297`), so the prose was
+the only carrier of facts that already had a better slot. Four changes, one per
+decision in that note:
+
+1. **The ready line sends what was typed, verbatim** (`ui/interactive.go`,
+   `userWords(ans.Text, "UserNewTask")`). It now matches a fresh run, whose
+   `instance_template` is a bare `{{.task}}` - the wrapper had only ever touched
+   later turns, which is what made it an inconsistency rather than a convention.
+2. **An interruption comment is the human's words with no prefix**
+   (`userWords(text, model.KindUserInterruption)`). "Interrupted by user: X" was
+   the harness speaking in the human's slot; the cancellation still reaches the
+   model, as the interrupted calls' results.
+3. **A refusal is reported in the call's result.** `model.Interrupt` gained
+   `Observations []env.Result`, the loop uses them at the `BeforeExecute`
+   failure path (`agent/agent.go`, `refusedObservations`), and each refused
+   action's `exception_info` now reads "action was not executed: refused by the
+   user; do not re-run these commands unchanged". `rejectMessage` and
+   `newTaskMessage` are deleted. Mini had been paying for the same fact twice -
+   `rc -1` in the observation and a narrated user turn.
+4. **A resumed task arrives verbatim**, marked `model.UserTypedKey` (the literal
+   `"user_typed"` moved to `model` so the UI and the loop share one name). The
+   "keep the restatement" half of the plan did not survive implementation: a
+   sentence in the human's slot is either a false claim of authorship or harness
+   prose worn as the human's, and the honest third channel - a system note - has
+   no reliable position because sushi folds every system message after index 0
+   into the head (`chat.zig:95-127`).
+
+Two things the survey taught that are now asserted in tests rather than believed:
+**structure that does not cross the wire needs prose** (zero's `is_error` reaches
+no provider at all - `grep IsError internal/providers/` is empty - so the words
+"not executed" are load-bearing, which is why decision 3 moved them rather than
+deleted them), and **ordering is a wire constraint** - zero's "a user message
+between tool_results breaks strict provider replay". `ui/interactive_test.go`
+pins that ordering for a refusal now, and `ui/fyneui_test.go` refuses an
+assertion its own scripted template could not falsify, in a comment saying so.
+
+Legacy transcripts still render correctly: the §11 subtype fallback keeps a
+wrapped rejection written before this change on the harness's side, and
+`UserNewTask` - whose wrapper could only ever quote the human - on theirs.
+Print mode is still blind to all of it (`Print.Message` labels every user-role
+row `User:`), so the §7 "cannot drift" gap narrows but does not close.
+
+**Citation drift from this change:** `ui/interactive.go` grew ~48 lines at
+`:100`, so `OnCallOpened` moved from the §9-corrected `:267-272` to
+`:315-320` and the `Loop` limits comment is at `:19`, not `:17`;
+`ui/blocks.go` gained the `typed` field, moving the panel-elision citation to
+`:219-233`; `ui/fyneview.go` is **unchanged**, so every `:NNNN` in §2.4, §2.5
+and §8 still resolves. §9's list of previously-corrected citations is left as
+written - it is a record of that pass, not a live index.

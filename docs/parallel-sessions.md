@@ -2583,6 +2583,69 @@ both flows end to end - each checked to fail against the old condition. Mid-run
 steering was already right and still is: it is echoed unwrapped, so the narrower
 truth is that the same keystroke was mislabelled only where a prompt takes it as
 an answer.
+
+### 8.15 The harness stopped narrating the human's turns
+
+`docs/harness-turn-framing.md` surveyed six harnesses and the chat server to
+settle whether the framing sentences §8.14 left standing were doing any work.
+They were not, and four of them are gone.
+
+**What the survey found.** `"The user added a new task:"` exists in mini and in
+`mini-swe-agent` and in none of crush, zero, oh-my-pi, qwen-code or little-coder.
+Every control event that is *about a call* - cancelled, refused, malformed, never
+run - goes into that call's result in all six, usually with a structured field
+beside it (`StopTurn`, `isError`, `Meta[policy_refusal]`, `details.__synthetic`).
+Where harness text must occupy the user slot, it is a directive addressed to the
+model ("do not retry", "retry if still needed") or it is labelled - pi carries
+`attribution: "user" | "agent"` orthogonally to role, qwen wraps injections in
+`<system-reminder>` with a recognizer, crush computes `IsPrompt()` from the
+message's parts. Nobody writes a sentence in the human's voice about what the
+human did. Two corrections worth keeping, because they argue against a naive
+reading: sushi validates the role *vocabulary* but neither tool pairing nor
+alternation, so closing a dangling call is the harness's job; and zero's
+`is_error` reaches no provider at all, so words are genuinely load-bearing - the
+fix is the right slot, not silence.
+
+**The four changes.** The ready line and the interruption comment now send what
+was typed, verbatim, and the `user_typed` marker from §8.14 carries the
+attribution. A refusal is reported per call: `model.Interrupt` gained
+`Observations []env.Result`, the loop feeds them to `FormatObservations` on the
+`BeforeExecute` failure path, and each refused action's `exception_info` says
+"action was not executed: refused by the user; do not re-run these commands
+unchanged". `rejectMessage` and `newTaskMessage` are deleted. A resumed task
+arrives verbatim too, marked with `model.UserTypedKey` - the literal moved to
+`model` so the UI and the loop cannot drift apart on a string.
+
+**A decision that changed during implementation.** §8.14's plan kept a
+session-state restatement on resume. It did not survive contact with the rule: a
+sentence in the human's slot is either a false claim of authorship or harness
+prose wearing the human's, and the honest third channel has no reliable position,
+because sushi folds every system message after index 0 into the head
+(`chat.zig:95-127`). So the resume path sends the task and nothing else. If a
+resumed model turns out to need "you are continuing, not starting", that belongs
+in the system template rendered for the resumed session - a prompt decision, with
+its own evidence requirement, not a message to invent at runtime.
+
+**Why mini was paying twice.** `agent.go` already padded every un-run action with
+`NotExecutedResult()` (`rc -1`) and `model/sushi.go:296-297` strips `extra`
+before the wire, so the narrated user turn duplicated a fact the observation had
+already delivered, in a voice the model could only misattribute.
+
+**Ordering is now a tested property.** zero's warning - "a user message between
+tool_results breaks strict provider replay" - is why the refusal observations are
+appended before the interrupt's messages, and `TestTypedTextRejectsAndReappearsInHistory`
+asserts that order rather than trusting it. Two assertions were *removed* while
+doing this because the scripted models' observation templates render rc and
+output only: an assertion about `exception_info` there could not have failed. The
+reason text is asserted where the template can show it, and a comment in the
+other test says why it is not asserted there.
+
+**Still standing.** `"Temporary interruption caught."`, `"Switched to human
+mode."` and the format-error prompts are harness-authored and render as harness
+cards - correctly, and unchanged. Legacy transcripts still classify through the
+§8.14 fallback. Print mode remains blind to all of it (`Print.Message` labels
+every user-role row `User:`), which is the §7 drift, narrowed but not closed.
+The human-facing prompt still reads "Agent is ready. Type a new task."
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that
