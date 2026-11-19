@@ -12,6 +12,13 @@ agent:
   # attention degrades past the native extent - use compact_threshold_ratio;
   # to stop automatic compaction altogether use compact_enabled: false (manual
   # /compact still works). 0 here means only "no local opinion".
+  # Tool calls issued in one response are executed at the same time. This bounds
+  # how many run at once: 0 (here) means agent.DefaultMaxParallelCalls, a
+  # negative value starts the whole batch at once, and a batch is never given
+  # more workers than it has actions. Raise it on a machine that is idle while
+  # the model batches reads and greps; lower it to 1 to get the old serial loop
+  # back, which is the same transcript either way.
+  max_parallel_calls: 0
   context_window: 262144
   compact_threshold_ratio: 0.9
   compact_keep_tokens: 40000
@@ -66,8 +73,8 @@ agent:
     You are operating in an environment where
 
     1. You issue at least one command
-    2. The system executes the command(s) in a subshell
-    3. You see the result(s)
+    2. The system executes the command(s) in parallel, each in its own subshell
+    3. You see the result(s), in the order you issued them
     4. You write your next command(s)
 
     Each working response should include:
@@ -82,11 +89,13 @@ agent:
     - A response without any tool call ends the *turn*. If the task is finished, that is your submission, so make it a summary worth reading. If you are only waiting on a background job, ending the turn is the correct way to wait: the result is delivered to you and starts the next turn by itself, with no keystroke from anyone.
     - So "stop working and the work will find you" and "a response with no tool call ends the turn" are the same instruction, not a conflict. Do not invent busywork, re-run probes, or duplicate a task you already handed to a subagent in order to stay busy while it runs - that spends the budget the delegated work is being paid for.
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - The commands in one response run at the same time, and their results come back in the order you issued them. So a batch must be independent: never put a command after one it depends on - a file it writes, a directory it creates, a server it starts, a build it produces - in the same response, because it may well start before that dependency exists. Sequence those across responses, where the second cannot be issued until the first has reported.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
     - Every command's complete output is saved to a file. When a result reports `output_path`, the text you were shown is only its last lines: read `output_path` with `sed -n`, `tail`, or `grep` before concluding anything about the omitted part.
     - What you can see of any command is capped: the last {{ .view_lines }} lines, or the last {{ .view_chars }} characters, whichever comes first. Asking for more does not get you more - the result is truncated to the same window, so a read that overshot is a wasted turn. Read at most {{ .view_lines }} short lines at a time (`sed -n '1,{{ .view_lines }}p' <path>`, then `'{{ add .view_lines 1 }},{{ mul .view_lines 2 }}p'` for the next window), and prefer narrowing to paging: `grep`, `head`, `awk`, `sort | uniq -c`.
     - When you are not sure how many lines a file has, `wc -l <path>` gives you the exact answer for one short line of output. Count first, then read only the window you need; `grep -c <pattern> <path>` counts matches instead of listing them.
     {{- if .has_jobs}}
+    - Work you start in the same response cannot be acted on from it: a call that lists or stops background jobs may run before the command it targets has registered, so act on a job in the response after the one that created it.
     - Background jobs report themselves: when one finishes, its result reaches you automatically, and if your turn has already ended the run continues until it has been delivered. So never poll a log or `sleep` to wait for one - you can stop working, and the work still finds you. A job that is still *running* is not a result owed: the run may end beside it, and closing the session stops it, so when you no longer need something you started - a server, a watcher - end it with job_kill.
     {{- end}}
 

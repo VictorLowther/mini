@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,15 +89,30 @@ func (f *fakeRecorder) CompleteToolCall(c model.ToolCall, out model.ToolOutcome)
 }
 
 // spyEnv is the real interpreter with a memory of the writer each command was
-// handed.
+// handed. The lock is not decoration: a batch of actions is executed
+// concurrently, so Execute is now reached from one goroutine per command and the
+// slice it grows would otherwise be written by all of them at once.
 type spyEnv struct {
 	inner   *env.Local
+	mu      sync.Mutex
 	writers []io.Writer
 }
 
 func (s *spyEnv) Execute(ctx context.Context, command, cwd string, out io.Writer) (env.Result, error) {
+	s.mu.Lock()
 	s.writers = append(s.writers, out)
+	s.mu.Unlock()
 	return s.inner.Execute(ctx, command, cwd, out)
+}
+
+// seen returns the writers in the order they were recorded, which under
+// concurrent execution is the order the commands happened to start in and not
+// the order they were issued. Assert against orderedWriters instead when the
+// pairing matters.
+func (s *spyEnv) seenWriters() []io.Writer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]io.Writer(nil), s.writers...)
 }
 
 func (s *spyEnv) TemplateVars() map[string]any { return s.inner.TemplateVars() }
@@ -142,9 +158,13 @@ func TestRecorderSeesEveryTurn(t *testing.T) {
 
 	// The command's bytes went straight into the recorder's file: the writer
 	// is the handle OpenToolCall returned.
-	f, ok := spy.writers[0].(*os.File)
+	ws := spy.seenWriters()
+	if len(ws) == 0 {
+		t.Fatal("Execute was never handed a writer")
+	}
+	f, ok := ws[0].(*os.File)
 	if !ok || len(rec.opens) == 0 || f != rec.opens[0].tc.File {
-		t.Fatalf("Execute did not receive the call's file (writers[0] = %T)", spy.writers[0])
+		t.Fatalf("Execute did not receive the call's file (writers[0] = %T)", ws[0])
 	}
 	b, err := os.ReadFile(rec.opens[0].tc.Path)
 	if err != nil || string(b) != "hi\n" {
@@ -379,13 +399,14 @@ func (p *scratchPeeker) OnMessage(m model.Message) {
 		p.seen["dir"] = p.l.scratchDir
 	}
 	if model.IsToolResult(m) {
-		if _, ok := p.seen["first file"]; !ok && len(p.spy.writers) > 0 {
-			if f, ok := p.spy.writers[0].(*os.File); ok {
+		ws := p.spy.seenWriters()
+		if _, ok := p.seen["first file"]; !ok && len(ws) > 0 {
+			if f, ok := ws[0].(*os.File); ok {
 				p.seen["writer"] = "*os.File"
 				b, _ := os.ReadFile(f.Name())
 				p.seen["first file"] = string(b)
 			} else {
-				p.seen["writer"] = fmt.Sprintf("%T", p.spy.writers[0])
+				p.seen["writer"] = fmt.Sprintf("%T", ws[0])
 			}
 		}
 		if b, err := os.ReadFile(p.l.Cfg.OutputPath); err == nil {

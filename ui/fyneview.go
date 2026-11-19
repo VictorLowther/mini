@@ -722,6 +722,16 @@ func (v *guiView) issueCard(b block) {
 // history, and the settle can arrive a moment before the observation it belongs to.
 // A late result revives the card it was issued into rather than drawing a second
 // card for the same call, which is the promise this function exists to keep.
+//
+// When there is no tool-call id to match on, the fallback pairs by command text -
+// and then the newest match is the wrong answer, because a batch of identical
+// commands has one newest card and N results that all want it. Since the loop
+// reports a batch in issue order, the right pairing is oldest-first: the first
+// unanswered card of the run gets the first result, the second card gets the
+// second, and every call ends up with its own card and its own output. Walking
+// back only over cards that are still open and still carry the same command
+// keeps the run to the batch it came from, so an older unanswered card from a
+// different turn cannot be pulled in as if it were part of it.
 func (v *guiView) openCard(b block) int {
 	for i := len(v.committed) - 1; i >= 0; i-- {
 		c := &v.committed[i]
@@ -732,6 +742,13 @@ func (v *guiView) openCard(b block) int {
 			return i
 		}
 		if b.tcid == "" && b.cmd != "" && c.tcid == "" && c.cmd == b.cmd {
+			for j := i - 1; j >= 0; j-- {
+				d := &v.committed[j]
+				if d.kind != "tool" || d.state == "finished" || d.tcid != "" || d.cmd != b.cmd {
+					break
+				}
+				i = j
+			}
 			return i
 		}
 	}

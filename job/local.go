@@ -156,15 +156,36 @@ func (m *Manager) Launch(s Spec) (*Run, error) {
 		return nil, fmt.Errorf("job: id %q is not path-safe", id)
 	}
 
-	// Adopt the handle before anything is written: the duplicate check costs
-	// nothing when it fires first, and a refusal must not leave a file or a row
-	// describing a run that never existed.
 	r := &Run{id: id, kind: s.kindOrDefault(), output: m.Session.JobPath(id),
 		dir: m.dir(s.Dir), started: time.Now().UnixMilli(), mgr: m, done: make(chan struct{})}
 	if s.Path != "" {
 		r.output = s.Path
 	}
+
+	// The stopper is built BEFORE register publishes the handle, and that order
+	// is the fix for a race, not a stylistic preference. register makes the run
+	// reachable by id from every other goroutine in the process - KillAll walks
+	// the live set, and Run.Hurry/Run.Kill read r.stop with no lock - so a run
+	// published first and fitted with a stopper a few instructions later is a
+	// run that can be asked to die by means it does not have yet. Serial tool
+	// calls almost never hit that window; parallel ones are built to.
+	//
+	// It costs nothing to do first: the cancel function is owned by the kind and
+	// reached only through hurry/stop, so nothing about the run's life changes.
+	ctx, cancel := context.WithCancel(m.background())
+	fn := &funcRun{run: r, cancel: cancel, fn: s.Run}
+	ip := &interpRun{run: r, cancel: cancel}
+	if s.Run != nil {
+		r.stop = fn
+	} else {
+		r.stop = ip
+	}
+
+	// Adopt the handle before anything is written: the duplicate check costs
+	// nothing when it fires first, and a refusal must not leave a file or a row
+	// describing a run that never existed.
 	if err := m.register(r); err != nil {
+		cancel()
 		return nil, err
 	}
 
@@ -193,21 +214,16 @@ func (m *Manager) Launch(s Spec) (*Run, error) {
 			envs[k] = v
 		}
 	}
-	ctx, cancel := context.WithCancel(m.background())
 	if s.Run != nil {
 		// A run that is not a process. Same handle, same done channel, same
 		// watcher contract - and the stopper is cancellation, with no
 		// SIGINT-to-SIGKILL window to wait through, because there is nothing to
 		// signal. That is the package doc's "a kind whose ending is not a process
 		// exit simply has none", made real.
-		agent := &funcRun{run: r, cancel: cancel, fn: s.Run}
-		r.stop = agent
-		go agent.watch(ctx, file, s)
+		go fn.watch(ctx, file, s)
 		return r, nil
 	}
-	run := &interpRun{run: r, cancel: cancel}
-	r.stop = run
-	go run.watch(ctx, file, s, envs)
+	go ip.watch(ctx, file, s, envs)
 	return r, nil
 }
 

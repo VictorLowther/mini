@@ -183,14 +183,36 @@ func formatError(errTemplate, errMsg string, hasToolCalls bool, ctx map[string]a
 	}
 }
 
+// NotExecutedResult is the stand-in for a call that produced no result: the
+// rc -1 and the "action was not executed" text the observation template renders
+// for it. It is exported because there are now two producers. formatObservations
+// pads a short slice with it, and the loop pre-fills every slot of a batch and
+// leaves the unfinished ones holding it - which it can only do if it can name
+// the value.
+//
+// One definition matters because the transcript is read back for the life of the
+// session: a padding the loop renders one way and the model's own padding
+// another is two different answers to "this never ran", and only one of them is
+// in the template's wording.
+func NotExecutedResult() env.Result {
+	return env.Result{ReturnCode: -1, ExceptionInfo: "action was not executed"}
+}
+
 // formatObservations is the port of format_toolcall_observation_messages:
 // missing outputs are padded with "action was not executed", each observation
 // renders the observation template with `output` plus the full agent template
 // vars. The result text itself never sits here: `output` is the bounded view
 // and extra names the result file that holds everything.
+//
+// The zip is positional - results[i] belongs to actions[i], always - and that is
+// the contract a parallel executor depends on: it fills a slot per action rather
+// than appending as commands finish, so a fast command can never be credited with
+// a slow one's exit code or result file. A slice that is merely short still gets
+// the tail padding, which is what keeps the human-mode and refused-batch paths
+// honest.
 func formatObservations(actions []Action, results []env.Result, obsTemplate string, tvars map[string]any) []Message {
 	padded := make([]env.Result, len(actions))
-	notExecuted := env.Result{ReturnCode: -1, ExceptionInfo: "action was not executed"}
+	notExecuted := NotExecutedResult()
 	for i := range padded {
 		if i < len(results) {
 			padded[i] = results[i]

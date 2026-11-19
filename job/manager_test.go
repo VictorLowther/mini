@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -651,4 +652,93 @@ func TestKillEndsEveryConcurrentExternalOfARun(t *testing.T) {
 	if row.State != session.JobKilled {
 		t.Errorf("state = %s, want killed", row.State)
 	}
+}
+
+// TestConcurrentLaunchAndKillAllEveryRunIsSignalable is the regression test for
+// the one race a parallel tool-call batch would hit head-on: register publishes a
+// run into the live set, and KillAll walks that set calling Hurry and Kill, both
+// of which read Run.stop with no lock. Launch used to fit the stopper a few
+// instructions after publishing, so a reaper could reach a run that had not been
+// given the means to die yet - a data race, and worse, a run that survived the
+// reap nobody told it about.
+//
+// Launching and killing at the same time is the only way to exercise it, which is
+// why this sits with the manager rather than in the agent tests.
+func TestConcurrentLaunchAndKillAllEveryRunIsSignalable(t *testing.T) {
+	m, _ := newMgr(t)
+	const (
+		launchers = 8
+		each      = 12
+		reapers   = 4
+	)
+	var tcno int64 = 600
+
+	doneReaping := make(chan struct{})
+	var launch, reap sync.WaitGroup
+	for i := 0; i < launchers; i++ {
+		launch.Add(1)
+		go func() {
+			defer launch.Done()
+			for k := 0; k < each; k++ {
+				// A distinct tcno per launch, because that is what a distinct
+				// tool call in a batch really is. The command is long and the
+				// Kill below is what ends it: the window worth hitting is the
+				// one between publishing the handle and having a stopper, and a
+				// run that has already been reaped offers it no more than once.
+				n := atomic.AddInt64(&tcno, 1)
+				r, err := m.Launch(Spec{Command: "sleep 30", TCNO: int(n)})
+				if err != nil {
+					continue
+				}
+				// Whether a concurrent KillAll got here first or this Kill does,
+				// the run must be endable and must end.
+				if err := r.Kill(); err != nil && !errors.Is(err, ErrStillRunning) {
+					t.Errorf("kill of %s: %v", r.ID(), err)
+				}
+			}
+		}()
+	}
+	for i := 0; i < reapers; i++ {
+		reap.Add(1)
+		go func() {
+			defer reap.Done()
+			// Reap continuously while the launches churn, so a pass is always in
+			// flight. KillAll snapshots the handles under the lock and then calls
+			// into each run outside it, which is precisely the gap a run that has
+			// not been given a stopper yet sits in.
+			for {
+				select {
+				case <-doneReaping:
+					return
+				default:
+				}
+				m.KillAll()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+	launch.Wait()
+	close(doneReaping)
+	reap.Wait()
+
+	// Nothing may be left live: every run either got a stopper in time or was
+	// adopted by a KillAll pass that saw it. Dropping the handle is register's
+	// own watcher goroutine's job (it fires when done closes), so this waits for
+	// the handoff instead of assuming it already happened.
+	deadline := time.Now().Add(20 * time.Second)
+	for liveHandles(m) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if left := liveHandles(m); left != 0 {
+		t.Errorf("%d runs still live after everything was launched and killed", left)
+	}
+}
+
+// liveHandles reads the live set under the lock the set is guarded by. Test-only:
+// production code never needs a count of it, and giving it one would advertise a
+// cap that was removed on purpose.
+func liveHandles(m *Manager) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.handles)
 }

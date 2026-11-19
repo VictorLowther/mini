@@ -69,6 +69,15 @@ type Config struct {
 	CompactThresholdRatio   float64
 	CompactKeepTokens       int
 	CompactSummaryMaxTokens int
+
+	// MaxParallelCalls bounds how many tool calls from one assistant turn run
+	// at the same time. The commands in a batch are independent by contract -
+	// every action is its own shell, so nothing carries over between them - and
+	// the loop now relies on that by running them together. This is the one
+	// number that says how far to take it: 0 means DefaultMaxParallelCalls, a
+	// negative value starts all of them at once, and a batch is never given more
+	// workers than it has actions.
+	MaxParallelCalls int
 }
 
 // InteractiveModes are the only values agent.mode may hold. "confirm" asks a
@@ -108,6 +117,7 @@ func ConfigFromMap(m map[string]any) *Config {
 		CompactThresholdRatio:      config.Float(m, "compact_threshold_ratio", 0.9),
 		CompactKeepTokens:          config.Int(m, "compact_keep_tokens", 40000),
 		CompactSummaryMaxTokens:    config.Int(m, "compact_summary_max_tokens", 16384),
+		MaxParallelCalls:           config.Int(m, "max_parallel_calls", 0),
 	}
 }
 
@@ -130,6 +140,7 @@ func (c *Config) Dump() map[string]any {
 		"compact_threshold_ratio":       c.CompactThresholdRatio,
 		"compact_keep_tokens":           c.CompactKeepTokens,
 		"compact_summary_max_tokens":    c.CompactSummaryMaxTokens,
+		"max_parallel_calls":            c.MaxParallelCalls,
 	}
 }
 
@@ -1563,6 +1574,18 @@ func exitMessage(kind, submission string) model.Message {
 // its text becomes the submission. Turns that do run commands follow the
 // Python InteractiveAgent's ordering: observations are recorded in the
 // finally block, after asking the user whether the run really ends.
+//
+// The commands of one turn are a batch, and the batch runs concurrently. That is
+// sound because the environment is stateless by contract - every action gets its
+// own shell, which is why `cd` and `export` do not persist - so a call cannot
+// depend on a sibling's side effects, and the prompt says so in those terms.
+// Concurrency is confined to the waiting: opening a call, announcing it to the
+// front end, completing its row and appending to the transcript all stay on this
+// goroutine, in issue order, so the Hooks and Recorder contracts - both
+// documented as agent-goroutine-only - are untouched by this function's speedup.
+//
+// What the model and the transcript see is unchanged: one observation per call,
+// in the order the calls were issued, whatever order they finished in.
 func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 	actions := model.ActionsOf(msg)
 	var results []env.Result
@@ -1590,6 +1613,23 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		}
 	}
 
+	// ---- Phase 1: open and announce, serially, in issue order. ----
+	//
+	// The batch is prepared here rather than inside the workers on purpose, and
+	// it is what keeps this change from widening any contract. Opening a call is
+	// a store write and announcing it is a hook call, and both are documented as
+	// agent-goroutine work: Recorder says so at its definition (agent.go:172),
+	// and OnCallOpened's whole promise to the window is that the card a call is
+	// issued into already exists when the call is announced. Fan either of those
+	// out and every front end inherits an ordering problem it cannot see coming.
+	//
+	// Doing them up front costs a serial database write per call, which is
+	// microseconds against the command that follows, and buys the expensive half
+	// of the loop a clean run at concurrency. The rows also already exist:
+	// recording the issuing turn allocated the ledger row and the transcript slot
+	// for every call it carried (session/calls.go), so this opens what was
+	// promised rather than inventing N promises at once.
+	opens := make([]model.ToolCall, len(actions))
 	for i, action := range actions {
 		// One call row and one result file per action. The file is the sink
 		// even when the database row failed: the observation must always
@@ -1612,86 +1652,219 @@ func (l *Loop) ExecuteActions(ctx context.Context, msg model.Message) error {
 		if o, ok := l.Hooks.(CallOpener); ok && tc.Path != "" {
 			o.OnCallOpened(action, tc.Path)
 		}
-		var sink io.Writer
-		if tc.File != nil {
-			sink = tc.File
-		}
-		var res env.Result
-		var detached bool
-		var err error
-		switch action.ToolName() {
-		case model.ToolJobs:
-			res = l.jobsObservation(action, sink)
-		case model.ToolJobKill:
-			res = l.killObservation(action, sink)
-		case model.ToolAgent:
-			res = l.spawnObservation(ctx, action, sink)
-		case model.ToolJobSend:
-			res = l.sendObservation(ctx, action, sink)
-		default:
-			res, detached, err = l.runCommand(ctx, action, tc, sink)
-		}
-		// Stop the shell's writes and measure the file once, before any
-		// branch returns: this is the only place tail arithmetic happens.
-		// Closing first keeps the fd from leaking on the cancellation path;
-		// res is returned by value, so these fields survive an early return.
+		opens[i] = tc
+	}
+
+	// ---- Phase 2: execute them all at once. ----
+	runs := l.runCallsConcurrently(ctx, actions, opens)
+
+	// ---- Phase 3: settle serially, in issue order. ----
+	//
+	// results[i] belongs to actions[i]. That pairing is not a convention here, it
+	// is what model.formatObservations zips on, what the stored transcript is
+	// built from, and what the model is told next turn - so it is filled by index
+	// and never appended, and a command that finishes early cannot be credited
+	// with a slower sibling's exit code, cwd or result file. Execution order is
+	// whatever the machine manages; the reported order is the order issued.
+	//
+	// Every slot starts as the padding value, because "unfinished" and "finished
+	// with exit 0" must not share a representation.
+	results = make([]env.Result, len(actions))
+	for i := range results {
+		results[i] = model.NotExecutedResult()
+	}
+	// cause is the interruption the turn ends with, if any: the first action that
+	// reported one, by issue order, which is the one a serial run would have
+	// reached first and therefore the honest thing to name.
+	var cause error
+
+	for i := range actions {
+		run, tc := runs[i], opens[i]
+		// Stop the shell's writes and measure the file once, before any branch
+		// returns: this is the only place tail arithmetic happens. Closing
+		// first keeps the fd from leaking on the cancellation path; res is
+		// returned by value, so these fields survive an early return.
 		//
 		// A detached run skips all of it. The job is still appending to that
 		// file, so the loop must not close it, and the observation is the
 		// handoff rather than a tail of a log that has no end yet - the model
 		// is told the path and how to read it, and reads it when it wants.
-		if tc.File != nil && !detached {
+		//
+		// A call that never started still closes here, and must: phase 1 opened
+		// every file in the batch, so a batch cut short by a cancellation would
+		// otherwise leak one descriptor per command that never ran.
+		if tc.File != nil && !run.detached {
 			_ = tc.File.Sync()
 			_ = tc.File.Close()
-			res.OutputPath = tc.Path
-			res.OutputBytes = sizeOf(tc.Path)
+			run.res.OutputPath = tc.Path
+			run.res.OutputBytes = sizeOf(tc.Path)
 			view, offset, elided, verr := model.ViewOf(tc.Path)
-			res.View, res.ViewOffset, res.ElidedLines, res.Truncated = view, offset, elided, offset > 0
+			run.res.View, run.res.ViewOffset, run.res.ElidedLines, run.res.Truncated = view, offset, elided, offset > 0
 			if verr != nil {
-				res.ViewError = verr.Error()
+				run.res.ViewError = verr.Error()
 			}
 		}
-		if err != nil {
-			// Context cancellation: a user interruption, not an observation.
-			// The call row keeps status='started' - the honest record that the
-			// command never finished - and its pre-allocated slot takes the
-			// padded "action was not executed" observation the addMessages call
-			// below produces, so the transcript stays legal either way.
-			if l.Hooks == nil {
-				return err
+		// Context cancellation: a user interruption, not an observation. The
+		// call row keeps status='started' - the honest record that the command
+		// never finished - and the slot keeps the padded "action was not
+		// executed" observation, so the transcript stays legal either way.
+		//
+		// It does not stop here any more. Serially, an interruption ended the
+		// batch and everything after it was simply never run; concurrently, the
+		// commands issued alongside it are already in flight, and the choice is
+		// between throwing away results that exist and reporting them. So the
+		// loop settles every sibling, records the cause, and interrupts after
+		// the batch: a cancelled turn still tells the model what its other
+		// commands actually did.
+		if run.err != nil {
+			if cause == nil {
+				cause = run.err
 			}
-			l.addMessages(l.Model.FormatObservations(msg, results, l.TemplateVars())...)
-			return l.interrupted(err)
+			continue
 		}
 		// A detached run leaves its call row 'started', which is the truth: the
 		// call did not complete, it handed off. The job's own row carries the
 		// outcome, and closing the call row with a return code the command has
 		// not produced yet would put a number in the ledger that nobody measured.
-		if l.Recorder != nil && !detached {
+		if l.Recorder != nil && !run.detached {
 			if err := l.Recorder.CompleteToolCall(tc, model.ToolOutcome{
-				Bytes:      res.OutputBytes,
-				ViewOffset: res.ViewOffset,
-				ViewElided: res.ElidedLines,
-				ReturnCode: res.ReturnCode,
-				CWD:        res.CWD,
+				Bytes:      run.res.OutputBytes,
+				ViewOffset: run.res.ViewOffset,
+				ViewElided: run.res.ElidedLines,
+				ReturnCode: run.res.ReturnCode,
+				CWD:        run.res.CWD,
 			}); err != nil {
 				l.logger().Error("session store: could not record tool call outcome", "err", err)
 			}
 		}
 		if tc.Number != 0 {
-			if res.Extra == nil {
-				res.Extra = map[string]any{}
+			if run.res.Extra == nil {
+				run.res.Extra = map[string]any{}
 			}
-			res.Extra["tcno"] = tc.Number
-			res.Extra["tcr_offset"] = res.ViewOffset
-			res.Extra["tcr_bytes"] = res.OutputBytes
-			res.Extra["elided_lines"] = res.ElidedLines
+			run.res.Extra["tcno"] = tc.Number
+			run.res.Extra["tcr_offset"] = run.res.ViewOffset
+			run.res.Extra["tcr_bytes"] = run.res.OutputBytes
+			run.res.Extra["elided_lines"] = run.res.ElidedLines
 		}
-		results = append(results, res)
+		results[i] = run.res
 	}
 
 	l.addMessages(l.Model.FormatObservations(msg, results, l.TemplateVars())...)
+	if cause != nil {
+		if l.Hooks == nil {
+			return cause
+		}
+		return l.interrupted(cause)
+	}
 	return nil
+}
+
+// callRun is one action's share of a batch: what its execution produced, and the
+// two facts only the worker knows. It is a value in a slice the workers index
+// into, so no lock is involved - each action owns its own element and the
+// elements are never touched by a goroutine that does not own one.
+type callRun struct {
+	res env.Result
+	// detached reports a handoff: the run outlived the call, so its result file
+	// stays open and belongs to the job, not the loop.
+	detached bool
+	// err is the caller's context ending, which is the only failure a command
+	// execution reports as a Go error and the only one that interrupts a turn.
+	err error
+}
+
+// DefaultMaxParallelCalls bounds how many of one batch run at once, and matches
+// model.DefaultGate so the two concurrent halves of a turn - commands and
+// subagent requests - are held to the same number.
+const DefaultMaxParallelCalls = 4
+
+// parallelBound is how many workers a batch of n actions gets: the configured
+// ceiling when there is one, unbounded when the config says so, and never more
+// than there is work for.
+func (l *Loop) parallelBound(n int) int {
+	max := DefaultMaxParallelCalls
+	if l.Cfg != nil && l.Cfg.MaxParallelCalls != 0 {
+		max = l.Cfg.MaxParallelCalls
+	}
+	if max < 0 || max > n {
+		return n
+	}
+	return max
+}
+
+// runCallsConcurrently executes every action of a batch and does not return
+// until nothing the batch started is still being written to. It hands back one
+// callRun per action, in issue order, and it is the whole of the parallel half:
+// no store write, no hook, no template variable and no transcript append happens
+// here, because those all stay on the goroutine that owns the loop.
+//
+// What makes this safe rather than merely fast is that the work being fanned out
+// owns nothing in common. env.Local is stateless by design - every action is a
+// fresh shell, which is why `cd` and `export` do not persist - and Execute builds
+// a new interpreter per call, reading l.CWD/l.Env/l.Timeout without writing them.
+// Each command writes its own result file, holds its own call row keyed by
+// (turn, idx), and is launched as its own job under an id derived from its own
+// tcno, so Manager cannot see two of them collide. job.Manager and Run are
+// documented and built for concurrent use, and the foreground wait holds no lock
+// at all: it is a bare select over run.Done, the caller's context and the budget
+// timer, so N waits are N goroutines parked on channels and nothing else.
+//
+// Cancelling the turn now reaches every command in the batch at once rather than
+// the one it happened to be waiting on. That is the intended reading of a cancel,
+// and it is why nothing here is left detached by accident: a run that outlives
+// the batch is a run whose file the loop must not close, which the detached flag
+// already says.
+func (l *Loop) runCallsConcurrently(ctx context.Context, actions []model.Action, opens []model.ToolCall) []callRun {
+	runs := make([]callRun, len(actions))
+	// A bounded fan-out. The bound is not for the machine's sake so much as the
+	// model's: a batch is whatever the turn asked for, and a turn that asked for
+	// forty commands should get forty processes eventually rather than forty at
+	// once and an unresponsive box.
+	sem := make(chan struct{}, l.parallelBound(len(actions)))
+	var wg sync.WaitGroup
+	for i := range actions {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// A batch already cancelled - by a sibling's interruption, or by a
+			// human who pressed stop before this one got a worker - is not
+			// started. Its slot keeps the padding, which is the truth: this
+			// action was never executed.
+			if ctx.Err() != nil {
+				runs[i] = callRun{err: ctx.Err()}
+				return
+			}
+			runs[i] = l.runCall(ctx, actions[i], opens[i])
+		}(i)
+	}
+	wg.Wait()
+	return runs
+}
+
+// runCall executes one action into its call's result file. It returns a value
+// rather than writing anything down precisely so that the caller stays the only
+// place any state changes hands.
+func (l *Loop) runCall(ctx context.Context, action model.Action, tc model.ToolCall) callRun {
+	var sink io.Writer
+	if tc.File != nil {
+		sink = tc.File
+	}
+	var run callRun
+	switch action.ToolName() {
+	case model.ToolJobs:
+		run.res = l.jobsObservation(action, sink)
+	case model.ToolJobKill:
+		run.res = l.killObservation(action, sink)
+	case model.ToolAgent:
+		run.res = l.spawnObservation(ctx, action, sink)
+	case model.ToolJobSend:
+		run.res = l.sendObservation(ctx, action, sink)
+	default:
+		run.res, run.detached, run.err = l.runCommand(ctx, action, tc, sink)
+	}
+	return run
 }
 
 // Serialize builds the trajectory document (rule 12).

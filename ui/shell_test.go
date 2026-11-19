@@ -878,3 +878,67 @@ func TestGUISubagentCardReportsProgress(t *testing.T) {
 		t.Errorf("a plain command's card claims step counts it cannot know:\n%s", got)
 	}
 }
+
+// TestGUIDuplicateCommandsInOneBatchGetOwnCards is what parallel execution asks
+// of the view. When a provider sends no tool-call ids the only way to pair a
+// result with its card is the command text, and taking the newest match merges a
+// whole batch of identical commands into one card: the siblings sit there saying
+// "issued" forever and every result but the last is overwritten. Results arrive in
+// issue order, so oldest-unanswered is the pairing that lines each result up with
+// the call that produced it.
+func TestGUIDuplicateCommandsInOneBatchGetOwnCards(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	v := a.v
+
+	// Distinct per-call markers that cannot collide with anything the window
+	// chrome itself renders, so counting them in the transcript text is a real
+	// test of "one card each" rather than of what the status bar happens to say.
+	marks := []string{"result-aa", "result-bb", "result-cc"}
+	for range marks {
+		v.issueCard(block{kind: "tool", title: "make", cmd: "make -j8",
+			state: "created", transcript: []string{"$ make -j8", "issued"}})
+	}
+	for _, mk := range marks {
+		v.commitBlock(block{kind: "tool", cmd: "make -j8",
+			transcript: []string{"$ make -j8", mk}})
+	}
+
+	got := transcriptText(v.root())
+	for i, mk := range marks {
+		if c := strings.Count(got, mk); c != 1 {
+			t.Errorf("%q (result of call %d) appears %d times, want exactly 1: a batch of identical commands merged into one card", mk, i, c)
+		}
+	}
+	if c := strings.Count(got, "issued"); c != 0 {
+		t.Errorf("%d cards still claim the call was only issued, want 0", c)
+	}
+	// And they stayed in issue order, which is the pairing the loop promises.
+	if !strings.Contains(got, "result-aa") ||
+		strings.Index(got, "result-aa") > strings.Index(got, "result-bb") ||
+		strings.Index(got, "result-bb") > strings.Index(got, "result-cc") {
+		t.Errorf("results are out of issue order:\n%s", got)
+	}
+}
+
+// TestGUIResultNeverBindsToAnEarlierTurnsCard keeps the guard the walk-back
+// relies on: pairing by command text stops at the first card that is not an open
+// card for the same command, so a stale unanswered card from a previous batch -
+// separated by anything else in the transcript - cannot collect this batch's
+// result.
+func TestGUIResultNeverBindsToAnEarlierTurnsCard(t *testing.T) {
+	a := newTestWindow(t, "yolo", "alpha")
+	v := a.v
+
+	v.issueCard(block{kind: "tool", title: "make", cmd: "make", state: "created",
+		transcript: []string{"$ make", "issued"}})
+	// Something else lands between the two batches, so the old card is no longer
+	// part of a contiguous run of matching calls.
+	v.commitBlock(block{kind: "assistant", title: "note", text: "in between"})
+	v.issueCard(block{kind: "tool", title: "make", cmd: "make", state: "created",
+		transcript: []string{"$ make", "issued"}})
+
+	i := v.openCard(block{kind: "tool", cmd: "make"})
+	if i != 2 {
+		t.Fatalf("openCard chose %d, want the newest card (2) - an earlier turn's card must not answer this call", i)
+	}
+}

@@ -177,8 +177,14 @@ type Run struct {
 	done chan struct{}
 
 	// stop is the kind-specific ability to end this run, and nil for a kind
-	// that has no process to signal. Nothing outside a kind's own code reads
-	// through it.
+	// that has no process to signal.
+	//
+	// It is read without the lock by Hurry and Kill, which are reached from
+	// other goroutines - KillAll walks the live set, and a cancelled action
+	// kills its own run - so it is written once, before register publishes the
+	// handle, and never again. Publishing a handle whose stopper is still
+	// missing is the race that ordering closes; there is no setter to guard it
+	// with, by design.
 	stop stopper
 }
 
@@ -359,7 +365,12 @@ func (m *Manager) Get(id string) (*Run, error) {
 // the tree from parent_id without a second query.
 func (m *Manager) List() ([]session.JobRow, error) { return m.Session.ListJobs() }
 
-// register adopts a row and its handle into the live set, enforcing the cap.
+// register adopts a run's handle into the live set and refuses a duplicate id.
+//
+// There used to be a cap on the live set here; it was deliberately removed
+// (docs/jobs-research.md, docs/adversarial-review-2026-11.md), and this comment
+// still promised it for long enough that a reader could go looking for the
+// number. Nothing bounds how many runs are live.
 func (m *Manager) register(r *Run) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
