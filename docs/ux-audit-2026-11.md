@@ -12,8 +12,9 @@ Line numbers refer to `ui/fyneview.go` unless another file is named. This is a
 survey of what exists and why, written before a round of UX changes: no
 recommendations, and §6 lists the ideas the design has already rejected.
 
-**One of those changes has since landed. Read §10 first**: it lists what was
-rewritten in place (the bubble paints an outline, not a tint), what is now
+**Two of those changes have since landed - read §10 and §11 first.** They record
+what was rewritten in place (the bubble paints an outline, not a tint; and which
+side a card sits on is who spoke, not what the wrapper is named), what is now
 historical, and how far the `fyneview.go` line citations have drifted.
 
 ---
@@ -111,7 +112,7 @@ permanent objects.
   `ScrollBarSize()+Padding()` (`:316`) - because the transcript bar and a card's
   own bar would otherwise stack in one column and "grabbing the transcript bar is
   a coin flip on which scrollbar answers."
-- `atBottom` has **no negative tolerance** (`:790`): overscroll reads as a genuine
+- `atBottom` has **no negative tolerance** (`:802`): overscroll reads as a genuine
   hold release, and the tolerance is one line, not a pixel.
 
 ### 2.4 The card (`area`) and the bubble
@@ -120,19 +121,19 @@ Every transcript row is now an `area` - a ruled change: *"all of the cards shoul
 be real containers instead of being just rich text widgets with background
 colors"* (§8.8). Composition is
 `Stack[ bubble, VBox[ Border{trailing: actions}(header), body ] ]`
-(`areaCard`, `:1410-1439`).
+(`areaCard`, `:1419-1448`).
 
 The visual reference is still explicit - "speech bubbles in the style of
 apptrix.org/components/widget/chat ... a rounded body with a tail flaring to a
-point on the sender's side" (`:1191-1210`) - but **the kind is now the stroke**,
-since §10. The bubble is one `canvas.ArbitraryPolygon` (`:1293`) carrying
+point on the sender's side" (`:1200-1233`) - but **the kind is now the stroke**,
+since §10. The bubble is one `canvas.ArbitraryPolygon` (`:1302`) carrying
 `FillColor`, `StrokeColor` and `StrokeWidth`: the primitive strokes its own path
 in this Fyne pin, in both painters, so there is no second inset shape faking a
 border. The interior is the plain theme surface for every kind (`bubbleSurface`,
-`:1245`); the hue lives entirely in the frame (`bubbleOutline`, `:1252`), at full
-intensity and `padding/2` thick with a 1 pt floor (`bubbleStrokeWidth`, `:1265`).
-The five hues are the ones the tinted design used (`bubbleAccent`, `:1225`) and
-everything without a hue of its own takes `bubbleNeutral` (`:1238`). The reason
+`:1254`); the hue lives entirely in the frame (`bubbleOutline`, `:1261`), at full
+intensity and `padding/2` thick with a 1 pt floor (`bubbleStrokeWidth`, `:1274`).
+The five hues are the ones the tinted design used (`bubbleAccent`, `:1234`) and
+everything without a hue of its own takes `bubbleNeutral` (`:1247`). The reason
 they are fixed hues and not theme names has not changed: "ColorNamePrimary (user)
 and ColorNameHyperlink (LLM output) are both blue in the default theme."
 
@@ -149,13 +150,17 @@ hue paints an invisible frame while every field reads correct - which is exactly
 what the old comment about low-alpha fills rendering "effectively invisible" was
 guarding, and what `A: 0xff` on every accent literal now guards.
 
-Sides and labels come from one table, `messageKindLabel` (`:1167-1181`, first
+Sides and labels come from one table, `messageKindLabel` (`:1165-1190`, first
 match wins): `transcript>0` -> **tool call**; `assistant` -> **LLM output**;
-`user`/`UserSteering` -> **user** right-justified; any other `user` subtype ->
-**harness** left. That human-vs-harness side split is the README's rule "so the
-two never read alike." Headers use the *body's own font* (`TextStyle{}`), never a
+`user` -> **user** right-justified when the human spoke it, **harness** left when
+the harness wrote the sentence. That side split is the README's rule "so the two
+never read alike." Who spoke is **carried**, not inferred - `block.typed` from
+`extra["user_typed"]` - because the previous rule was
+"`subtype` in {"", `UserSteering`} -> user, everything else -> harness", which
+made every human-typed kind that had not been enumerated into a harness card. See
+§11. Headers use the *body's own font* (`TextStyle{}`), never a
 label widget, so header width tracks body width exactly, and the *plain theme
-foreground* for every kind (`areaColor`, `:1404`) - a decision since §10, with
+foreground* for every kind (`areaColor`, `:1413`) - a decision since §10, with
 `TestGUIAreaHeadersAndAlignment` asserting it, because a function that takes a
 kind and ignores it is indistinguishable from unfinished work without one.
 
@@ -164,13 +169,13 @@ kind and ignores it is indistinguishable from unfinished work without one.
 | Knob | Value | Site |
 |---|---|---|
 | **Master unit** | `theme.SizeNamePadding` (=4 by default) - everything spatial is a multiple | |
-| corner radius | x1 | `:1308` |
+| corner radius | x1 | `:1317` |
 | tail drop / flare base | x1.5 / x2 | `:1271, :1275` |
-| card insets | top p, bottom 2.5p, left p, right p | `:1427` |
-| **outline width** (since §10) | `padding/2` (=2 pt at defaults), floored at 1 pt | `:1265` |
-| **bubble interior** (since §10) | theme background, uncoloured, opaque | `:1245` |
-| tip softening | `min(radius/4, 1)` - one of two hard pixels (the other is the outline floor) | `:1310` |
-| mono card growth cap | `min(content, 10 lines)`, measured from glyph `"M"` | `:1500-1509` |
+| card insets | top p, bottom 2.5p, left p, right p | `:1436` |
+| **outline width** (since §10) | `padding/2` (=2 pt at defaults), floored at 1 pt | `:1274` |
+| **bubble interior** (since §10) | theme background, uncoloured, opaque | `:1254` |
+| tip softening | `min(radius/4, 1)` - one of two hard pixels (the other is the outline floor) | `:1319` |
+| mono card growth cap | `min(content, 10 lines)`, measured from glyph `"M"` | `:1509-1519` |
 | code fold threshold | 6 lines open, >=7 accordion `[lang . N lines]` | `markdown.go:24-28` |
 | fence split | >=3 markers, indent <4 opens | `markdown.go:78-81` |
 | live repaint gap | 80 ms leading-edge, clamped >=0 | `:88` (field), `:182` (set) |
@@ -184,7 +189,7 @@ kind and ignores it is indistinguishable from unfinished work without one.
 | default window | 960x720 | `prefs.go:59` |
 | panel action elision | 4 shown then `+N more commands`; 6 lines per action | `blocks.go:205-234` |
 
-Header text carries **no width logic at all**: `cardHeaderText` (`:1443-1455`)
+Header text carries **no width logic at all**: `cardHeaderText` (`:1452-1464`)
 builds `[]string{label}` and appends each non-zero metric (`%d tok`, `%.1fs`,
 `$%.2f`), joined with U+00B7. Truncation, wrapping and per-field elision do not
 exist here, so a long compaction title or a five-part metric run can wrap the
@@ -339,7 +344,8 @@ is the only layout introspection.
    our own `ScrollToBottom` - because glfw fires `OnScrolled` for programmatic
    scrolls, and a geometry-derived pin "un-pinned a transcript nobody had
    touched."
-5. **Attribution is carried, never derived** (decision 5/13).
+5. **Attribution is carried, never derived** (decision 5/13) - and §11 is what
+   happens where that rule was not yet applied.
    `Question.Origin` -> `displayTitle` prefixes `subagent <name> . `, because
    "an unattributed queue is how a human approves `rm -rf build/` believing they
    pressed enter on their own command." Bubbling became *routing* with tabs;
@@ -444,7 +450,7 @@ UX pass:
   *trajectory JSON* equality, not transcript text.
 - **Dead code a layout change will step on:** `areaColor(kind)` ignores its
   parameter and returns one constant - which §10 turned from "the API is a lie"
-  into a documented decision with an assertion behind it (`areaColor` `:1404`,
+  into a documented decision with an assertion behind it (`areaColor` `:1413`,
   `TestGUIAreaHeadersAndAlignment`), and which is still the single place a
   per-kind header hue would go; `selectableRT` and `collapseSpaces` have no callers while the invariant
   is duplicated by hand in three places; `limitLabelSteps`/`limitLabelCost`
@@ -453,7 +459,7 @@ UX pass:
 - **Live contradictions in comments:** `blockCards`' header says
   notes/errors/exit "stay plain rows" while the code builds `areaCard` for all
   three; the accent map's banner still claims "the five kinds are tellable at a
-  glance" (`:1211-1224`) while
+  glance" (`:1220-1234`) while
   eight literal labels (`tool call`, `LLM output`, `user`, `harness`, `thinking`, `exit`, `error`, `note`) plus raw `b.kind` and compaction `b.title` passthrough reach `bubbleOutline` and `note`/`exit`/`error` - the most
   common rows - all take the same `bubbleNeutral` frame. Compaction feeds
   free-form `b.title` in as the colour key, so it can never match. Before §10
@@ -497,15 +503,15 @@ UX pass:
 
 | Change | Files | Caught by tests? |
 |---|---|---|
-| Spacing / vertical rhythm | theme padding only, `blockSpacer` (`:1543`), the x1.5 coefficient in `estimateBlockHeight` | no - estimates are never compared to measured |
-| Colour / contrast | `bubbleAccent` (`:1225`), `bubbleOutline` (`:1252`), `bubbleSurface` (`:1245`), `bubbleStrokeWidth` (`:1265`) - `bubbleFill` and `blendOnto` are gone (§10) | outlines differ by kind; `user`'s hue is pixel-asserted, the other four only compared to each other |
-| Bubble frame, tail, stroke | `bubble.points` (`:1303`), `newBubble` (`:1292`), `bubbleRenderer.Layout` (`:1338`) | the pixels, not the geometry - nothing reads the polygon's points back |
-| Card chrome | `areaCard` (`:1355`), `area.CreateRenderer` (`:1340`) | partially (`TestGUICardBodiesAreSelectable`) |
-| Header content/format | `cardHeaderText` (`:1388-1400`) - no width logic, so anything here that grows competes with wrapping | exact strings: `TestGUIAreaHeadersAndAlignment` (`fyneui_test.go:1282`) |
-| Kinds, labels, sides | `messageKindLabel` + `blockCards` + `bubbleAccent` + `costLabel` - **four string-coupled sites, no constants** | partially |
-| Per-kind controls | `area.setActions` from `attachCardActions` (`:355`) - must be called before the row reaches the canvas | `TestGUIJobCardEndsItsOwnJob` |
-| Input area | `newChatInput` (`:1978`) - mind the first-write-wins trap in §7 | `TestPaintedInputFollowsResize` |
-| Panel | `setPanel` (`:1717`) + the `questionPanel*Mode` constants (`:1756`) + `Interactive`'s answer semantics | `TestGUIConfirmPanelDrivesTheLoop` |
+| Spacing / vertical rhythm | theme padding only, `blockSpacer` (`:1609`), the x1.5 coefficient in `estimateBlockHeight` | no - estimates are never compared to measured |
+| Colour / contrast | `bubbleAccent` (`:1234`), `bubbleOutline` (`:1261`), `bubbleSurface` (`:1254`), `bubbleStrokeWidth` (`:1274`) - `bubbleFill` and `blendOnto` are gone (§10) | outlines differ by kind; `user`'s hue is pixel-asserted, the other four only compared to each other |
+| Bubble frame, tail, stroke | `bubble.points` (`:1312`), `newBubble` (`:1301`), `bubbleRenderer.Layout` (`:1347`) | the pixels, not the geometry - nothing reads the polygon's points back |
+| Card chrome | `areaCard` (`:1419`), `area.CreateRenderer` (`:1400`) | partially (`TestGUICardBodiesAreSelectable`) |
+| Header content/format | `cardHeaderText` (`1452-1464`) - no width logic, so anything here that grows competes with wrapping | exact strings: `TestGUIAreaHeadersAndAlignment` (`fyneui_test.go:1282`) |
+| Kinds, labels, sides | `messageKindLabel` (`1165-1190`) + `blockCards` (`:1548-1593`) + `bubbleAccent` (`:1234`) + `costLabel` - **four string-coupled sites, no constants** | the sides, by table: `TestGUITranscriptSideFollowsAuthorship` |
+| Per-kind controls | `area.setActions` (`:1396`) from `attachCardActions` (`:350`) - must be called before the row reaches the canvas | `TestGUIJobCardEndsItsOwnJob` |
+| Input area | `newChatInput` (`:2044`) - mind the first-write-wins trap in §7 | `TestPaintedInputFollowsResize` |
+| Panel | `setPanel` (`:1783`) + `showQuestion`'s switch on `Question.Kind` (`:1799`) + `Interactive`'s answer semantics. **The `questionPanel*Mode` constants this row used to cite do not exist anywhere in the tree** - another §9 survivor | `TestGUIConfirmPanelDrivesTheLoop` |
 | Window/tab chrome | `shell.go` `newShell`/`menus`/`label` | `TestGUIModeInTitleTracksVisibleSession` |
 | **Anything geometry** | `fyneview.go` | **nothing for placement** (row widths are pinned, in the app and - since §10 - in the mockup). Verify by hand: `MINI_DEBUG_LAYOUT=1`, or `go run ./cmd/bubblemock` |
 | The mockup window | `mockup.go`, `cmd/bubblemock` | `TestGUIMockupLeavesScrollbarGutter` (the gutter, not the look) |
@@ -601,7 +607,7 @@ three further errors, now corrected above:
 Citation drift corrected in the same pass: the interface (`ui.go:68-80`, not
 `:76-94`), the dead-code-shape quote (`ui.go:90-93`), `OnCallOpened`
 (`interactive.go:267-272`), the virtualization comment (`:117-120`), the pre-show
-viewport (`:428`), `atBottom` (`:790`), and `paintGap` (`:88`/`:182`). The
+viewport (`:428`), `atBottom` (`:802`), and `paintGap` (`:88`/`:182`). The
 "eleven-plus labels" count is replaced by the eight literal labels plus the
 `b.kind` / `b.title` passthrough, which is what the code actually produces.
 
@@ -641,12 +647,77 @@ mode this codebase has been bitten by repeatedly, and `A: 0xff` on every accent
 literal plus the pixel test are the answer to it. §7's note that no test asserted
 anything a painter does is now, in this one corner, out of date - see §4.
 
-**Citation drift.** `ui/fyneview.go` grew from 2,123 to 2,163 lines. Citations
+**Citation drift.** `ui/fyneview.go` grew from 2,123 to 2,163 lines with §10, and
+to 2172 with §11. Every number in this file was re-derived a second time when §11
+landed, so the citations below :1165 are exact and the ones §10 re-derived are
+exact again. Citations
 below `:1195` are unaffected and still exact; in the bubble and area region every
-number in this file was re-read off the current tree (`bubbleAccent` `:1225`,
-`bubbleSurface` `:1245`, `bubbleOutline` `:1252`, `bubbleStrokeWidth` `:1265`,
-`bubble.points` `:1303`, `areaColor` `:1404`, `areaCard` `:1410-1439`,
-`cardHeaderText` `:1443-1455`, `transcriptGrid` `:1500-1509`, plus the four
+number in this file was re-read off the current tree (`bubbleAccent` `:1234`,
+`bubbleSurface` `:1254`, `bubbleOutline` `:1261`, `bubbleStrokeWidth` `:1274`,
+`bubble.points` `:1312`, `areaColor` `:1413`, `areaCard` `:1419-1448`,
+`cardHeaderText` `:1452-1464`, `transcriptGrid` `:1509-1519`, plus the four
 `"LLM output"` sites `:1172, :1230, :1565, :1644`); a citation elsewhere in the
 file that lands after those is short by up to 40. The §9 rule is not withdrawn:
 open the file before trusting a number.
+
+---
+
+## 11. Amendment, 2026-11-18: which side a card sits on is who spoke
+
+Reported as a display bug - text the user typed appeared in a **harness** card -
+and fixed as a design one, because the display was only the symptom.
+
+**What was actually wrong.** `messageKindLabel` (`:1165-1190`) had the right
+nouns and the wrong default. For `kind == "user"` it asked whether `subtype` was
+one of the human-authored strings (`""`, `"UserSteering"`) and sent everything
+else to the harness. So every `interrupt_type` that existed but had not been
+enumerated read as harness feedback: the comment typed at the interruption prompt
+(`"UserInterruption"`, from `"Interrupted by user: ..."`) and the next thing
+typed at the ready line (`"UserNewTask"`). Mid-run steering was already correct -
+it is echoed as `block{kind: "user"}` with no subtype, and its commit is skipped
+(`fyneui.go:453`) - which is why the two paths looked like one bug to whoever hit
+them: the same keystroke becomes an *answer to a prompt* the moment the run is
+not mid-turn, and prompts are where the mislabelled types are written.
+
+**The rule that was broken is §5.5's**: attribution was **derived** from a field
+the harness writes for the model's benefit, instead of carried. Derived
+attribution is wrong by default for every kind nobody has thought of yet, and
+nothing fails when that happens.
+
+**Now it is carried.** `ui/blocks.go` gained `block.typed`, read from
+`extra["user_typed"]` (`userTypedKey`), and `ui/slash.go` gained `userWords`
+beside `interruptUser` for the sites where the words came off the keyboard:
+`Interactive.OnInterrupt`'s comment, and the answer at the ready line. The
+`interrupt_type` the model and the store see is **unchanged** - only an extra key
+is new - so sessions keep their shape. The subtype list still back-fills
+transcripts written before the marker existed, and `"UserNewTask"` joined it on
+the reasoning that its wrapper can only ever quote the human.
+
+**On the "new task" framing**, which the maintainer called out as wrong for this
+UI: a session is a continuing conversation whose turns build on each other, not a
+run of discrete tasks, and the transcript should not imply otherwise. That is
+why the ready-line text now reads as the human's own card. The sentence handed to
+the model still says *"The user added a new task: ..."*, and so does the prompt
+title (`newTaskTitle`, `slash.go:70`) - **that wording is a prompt decision, not
+a display one**, and it is the next thing to revisit here.
+
+**What stayed harness, on purpose:** rejections, format errors, job updates, a
+parent's message to a child, and "Temporary interruption caught." - a
+cancellation the human chose not to comment on. The test is who wrote the
+sentence, not whether the human is mentioned in it; a harness report wearing the
+user's blue bubble is the honesty rule (§4, idiom 3) and the lying affordance §8.6 refuses to ship,
+wearing a colour and an alignment.
+
+**Pinned** by `TestGUITranscriptSideFollowsAuthorship` (a table, including a
+subtype invented after the test was written - precisely the case the old default
+got wrong), `TestGUIAuthorshipTravelsInTheMessage` (the marker survives the
+`model.Message` round trip), `TestGUIEscCancelsTheTurn` and
+`TestGUINextTurnAtTheReadyLineIsTheHuman` end to end. All four were run against
+the old condition and fail on it; the `esc` test's failure message reproduces the bug
+report.
+
+**One citation in this file was found false while doing it:** §2.3's `atBottom`
+"`:790`" is `:802`. Corrected - it is the kind of drift §9 says to expect, and
+the §8 table's `questionPanel*Mode` row (never re-verified by the §9 pass) names
+constants that do not exist at all, so that row now says so instead of pointing
+nowhere.

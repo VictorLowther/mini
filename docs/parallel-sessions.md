@@ -2533,6 +2533,56 @@ still share one frame, and it is more conspicuous now that it is a real line
 rather than a wash - deferred, to be given distinct hues or dropped. Amber on the
 light variant is the weakest of the five and stays. No hues were invented, no
 hues were changed, and nothing else about the card moved.
+
+### 8.14 Which side of the transcript a card sits on is who spoke
+
+Reported against the GUI: text the user typed showed up as a `harness` card.
+Fixed, and the fix is decision 5/13 applied where it had not been.
+
+**The derivation was the bug.** `messageKindLabel` classified a user-role block by
+asking whether `subtype` was one of a short list of human-authored
+`interrupt_type` strings, and sent everything else left as harness feedback. That
+list was written when the only kinds in existence were unwrapped entries and
+steering, so every human-typed kind added afterwards was mislabelled by default -
+the comment typed at the interruption prompt, and the next thing typed at the
+ready line. Nothing failed, no test complained, and the user's own words arrived
+wearing the harness's colour. A rule of the form *"this, this and this are the
+human's; everything else is ours"* is a claim that the list is complete, and the
+list is never complete.
+
+**Authorship travels with the message.** `ui/blocks.go` gained `block.typed`, set
+from `extra["user_typed"]` (`userTypedKey`), and `ui/slash.go` gained `userWords`
+next to `interruptUser` for the two sites where the sentence came off the
+keyboard. The wire format is otherwise untouched - `interrupt_type` keeps its
+values, so the model reads what it always read and stored transcripts keep their
+shape - and the subtype list stays as the fallback for sessions written before the
+marker existed. Marking the *case* rather than teaching the view to see through
+each new wrapper is the difference between fixing this bug and fixing it again the
+next time a kind is added.
+
+**What stays harness, and why.** Rejections, format errors, job updates, a
+parent's message to a child, and "Temporary interruption caught." - a cancellation
+the human chose not to comment on. The test is who wrote the sentence, not whether
+the human is mentioned in it: `"Interrupted by user: X"` is the harness recording
+an interruption, but the X came off a keyboard and the transcript is showing the
+human what they typed. A harness report borrowing the user's side of the window is
+the §8.6 lying affordance with a colour and an alignment attached.
+
+**The framing this drags into the open.** `"UserNewTask"` and its wrapper - "The
+user added a new task: ..." - belong to a model of the UI where a run is a
+sequence of discrete tasks. It is not: in a session the turns build on each other,
+and the next thing typed is the conversation continuing. The display now says so,
+because a human-typed message reads as the human's whatever the type is named; the
+prompt title (`newTaskTitle`) and the sentence handed to the model still use the
+task framing, and changing *those* changes what the model reads, so they are a
+separate decision with its own commit.
+
+**Pinned** by a table (`TestGUITranscriptSideFollowsAuthorship`) that includes a
+subtype invented on the spot, by a round-trip test on the message itself, and by
+both flows end to end - each checked to fail against the old condition. Mid-run
+steering was already right and still is: it is echoed unwrapped, so the narrower
+truth is that the same keystroke was mislabelled only where a prompt takes it as
+an answer.
 ## 9. Open questions
 
 Organised by whether implementation can start without the answer, because that
